@@ -65,12 +65,24 @@ static int ipmi_pci_probe_regspacing(struct si_sm_io *io)
 	return DEFAULT_REGSPACING;
 }
 
+static struct pci_device_id ipmi_pci_blacklist[] = {
+	/*
+	 * This is a "Virtual IPMI device", whatever that is.  It appears
+	 * as a KCS device by the class, but it is not one.
+	 */
+	{ PCI_VDEVICE(REALTEK, 0x816c) },
+	{ 0, }
+};
+
 static int ipmi_pci_probe(struct pci_dev *pdev,
 				    const struct pci_device_id *ent)
 {
 	int rv;
 	int class_type = pdev->class & PCI_ERMC_CLASSCODE_TYPE_MASK;
 	struct si_sm_io io;
+
+	if (pci_match_id(ipmi_pci_blacklist, pdev))
+		return -ENODEV;
 
 	memset(&io, 0, sizeof(io));
 	io.addr_source = SI_PCI;
@@ -112,6 +124,8 @@ static int ipmi_pci_probe(struct pci_dev *pdev,
 	}
 	io.addr_data = pci_resource_start(pdev, 0);
 
+	io.dev = &pdev->dev;
+
 	io.regspacing = ipmi_pci_probe_regspacing(&io);
 	io.regsize = DEFAULT_REGSIZE;
 	io.regshift = 0;
@@ -119,8 +133,6 @@ static int ipmi_pci_probe(struct pci_dev *pdev,
 	io.irq = pdev->irq;
 	if (io.irq)
 		io.irq_setup = ipmi_std_irq_setup;
-
-	io.dev = &pdev->dev;
 
 	dev_info(&pdev->dev, "%pR regsize %d spacing %d irq %d\n",
 		&pdev->resource[0], io.regsize, io.regspacing, io.irq);

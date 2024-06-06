@@ -128,7 +128,7 @@ static const struct net_device_ops xtsonic_netdev_ops = {
 	.ndo_set_mac_address	= eth_mac_addr,
 };
 
-static int __init sonic_probe1(struct net_device *dev)
+static int sonic_probe1(struct net_device *dev)
 {
 	static unsigned version_printed = 0;
 	unsigned int silicon_revision;
@@ -274,14 +274,17 @@ int xtsonic_probe(struct platform_device *pdev)
 	if ((err = sonic_probe1(dev)))
 		goto out;
 	if ((err = register_netdev(dev)))
-		goto out1;
+		goto undo_probe1;
 
 	printk("%s: SONIC ethernet @%08lx, MAC %pM, IRQ %d\n", dev->name,
 	       dev->base_addr, dev->dev_addr, dev->irq);
 
 	return 0;
 
-out1:
+undo_probe1:
+	dma_free_coherent(lp->device,
+			  SIZEOF_SONIC_DESC * SONIC_BUS_SCALE(lp->dma_bitmode),
+			  lp->descriptors, lp->descriptors_laddr);
 	release_region(dev->base_addr, SONIC_MEM_SIZE);
 out:
 	free_netdev(dev);

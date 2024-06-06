@@ -66,6 +66,7 @@ static const u32 golden_settings_sdma_4[] = {
 	SOC15_REG_OFFSET(SDMA0, 0, mmSDMA0_RLC1_IB_CNTL), 0x800f0100, 0x00000100,
 	SOC15_REG_OFFSET(SDMA0, 0, mmSDMA0_RLC1_RB_WPTR_POLL_CNTL), 0x0000fff0, 0x00403000,
 	SOC15_REG_OFFSET(SDMA0, 0, mmSDMA0_UTCL1_PAGE), 0x000003ff, 0x000003c0,
+	SOC15_REG_OFFSET(SDMA0, 0, mmSDMA0_UTCL1_WATERMK), 0xfc000000, 0x00000000,
 	SOC15_REG_OFFSET(SDMA1, 0, mmSDMA1_CHICKEN_BITS), 0xfe931f07, 0x02831f07,
 	SOC15_REG_OFFSET(SDMA1, 0, mmSDMA1_CLK_CTRL), 0xffffffff, 0x3f000100,
 	SOC15_REG_OFFSET(SDMA1, 0, mmSDMA1_GFX_IB_CNTL), 0x800f0100, 0x00000100,
@@ -77,7 +78,8 @@ static const u32 golden_settings_sdma_4[] = {
 	SOC15_REG_OFFSET(SDMA1, 0, mmSDMA1_RLC0_RB_WPTR_POLL_CNTL), 0x0000fff0, 0x00403000,
 	SOC15_REG_OFFSET(SDMA1, 0, mmSDMA1_RLC1_IB_CNTL), 0x800f0100, 0x00000100,
 	SOC15_REG_OFFSET(SDMA1, 0, mmSDMA1_RLC1_RB_WPTR_POLL_CNTL), 0x0000fff0, 0x00403000,
-	SOC15_REG_OFFSET(SDMA1, 0, mmSDMA1_UTCL1_PAGE), 0x000003ff, 0x000003c0
+	SOC15_REG_OFFSET(SDMA1, 0, mmSDMA1_UTCL1_PAGE), 0x000003ff, 0x000003c0,
+	SOC15_REG_OFFSET(SDMA1, 0, mmSDMA1_UTCL1_WATERMK), 0xfc000000, 0x00000000
 };
 
 static const u32 golden_settings_sdma_vg10[] = {
@@ -98,7 +100,8 @@ static const u32 golden_settings_sdma_4_1[] =
 	SOC15_REG_OFFSET(SDMA0, 0, mmSDMA0_RLC0_RB_WPTR_POLL_CNTL), 0xfffffff7, 0x00403000,
 	SOC15_REG_OFFSET(SDMA0, 0, mmSDMA0_RLC1_IB_CNTL), 0x800f0111, 0x00000100,
 	SOC15_REG_OFFSET(SDMA0, 0, mmSDMA0_RLC1_RB_WPTR_POLL_CNTL), 0xfffffff7, 0x00403000,
-	SOC15_REG_OFFSET(SDMA0, 0, mmSDMA0_UTCL1_PAGE), 0x000003ff, 0x000003c0
+	SOC15_REG_OFFSET(SDMA0, 0, mmSDMA0_UTCL1_PAGE), 0x000003ff, 0x000003c0,
+	SOC15_REG_OFFSET(SDMA0, 0, mmSDMA0_UTCL1_WATERMK), 0xfc000000, 0x00000000
 };
 
 static const u32 golden_settings_sdma_rv1[] =
@@ -1136,7 +1139,7 @@ static void sdma_v4_0_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
 	amdgpu_ring_write(ring, addr & 0xfffffffc);
 	amdgpu_ring_write(ring, upper_32_bits(addr) & 0xffffffff);
 	amdgpu_ring_write(ring, seq); /* reference */
-	amdgpu_ring_write(ring, 0xfffffff); /* mask */
+	amdgpu_ring_write(ring, 0xffffffff); /* mask */
 	amdgpu_ring_write(ring, SDMA_PKT_POLL_REGMEM_DW5_RETRY_COUNT(0xfff) |
 			  SDMA_PKT_POLL_REGMEM_DW5_INTERVAL(4)); /* retry count, poll interval */
 }

@@ -48,6 +48,14 @@ config ARM_SCPI_POWER_DOMAIN
 	  This enables support for the SCPI power domains which can be
 	  enabled or disabled via the SCP firmware
 
+config ARM_SDE_INTERFACE
+	bool "ARM Software Delegated Exception Interface (SDEI)"
+	depends on ARM64
+	help
+	  The Software Delegated Exception Interface (SDEI) is an ARM
+	  standard for registering callbacks from the platform firmware
+	  into the OS. This is typically used to implement RAS notifications.
+
 config EDD
 	tristate "BIOS Enhanced Disk Drive calls determine boot disk"
 	depends on X86
@@ -156,7 +164,7 @@ config DMI_SCAN_MACHINE_NON_EFI_FALLBACK
 
 config ISCSI_IBFT_FIND
 	bool "iSCSI Boot Firmware Table Attributes"
-	depends on X86 && ACPI
+	depends on X86 && ISCSI_IBFT
 	default n
 	help
 	  This option enables the kernel to find the region of memory
@@ -167,7 +175,8 @@ config ISCSI_IBFT_FIND
 config ISCSI_IBFT
 	tristate "iSCSI Boot Firmware Table Attributes module"
 	select ISCSI_BOOT_SYSFS
-	depends on ISCSI_IBFT_FIND && SCSI && SCSI_LOWLEVEL
+	select ISCSI_IBFT_FIND if X86
+	depends on ACPI && SCSI && SCSI_LOWLEVEL
 	default	n
 	help
 	  This option enables support for detection and exposing of iSCSI
@@ -205,6 +214,7 @@ config FW_CFG_SYSFS_CMDLINE
 config QCOM_SCM
 	bool
 	depends on ARM || ARM64
+	depends on HAVE_ARM_SMCCC
 	select RESET_CONTROLLER
 
 config QCOM_SCM_32

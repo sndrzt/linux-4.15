@@ -296,7 +296,7 @@ static inline int ovl_dir_read(struct path *realpath,
 	struct file *realfile;
 	int err;
 
-	realfile = ovl_path_open(realpath, O_RDONLY | O_DIRECTORY);
+	realfile = ovl_path_open(realpath, O_RDONLY | O_LARGEFILE);
 	if (IS_ERR(realfile))
 		return PTR_ERR(realfile);
 
@@ -593,8 +593,15 @@ static struct ovl_dir_cache *ovl_cache_get_impure(struct path *path)
 		return ERR_PTR(res);
 	}
 	if (list_empty(&cache->entries)) {
-		/* Good oportunity to get rid of an unnecessary "impure" flag */
-		ovl_do_removexattr(ovl_dentry_upper(dentry), OVL_XATTR_IMPURE);
+		/*
+		 * A good opportunity to get rid of an unneeded "impure" flag.
+		 * Removing the "impure" xattr is best effort.
+		 */
+		if (!ovl_want_write(dentry)) {
+			ovl_do_removexattr(ovl_dentry_upper(dentry),
+					   OVL_XATTR_IMPURE);
+			ovl_drop_write(dentry);
+		}
 		ovl_clear_flag(OVL_IMPURE, d_inode(dentry));
 		kfree(cache);
 		return NULL;
@@ -634,6 +641,21 @@ static int ovl_fill_real(struct dir_context *ctx, const char *name,
 	return orig_ctx->actor(orig_ctx, name, namelen, offset, ino, d_type);
 }
 
+static bool ovl_is_impure_dir(struct file *file)
+{
+	struct ovl_dir_file *od = file->private_data;
+	struct inode *dir = d_inode(file->f_path.dentry);
+
+	/*
+	 * Only upper dir can be impure, but if we are in the middle of
+	 * iterating a lower real dir, dir could be copied up and marked
+	 * impure. We only want the impure cache if we started iterating
+	 * a real upper dir to begin with.
+	 */
+	return od->is_upper && ovl_test_flag(OVL_IMPURE, dir);
+
+}
+
 static int ovl_iterate_real(struct file *file, struct dir_context *ctx)
 {
 	int err;
@@ -657,7 +679,7 @@ static int ovl_iterate_real(struct file *file, struct dir_context *ctx)
 		rdt.parent_ino = stat.ino;
 	}
 
-	if (ovl_test_flag(OVL_IMPURE, d_inode(dir))) {
+	if (ovl_is_impure_dir(file)) {
 		rdt.cache = ovl_cache_get_impure(&file->f_path);
 		if (IS_ERR(rdt.cache))
 			return PTR_ERR(rdt.cache);
@@ -675,8 +697,10 @@ static int ovl_iterate(struct file *file, struct dir_context *ctx)
 	struct ovl_dir_file *od = file->private_data;
 	struct dentry *dentry = file->f_path.dentry;
 	struct ovl_cache_entry *p;
+	const struct cred *old_cred;
 	int err;
 
+	old_cred = ovl_override_creds(dentry->d_sb);
 	if (!ctx->pos)
 		ovl_dir_reset(file);
 
@@ -687,19 +711,22 @@ static int ovl_iterate(struct file *file, struct dir_context *ctx)
 		 * entries.
 		 */
 		if (ovl_same_sb(dentry->d_sb) &&
-		    (ovl_test_flag(OVL_IMPURE, d_inode(dentry)) ||
+		    (ovl_is_impure_dir(file) ||
 		     OVL_TYPE_MERGE(ovl_path_type(dentry->d_parent)))) {
-			return ovl_iterate_real(file, ctx);
+			err = ovl_iterate_real(file, ctx);
+		} else {
+			err = iterate_dir(od->realfile, ctx);
 		}
-		return iterate_dir(od->realfile, ctx);
+		goto out;
 	}
 
 	if (!od->cache) {
 		struct ovl_dir_cache *cache;
 
 		cache = ovl_cache_get(dentry);
+		err = PTR_ERR(cache);
 		if (IS_ERR(cache))
-			return PTR_ERR(cache);
+			goto out;
 
 		od->cache = cache;
 		ovl_seek_cursor(od, ctx->pos);
@@ -711,7 +738,7 @@ static int ovl_iterate(struct file *file, struct dir_context *ctx)
 			if (!p->ino) {
 				err = ovl_cache_update_ino(&file->f_path, p);
 				if (err)
-					return err;
+					goto out;
 			}
 			if (!dir_emit(ctx, p->name, p->len, p->ino, p->type))
 				break;
@@ -719,7 +746,10 @@ static int ovl_iterate(struct file *file, struct dir_context *ctx)
 		od->cursor = p->l_node.next;
 		ctx->pos++;
 	}
-	return 0;
+	err = 0;
+out:
+	revert_creds(old_cred);
+	return err;
 }
 
 static loff_t ovl_dir_llseek(struct file *file, loff_t offset, int origin)
@@ -762,6 +792,19 @@ out_unlock:
 	return res;
 }
 
+static struct file *ovl_dir_open_realfile(struct file *file,
+					  struct path *realpath)
+{
+	struct file *res;
+	const struct cred *old_cred;
+
+	old_cred = ovl_override_creds(file_inode(file)->i_sb);
+	res = ovl_path_open(realpath, O_RDONLY | (file->f_flags & O_LARGEFILE));
+	revert_creds(old_cred);
+
+	return res;
+}
+
 static int ovl_dir_fsync(struct file *file, loff_t start, loff_t end,
 			 int datasync)
 {
@@ -769,10 +812,14 @@ static int ovl_dir_fsync(struct file *file, loff_t start, loff_t end,
 	struct dentry *dentry = file->f_path.dentry;
 	struct file *realfile = od->realfile;
 
+	/* Nothing to sync for lower */
+	if (!OVL_TYPE_UPPER(ovl_path_type(dentry)))
+		return 0;
+
 	/*
 	 * Need to check if we started out being a lower dir, but got copied up
 	 */
-	if (!od->is_upper && OVL_TYPE_UPPER(ovl_path_type(dentry))) {
+	if (!od->is_upper) {
 		struct inode *inode = file_inode(file);
 
 		realfile = READ_ONCE(od->upperfile);
@@ -780,7 +827,7 @@ static int ovl_dir_fsync(struct file *file, loff_t start, loff_t end,
 			struct path upperpath;
 
 			ovl_path_upper(dentry, &upperpath);
-			realfile = ovl_path_open(&upperpath, O_RDONLY);
+			realfile = ovl_dir_open_realfile(file, &upperpath);
 
 			inode_lock(inode);
 			if (!od->upperfile) {
@@ -831,7 +878,7 @@ static int ovl_dir_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 
 	type = ovl_path_real(file->f_path.dentry, &realpath);
-	realfile = ovl_path_open(&realpath, file->f_flags);
+	realfile = ovl_dir_open_realfile(file, &realpath);
 	if (IS_ERR(realfile)) {
 		kfree(od);
 		return PTR_ERR(realfile);

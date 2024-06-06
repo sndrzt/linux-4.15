@@ -125,11 +125,14 @@ struct msm_gpu *adreno_load_gpu(struct drm_device *dev)
 {
 	struct msm_drm_private *priv = dev->dev_private;
 	struct platform_device *pdev = priv->gpu_pdev;
-	struct msm_gpu *gpu = platform_get_drvdata(priv->gpu_pdev);
+	struct msm_gpu *gpu = NULL;
 	int ret;
 
+	if (pdev)
+		gpu = platform_get_drvdata(pdev);
+
 	if (!gpu) {
-		dev_err(dev->dev, "no adreno device\n");
+		dev_err_once(dev->dev, "no GPU device was found\n");
 		return NULL;
 	}
 
@@ -196,8 +199,7 @@ static int adreno_get_legacy_pwrlevels(struct device *dev)
 	struct device_node *child, *node;
 	int ret;
 
-	node = of_find_compatible_node(dev->of_node, NULL,
-		"qcom,gpu-pwrlevels");
+	node = of_get_compatible_child(dev->of_node, "qcom,gpu-pwrlevels");
 	if (!node) {
 		dev_err(dev, "Could not find the GPU powerlevels\n");
 		return -ENXIO;
@@ -217,6 +219,8 @@ static int adreno_get_legacy_pwrlevels(struct device *dev)
 		if (val != 27000000)
 			dev_pm_opp_add(dev, val, 0);
 	}
+
+	of_node_put(node);
 
 	return 0;
 }

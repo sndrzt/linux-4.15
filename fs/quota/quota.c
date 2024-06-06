@@ -18,6 +18,7 @@
 #include <linux/quotaops.h>
 #include <linux/types.h>
 #include <linux/writeback.h>
+#include <linux/nospec.h>
 
 static int check_quotactl_permission(struct super_block *sb, int type, int cmd,
 				     qid_t id)
@@ -703,6 +704,7 @@ static int do_quotactl(struct super_block *sb, int type, int cmd, qid_t id,
 
 	if (type >= (XQM_COMMAND(cmd) ? XQM_MAXQUOTAS : MAXQUOTAS))
 		return -EINVAL;
+	type = array_index_nospec(type, MAXQUOTAS);
 	/*
 	 * Quota not supported on this fs? Check this before s_quota_types
 	 * since they needn't be set if quota is not supported at all.
@@ -791,7 +793,8 @@ static int quotactl_cmd_write(int cmd)
 /* Return true if quotactl command is manipulating quota on/off state */
 static bool quotactl_cmd_onoff(int cmd)
 {
-	return (cmd == Q_QUOTAON) || (cmd == Q_QUOTAOFF);
+	return (cmd == Q_QUOTAON) || (cmd == Q_QUOTAOFF) ||
+		 (cmd == Q_XQUOTAON) || (cmd == Q_XQUOTAOFF);
 }
 
 /*
@@ -807,7 +810,7 @@ static struct super_block *quotactl_block(const char __user *special, int cmd)
 
 	if (IS_ERR(tmp))
 		return ERR_CAST(tmp);
-	bdev = lookup_bdev(tmp->name);
+	bdev = lookup_bdev(tmp->name, 0);
 	putname(tmp);
 	if (IS_ERR(bdev))
 		return ERR_CAST(bdev);

@@ -17,7 +17,12 @@
 # Mike Shaver, Helge Deller and Martin K. Petersen
 #
 
+ifdef CONFIG_PARISC_SELF_EXTRACT
+boot := arch/parisc/boot
+KBUILD_IMAGE := $(boot)/bzImage
+else
 KBUILD_IMAGE := vmlinuz
+endif
 
 KBUILD_DEFCONFIG := default_defconfig
 
@@ -73,6 +78,13 @@ cflags-y	+= -ffunction-sections
 # link a too big vmlinux executable). Not enabled for building modules.
 ifdef CONFIG_MLONGCALLS
 KBUILD_CFLAGS_KERNEL += -mlong-calls
+endif
+
+# Without this, "ld -r" results in .text sections that are too big (> 0x40000)
+# for branches to reach stubs. And multiple .text sections trigger a warning
+# when creating the sysfs module information section.
+ifndef CONFIG_64BIT
+KBUILD_CFLAGS_MODULE += -ffunction-sections
 endif
 
 # select which processor to optimise for

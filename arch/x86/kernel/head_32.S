@@ -26,6 +26,7 @@
 #include <asm/bootparam.h>
 #include <asm/export.h>
 #include <asm/pgtable_32.h>
+#include <asm/nospec-branch.h>
 
 /* Physical address */
 #define pa(X) ((X) - __PAGE_OFFSET)
@@ -37,7 +38,7 @@
 #define X86		new_cpu_data+CPUINFO_x86
 #define X86_VENDOR	new_cpu_data+CPUINFO_x86_vendor
 #define X86_MODEL	new_cpu_data+CPUINFO_x86_model
-#define X86_MASK	new_cpu_data+CPUINFO_x86_mask
+#define X86_STEPPING	new_cpu_data+CPUINFO_x86_stepping
 #define X86_HARD_MATH	new_cpu_data+CPUINFO_hard_math
 #define X86_CPUID	new_cpu_data+CPUINFO_cpuid_level
 #define X86_CAPABILITY	new_cpu_data+CPUINFO_x86_capability
@@ -153,6 +154,7 @@ ENTRY(startup_32)
 
 	movl pa(subarch_entries)(,%eax,4), %eax
 	subl $__PAGE_OFFSET, %eax
+	ANNOTATE_RETPOLINE_SAFE
 	jmp *%eax
 
 .Lbad_subarch:
@@ -302,6 +304,7 @@ ENTRY(startup_32_smp)
 	movl setup_once_ref,%eax
 	andl %eax,%eax
 	jz 1f				# Did we do this already?
+	ANNOTATE_RETPOLINE_SAFE
 	call *%eax
 1:
 
@@ -332,7 +335,7 @@ ENTRY(startup_32_smp)
 	shrb $4,%al
 	movb %al,X86_MODEL
 	andb $0x0f,%cl		# mask mask revision
-	movb %cl,X86_MASK
+	movb %cl,X86_STEPPING
 	movl %edx,X86_CAPABILITY
 
 .Lis486:
@@ -512,11 +515,18 @@ ENTRY(initial_code)
 ENTRY(setup_once_ref)
 	.long setup_once
 
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+#define	PGD_ALIGN	(2 * PAGE_SIZE)
+#define PTI_USER_PGD_FILL	1024
+#else
+#define	PGD_ALIGN	(PAGE_SIZE)
+#define PTI_USER_PGD_FILL	0
+#endif
 /*
  * BSS section
  */
 __PAGE_ALIGNED_BSS
-	.align PAGE_SIZE
+	.align PGD_ALIGN
 #ifdef CONFIG_X86_PAE
 .globl initial_pg_pmd
 initial_pg_pmd:
@@ -526,14 +536,17 @@ initial_pg_pmd:
 initial_page_table:
 	.fill 1024,4,0
 #endif
+	.align PGD_ALIGN
 initial_pg_fixmap:
 	.fill 1024,4,0
+.globl swapper_pg_dir
+	.align PGD_ALIGN
+swapper_pg_dir:
+	.fill 1024,4,0
+	.fill PTI_USER_PGD_FILL,4,0
 .globl empty_zero_page
 empty_zero_page:
 	.fill 4096,1,0
-.globl swapper_pg_dir
-swapper_pg_dir:
-	.fill 1024,4,0
 EXPORT_SYMBOL(empty_zero_page)
 
 /*
@@ -542,7 +555,7 @@ EXPORT_SYMBOL(empty_zero_page)
 #ifdef CONFIG_X86_PAE
 __PAGE_ALIGNED_DATA
 	/* Page-aligned for the benefit of paravirt? */
-	.align PAGE_SIZE
+	.align PGD_ALIGN
 ENTRY(initial_page_table)
 	.long	pa(initial_pg_pmd+PGD_IDENT_ATTR),0	/* low identity map */
 # if KPMDS == 3

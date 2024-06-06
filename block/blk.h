@@ -55,7 +55,7 @@ static inline void __blk_get_queue(struct request_queue *q)
 }
 
 struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
-		int node, int cmd_size);
+		int node, int cmd_size, gfp_t flags);
 void blk_free_flush_queue(struct blk_flush_queue *q);
 
 int blk_init_rl(struct request_list *rl, struct request_queue *q,
@@ -243,6 +243,16 @@ static inline void req_set_nomerge(struct request_queue *q, struct request *req)
 	req->cmd_flags |= REQ_NOMERGE;
 	if (req == q->last_merge)
 		q->last_merge = NULL;
+}
+
+/*
+ * The max size one bio can handle is UINT_MAX becasue bvec_iter.bi_size
+ * is defined as 'unsigned int', meantime it has to aligned to with logical
+ * block size which is the minimum accepted unit by hardware.
+ */
+static inline unsigned int bio_allowed_max_sectors(struct request_queue *q)
+{
+	return round_down(UINT_MAX, queue_logical_block_size(q)) >> 9;
 }
 
 /*

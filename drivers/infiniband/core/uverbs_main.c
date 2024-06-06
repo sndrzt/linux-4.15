@@ -252,12 +252,14 @@ void ib_uverbs_release_file(struct kref *ref)
 	if (atomic_dec_and_test(&file->device->refcount))
 		ib_uverbs_comp_dev(file->device);
 
+	if (file->async_file)
+		kref_put(&file->async_file->ref,
+			 ib_uverbs_release_async_event_file);
 	kobject_put(&file->device->kobj);
 	kfree(file);
 }
 
 static ssize_t ib_uverbs_event_read(struct ib_uverbs_event_queue *ev_queue,
-				    struct ib_uverbs_file *uverbs_file,
 				    struct file *filp, char __user *buf,
 				    size_t count, loff_t *pos,
 				    size_t eventsz)
@@ -275,19 +277,16 @@ static ssize_t ib_uverbs_event_read(struct ib_uverbs_event_queue *ev_queue,
 
 		if (wait_event_interruptible(ev_queue->poll_wait,
 					     (!list_empty(&ev_queue->event_list) ||
-			/* The barriers built into wait_event_interruptible()
-			 * and wake_up() guarentee this will see the null set
-			 * without using RCU
-			 */
-					     !uverbs_file->device->ib_dev)))
+					      ev_queue->is_closed)))
 			return -ERESTARTSYS;
 
-		/* If device was disassociated and no event exists set an error */
-		if (list_empty(&ev_queue->event_list) &&
-		    !uverbs_file->device->ib_dev)
-			return -EIO;
-
 		spin_lock_irq(&ev_queue->lock);
+
+		/* If device was disassociated and no event exists set an error */
+		if (list_empty(&ev_queue->event_list) && ev_queue->is_closed) {
+			spin_unlock_irq(&ev_queue->lock);
+			return -EIO;
+		}
 	}
 
 	event = list_entry(ev_queue->event_list.next, struct ib_uverbs_event, list);
@@ -322,8 +321,7 @@ static ssize_t ib_uverbs_async_event_read(struct file *filp, char __user *buf,
 {
 	struct ib_uverbs_async_event_file *file = filp->private_data;
 
-	return ib_uverbs_event_read(&file->ev_queue, file->uverbs_file, filp,
-				    buf, count, pos,
+	return ib_uverbs_event_read(&file->ev_queue, filp, buf, count, pos,
 				    sizeof(struct ib_uverbs_async_event_desc));
 }
 
@@ -333,9 +331,8 @@ static ssize_t ib_uverbs_comp_event_read(struct file *filp, char __user *buf,
 	struct ib_uverbs_completion_event_file *comp_ev_file =
 		filp->private_data;
 
-	return ib_uverbs_event_read(&comp_ev_file->ev_queue,
-				    comp_ev_file->uobj_file.ufile, filp,
-				    buf, count, pos,
+	return ib_uverbs_event_read(&comp_ev_file->ev_queue, filp, buf, count,
+				    pos,
 				    sizeof(struct ib_uverbs_comp_event_desc));
 }
 
@@ -358,7 +355,9 @@ static unsigned int ib_uverbs_event_poll(struct ib_uverbs_event_queue *ev_queue,
 static unsigned int ib_uverbs_async_event_poll(struct file *filp,
 					       struct poll_table_struct *wait)
 {
-	return ib_uverbs_event_poll(filp->private_data, filp, wait);
+	struct ib_uverbs_async_event_file *file = filp->private_data;
+
+	return ib_uverbs_event_poll(&file->ev_queue, filp, wait);
 }
 
 static unsigned int ib_uverbs_comp_event_poll(struct file *filp,
@@ -372,9 +371,9 @@ static unsigned int ib_uverbs_comp_event_poll(struct file *filp,
 
 static int ib_uverbs_async_event_fasync(int fd, struct file *filp, int on)
 {
-	struct ib_uverbs_event_queue *ev_queue = filp->private_data;
+	struct ib_uverbs_async_event_file *file = filp->private_data;
 
-	return fasync_helper(fd, filp, on, &ev_queue->async_queue);
+	return fasync_helper(fd, filp, on, &file->ev_queue.async_queue);
 }
 
 static int ib_uverbs_comp_event_fasync(int fd, struct file *filp, int on)
@@ -425,6 +424,7 @@ static int ib_uverbs_comp_event_close(struct inode *inode, struct file *filp)
 			list_del(&entry->obj_list);
 		kfree(entry);
 	}
+	file->ev_queue.is_closed = 1;
 	spin_unlock_irq(&file->ev_queue.lock);
 
 	uverbs_close_fd(filp);
@@ -648,12 +648,21 @@ static int verify_command_mask(struct ib_device *ib_dev, __u32 command)
 	return -1;
 }
 
+static bool verify_command_idx(u32 command, bool extended)
+{
+	if (extended)
+		return command < ARRAY_SIZE(uverbs_ex_cmd_table);
+
+	return command < ARRAY_SIZE(uverbs_cmd_table);
+}
+
 static ssize_t ib_uverbs_write(struct file *filp, const char __user *buf,
 			     size_t count, loff_t *pos)
 {
 	struct ib_uverbs_file *file = filp->private_data;
 	struct ib_device *ib_dev;
 	struct ib_uverbs_cmd_hdr hdr;
+	bool extended_command;
 	__u32 command;
 	__u32 flags;
 	int srcu_key;
@@ -686,6 +695,15 @@ static ssize_t ib_uverbs_write(struct file *filp, const char __user *buf,
 	}
 
 	command = hdr.command & IB_USER_VERBS_CMD_COMMAND_MASK;
+	flags = (hdr.command &
+		 IB_USER_VERBS_CMD_FLAGS_MASK) >> IB_USER_VERBS_CMD_FLAGS_SHIFT;
+
+	extended_command = flags & IB_USER_VERBS_CMD_FLAG_EXTENDED;
+	if (!verify_command_idx(command, extended_command)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
 	if (verify_command_mask(ib_dev, command)) {
 		ret = -EOPNOTSUPP;
 		goto out;
@@ -697,12 +715,8 @@ static ssize_t ib_uverbs_write(struct file *filp, const char __user *buf,
 		goto out;
 	}
 
-	flags = (hdr.command &
-		 IB_USER_VERBS_CMD_FLAGS_MASK) >> IB_USER_VERBS_CMD_FLAGS_SHIFT;
-
 	if (!flags) {
-		if (command >= ARRAY_SIZE(uverbs_cmd_table) ||
-		    !uverbs_cmd_table[command]) {
+		if (!uverbs_cmd_table[command]) {
 			ret = -EINVAL;
 			goto out;
 		}
@@ -723,8 +737,7 @@ static ssize_t ib_uverbs_write(struct file *filp, const char __user *buf,
 		struct ib_udata uhw;
 		size_t written_count = count;
 
-		if (command >= ARRAY_SIZE(uverbs_ex_cmd_table) ||
-		    !uverbs_ex_cmd_table[command]) {
+		if (!uverbs_ex_cmd_table[command]) {
 			ret = -ENOSYS;
 			goto out;
 		}
@@ -922,10 +935,6 @@ static int ib_uverbs_close(struct inode *inode, struct file *filp)
 		file->is_closed = 1;
 	}
 	mutex_unlock(&file->device->lists_mutex);
-
-	if (file->async_file)
-		kref_put(&file->async_file->ref,
-			 ib_uverbs_release_async_event_file);
 
 	kref_put(&file->ref, ib_uverbs_release_file);
 

@@ -465,7 +465,10 @@ static int imx_init_from_nvmem_cells(struct platform_device *pdev)
 	ret = nvmem_cell_read_u32(&pdev->dev, "calib", &val);
 	if (ret)
 		return ret;
-	imx_init_calib(pdev, val);
+
+	ret = imx_init_calib(pdev, val);
+	if (ret)
+		return ret;
 
 	ret = nvmem_cell_read_u32(&pdev->dev, "temp_grade", &val);
 	if (ret)
@@ -645,6 +648,9 @@ static int imx_thermal_probe(struct platform_device *pdev)
 	regmap_write(map, TEMPSENSE0 + REG_CLR, TEMPSENSE0_POWER_DOWN);
 	regmap_write(map, TEMPSENSE0 + REG_SET, TEMPSENSE0_MEASURE_TEMP);
 
+	data->irq_enabled = true;
+	data->mode = THERMAL_DEVICE_ENABLED;
+
 	ret = devm_request_threaded_irq(&pdev->dev, data->irq,
 			imx_thermal_alarm_irq, imx_thermal_alarm_irq_thread,
 			0, "imx_thermal", data);
@@ -656,9 +662,6 @@ static int imx_thermal_probe(struct platform_device *pdev)
 		cpufreq_cpu_put(data->policy);
 		return ret;
 	}
-
-	data->irq_enabled = true;
-	data->mode = THERMAL_DEVICE_ENABLED;
 
 	return 0;
 }

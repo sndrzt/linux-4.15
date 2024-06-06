@@ -240,6 +240,7 @@ void aa_free_profile(struct aa_profile *profile)
 
 	kzfree(profile->hash);
 	aa_put_loaddata(profile->rawdata);
+	aa_label_destroy(&profile->label);
 
 	kzfree(profile);
 }
@@ -1003,6 +1004,9 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 			audit_policy(label, op, ns_name, ent->new->base.hname,
 				     "same as current profile, skipping",
 				     error);
+			/* break refcount cycle with proxy. */
+			aa_put_proxy(ent->new->label.proxy);
+			ent->new->label.proxy = NULL;
 			goto skip;
 		}
 
@@ -1117,7 +1121,7 @@ ssize_t aa_remove_profiles(struct aa_ns *policy_ns, struct aa_label *subj,
 
 	if (!name) {
 		/* remove namespace - can only happen if fqname[0] == ':' */
-		mutex_lock_nested(&ns->parent->lock, ns->level);
+		mutex_lock_nested(&ns->parent->lock, ns->parent->level);
 		__aa_remove_ns(ns);
 		__aa_bump_ns_revision(ns);
 		mutex_unlock(&ns->parent->lock);

@@ -232,7 +232,10 @@ static inline int ip_vs_conn_unhash(struct ip_vs_conn *cp)
 static inline bool ip_vs_conn_unlink(struct ip_vs_conn *cp)
 {
 	unsigned int hash;
-	bool ret;
+	bool ret = false;
+
+	if (cp->flags & IP_VS_CONN_F_ONE_PACKET)
+		return refcount_dec_if_one(&cp->refcnt);
 
 	hash = ip_vs_conn_hashkey_conn(cp);
 
@@ -240,15 +243,13 @@ static inline bool ip_vs_conn_unlink(struct ip_vs_conn *cp)
 	spin_lock(&cp->lock);
 
 	if (cp->flags & IP_VS_CONN_F_HASHED) {
-		ret = false;
 		/* Decrease refcnt and unlink conn only if we are last user */
 		if (refcount_dec_if_one(&cp->refcnt)) {
 			hlist_del_rcu(&cp->c_list);
 			cp->flags &= ~IP_VS_CONN_F_HASHED;
 			ret = true;
 		}
-	} else
-		ret = refcount_read(&cp->refcnt) ? false : true;
+	}
 
 	spin_unlock(&cp->lock);
 	ct_write_unlock_bh(hash);
@@ -454,12 +455,6 @@ ip_vs_conn_out_get_proto(struct netns_ipvs *ipvs, int af,
 }
 EXPORT_SYMBOL_GPL(ip_vs_conn_out_get_proto);
 
-static void __ip_vs_conn_put_notimer(struct ip_vs_conn *cp)
-{
-	__ip_vs_conn_put(cp);
-	ip_vs_conn_expire(&cp->timer);
-}
-
 /*
  *      Put back the conn and restart its timer with its timeout
  */
@@ -478,7 +473,7 @@ void ip_vs_conn_put(struct ip_vs_conn *cp)
 	    (refcount_read(&cp->refcnt) == 1) &&
 	    !timer_pending(&cp->timer))
 		/* expire connection immediately */
-		__ip_vs_conn_put_notimer(cp);
+		ip_vs_conn_expire(&cp->timer);
 	else
 		__ip_vs_conn_put_timer(cp);
 }
@@ -1240,8 +1235,8 @@ static inline int todrop_entry(struct ip_vs_conn *cp)
 	 * The drop rate array needs tuning for real environments.
 	 * Called from timer bh only => no locking
 	 */
-	static const char todrop_rate[9] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
-	static char todrop_counter[9] = {0};
+	static const signed char todrop_rate[9] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+	static signed char todrop_counter[9] = {0};
 	int i;
 
 	/* if the conn entry hasn't lasted for 60 seconds, don't drop it.
@@ -1387,18 +1382,34 @@ int __net_init ip_vs_conn_net_init(struct netns_ipvs *ipvs)
 {
 	atomic_set(&ipvs->conn_count, 0);
 
-	proc_create("ip_vs_conn", 0, ipvs->net->proc_net, &ip_vs_conn_fops);
-	proc_create("ip_vs_conn_sync", 0, ipvs->net->proc_net,
-		    &ip_vs_conn_sync_fops);
+#ifdef CONFIG_PROC_FS
+	if (!proc_create("ip_vs_conn", 0, ipvs->net->proc_net,
+			 &ip_vs_conn_fops))
+		goto err_conn;
+
+	if (!proc_create("ip_vs_conn_sync", 0, ipvs->net->proc_net,
+			 &ip_vs_conn_sync_fops))
+		goto err_conn_sync;
+#endif
+
 	return 0;
+
+#ifdef CONFIG_PROC_FS
+err_conn_sync:
+	remove_proc_entry("ip_vs_conn", ipvs->net->proc_net);
+err_conn:
+	return -ENOMEM;
+#endif
 }
 
 void __net_exit ip_vs_conn_net_cleanup(struct netns_ipvs *ipvs)
 {
 	/* flush all the connection entries first */
 	ip_vs_conn_flush(ipvs);
+#ifdef CONFIG_PROC_FS
 	remove_proc_entry("ip_vs_conn", ipvs->net->proc_net);
 	remove_proc_entry("ip_vs_conn_sync", ipvs->net->proc_net);
+#endif
 }
 
 int __init ip_vs_conn_init(void)
@@ -1406,6 +1417,10 @@ int __init ip_vs_conn_init(void)
 	int idx;
 
 	/* Compute size and mask */
+	if (ip_vs_conn_tab_bits < 8 || ip_vs_conn_tab_bits > 20) {
+		pr_info("conn_tab_bits not in [8, 20]. Using default value\n");
+		ip_vs_conn_tab_bits = CONFIG_IP_VS_TAB_BITS;
+	}
 	ip_vs_conn_tab_size = 1 << ip_vs_conn_tab_bits;
 	ip_vs_conn_tab_mask = ip_vs_conn_tab_size - 1;
 
@@ -1428,7 +1443,7 @@ int __init ip_vs_conn_init(void)
 	pr_info("Connection hash table configured "
 		"(size=%d, memory=%ldKbytes)\n",
 		ip_vs_conn_tab_size,
-		(long)(ip_vs_conn_tab_size*sizeof(struct list_head))/1024);
+		(long)(ip_vs_conn_tab_size*sizeof(*ip_vs_conn_tab))/1024);
 	IP_VS_DBG(0, "Each connection entry needs %zd bytes at least\n",
 		  sizeof(struct ip_vs_conn));
 

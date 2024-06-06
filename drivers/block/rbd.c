@@ -51,15 +51,6 @@
 #define RBD_DEBUG	/* Activate rbd_assert() calls */
 
 /*
- * The basic unit of block I/O is a sector.  It is interpreted in a
- * number of contexts in Linux (blk, bio, genhd), but the default is
- * universally 512 bytes.  These symbols are just slightly more
- * meaningful than the bare numbers they represent.
- */
-#define	SECTOR_SHIFT	9
-#define	SECTOR_SIZE	(1ULL << SECTOR_SHIFT)
-
-/*
  * Increment the given counter and return its updated value.
  * If the counter is already 0 it will not be incremented.
  * If the counter is already at its maximum value returns
@@ -124,11 +115,13 @@ static int atomic_dec_return_safe(atomic_t *v)
 #define RBD_FEATURE_STRIPINGV2		(1ULL<<1)
 #define RBD_FEATURE_EXCLUSIVE_LOCK	(1ULL<<2)
 #define RBD_FEATURE_DATA_POOL		(1ULL<<7)
+#define RBD_FEATURE_OPERATIONS		(1ULL<<8)
 
 #define RBD_FEATURES_ALL	(RBD_FEATURE_LAYERING |		\
 				 RBD_FEATURE_STRIPINGV2 |	\
 				 RBD_FEATURE_EXCLUSIVE_LOCK |	\
-				 RBD_FEATURE_DATA_POOL)
+				 RBD_FEATURE_DATA_POOL |	\
+				 RBD_FEATURE_OPERATIONS)
 
 /* Features supported by this (client software) implementation. */
 
@@ -3812,13 +3805,16 @@ static void cancel_tasks_sync(struct rbd_device *rbd_dev)
 {
 	dout("%s rbd_dev %p\n", __func__, rbd_dev);
 
-	cancel_delayed_work_sync(&rbd_dev->watch_dwork);
 	cancel_work_sync(&rbd_dev->acquired_lock_work);
 	cancel_work_sync(&rbd_dev->released_lock_work);
 	cancel_delayed_work_sync(&rbd_dev->lock_dwork);
 	cancel_work_sync(&rbd_dev->unlock_work);
 }
 
+/*
+ * header_rwsem must not be held to avoid a deadlock with
+ * rbd_dev_refresh() when flushing notifies.
+ */
 static void rbd_unregister_watch(struct rbd_device *rbd_dev)
 {
 	WARN_ON(waitqueue_active(&rbd_dev->lock_waitq));
@@ -3830,6 +3826,7 @@ static void rbd_unregister_watch(struct rbd_device *rbd_dev)
 	rbd_dev->watch_state = RBD_WATCH_STATE_UNREGISTERED;
 	mutex_unlock(&rbd_dev->watch_mutex);
 
+	cancel_delayed_work_sync(&rbd_dev->watch_dwork);
 	ceph_osdc_flush_notifies(&rbd_dev->rbd_client->client->osdc);
 }
 
@@ -4502,6 +4499,9 @@ static ssize_t rbd_config_info_show(struct device *dev,
 {
 	struct rbd_device *rbd_dev = dev_to_rbd_dev(dev);
 
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
 	return sprintf(buf, "%s\n", rbd_dev->config_info);
 }
 
@@ -4602,6 +4602,9 @@ static ssize_t rbd_image_refresh(struct device *dev,
 {
 	struct rbd_device *rbd_dev = dev_to_rbd_dev(dev);
 	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
 
 	ret = rbd_dev_refresh(rbd_dev);
 	if (ret)
@@ -6007,9 +6010,10 @@ static int rbd_dev_header_name(struct rbd_device *rbd_dev)
 
 static void rbd_dev_image_release(struct rbd_device *rbd_dev)
 {
-	rbd_dev_unprobe(rbd_dev);
 	if (rbd_dev->opts)
 		rbd_unregister_watch(rbd_dev);
+
+	rbd_dev_unprobe(rbd_dev);
 	rbd_dev->image_format = 0;
 	kfree(rbd_dev->spec->image_id);
 	rbd_dev->spec->image_id = NULL;
@@ -6020,6 +6024,9 @@ static void rbd_dev_image_release(struct rbd_device *rbd_dev)
  * device.  If this image is the one being mapped (i.e., not a
  * parent), initiate a watch on its header object before using that
  * object to get detailed information about the rbd image.
+ *
+ * On success, returns with header_rwsem held for write if called
+ * with @depth == 0.
  */
 static int rbd_dev_image_probe(struct rbd_device *rbd_dev, int depth)
 {
@@ -6050,9 +6057,12 @@ static int rbd_dev_image_probe(struct rbd_device *rbd_dev, int depth)
 		}
 	}
 
+	if (!depth)
+		down_write(&rbd_dev->header_rwsem);
+
 	ret = rbd_dev_header_info(rbd_dev);
 	if (ret)
-		goto err_out_watch;
+		goto err_out_probe;
 
 	/*
 	 * If this image is the one being mapped, we have pool name and
@@ -6096,10 +6106,11 @@ static int rbd_dev_image_probe(struct rbd_device *rbd_dev, int depth)
 	return 0;
 
 err_out_probe:
-	rbd_dev_unprobe(rbd_dev);
-err_out_watch:
+	if (!depth)
+		up_write(&rbd_dev->header_rwsem);
 	if (!depth)
 		rbd_unregister_watch(rbd_dev);
+	rbd_dev_unprobe(rbd_dev);
 err_out_format:
 	rbd_dev->image_format = 0;
 	kfree(rbd_dev->spec->image_id);
@@ -6117,6 +6128,9 @@ static ssize_t do_rbd_add(struct bus_type *bus,
 	struct rbd_spec *spec = NULL;
 	struct rbd_client *rbdc;
 	int rc;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
 
 	if (!try_module_get(THIS_MODULE))
 		return -ENODEV;
@@ -6156,12 +6170,9 @@ static ssize_t do_rbd_add(struct bus_type *bus,
 		goto err_out_rbd_dev;
 	}
 
-	down_write(&rbd_dev->header_rwsem);
 	rc = rbd_dev_image_probe(rbd_dev, 0);
-	if (rc < 0) {
-		up_write(&rbd_dev->header_rwsem);
+	if (rc < 0)
 		goto err_out_rbd_dev;
-	}
 
 	/* If we are mapping a snapshot it must be marked read-only */
 	if (rbd_dev->spec->snap_id != CEPH_NOSNAP)
@@ -6267,9 +6278,11 @@ static ssize_t do_rbd_remove(struct bus_type *bus,
 	struct list_head *tmp;
 	int dev_id;
 	char opt_buf[6];
-	bool already = false;
 	bool force = false;
 	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
 
 	dev_id = -1;
 	opt_buf[0] = '\0';
@@ -6300,13 +6313,13 @@ static ssize_t do_rbd_remove(struct bus_type *bus,
 		spin_lock_irq(&rbd_dev->lock);
 		if (rbd_dev->open_count && !force)
 			ret = -EBUSY;
-		else
-			already = test_and_set_bit(RBD_DEV_FLAG_REMOVING,
-							&rbd_dev->flags);
+		else if (test_and_set_bit(RBD_DEV_FLAG_REMOVING,
+					  &rbd_dev->flags))
+			ret = -EINPROGRESS;
 		spin_unlock_irq(&rbd_dev->lock);
 	}
 	spin_unlock(&rbd_dev_list_lock);
-	if (ret < 0 || already)
+	if (ret)
 		return ret;
 
 	if (force) {

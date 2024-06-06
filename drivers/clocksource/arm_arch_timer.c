@@ -319,6 +319,55 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
 }
 #endif
 
+#ifdef CONFIG_SUN50I_ERRATUM_UNKNOWN1
+/*
+ * The low bits of the counter registers are indeterminate while bit 10 or
+ * greater is rolling over. Since the counter value can jump both backward
+ * (7ff -> 000 -> 800) and forward (7ff -> fff -> 800), ignore register values
+ * with all ones or all zeros in the low bits. Bound the loop by the maximum
+ * number of CPU cycles in 3 consecutive 24 MHz counter periods.
+ */
+#define __sun50i_a64_read_reg(reg) ({					\
+	u64 _val;							\
+	int _retries = 150;						\
+									\
+	do {								\
+		_val = read_sysreg(reg);				\
+		_retries--;						\
+	} while (((_val + 1) & GENMASK(8, 0)) <= 1 && _retries);	\
+									\
+	WARN_ON_ONCE(!_retries);					\
+	_val;								\
+})
+
+static u64 notrace sun50i_a64_read_cntpct_el0(void)
+{
+	return __sun50i_a64_read_reg(cntpct_el0);
+}
+
+static u64 notrace sun50i_a64_read_cntvct_el0(void)
+{
+	return __sun50i_a64_read_reg(cntvct_el0);
+}
+
+static u32 notrace sun50i_a64_read_cntp_tval_el0(void)
+{
+	return read_sysreg(cntp_cval_el0) - sun50i_a64_read_cntpct_el0();
+}
+
+static u32 notrace sun50i_a64_read_cntv_tval_el0(void)
+{
+	return read_sysreg(cntv_cval_el0) - sun50i_a64_read_cntvct_el0();
+}
+#endif
+
+#ifdef CONFIG_ARM64_ERRATUM_1188873
+static u64 notrace arm64_1188873_read_cntvct_el0(void)
+{
+	return read_sysreg(cntvct_el0);
+}
+#endif
+
 #ifdef CONFIG_ARM_ARCH_TIMER_OOL_WORKAROUND
 DEFINE_PER_CPU(const struct arch_timer_erratum_workaround *, timer_unstable_counter_workaround);
 EXPORT_SYMBOL_GPL(timer_unstable_counter_workaround);
@@ -406,6 +455,27 @@ static const struct arch_timer_erratum_workaround ool_workarounds[] = {
 		.desc = "ARM erratum 858921",
 		.read_cntpct_el0 = arm64_858921_read_cntpct_el0,
 		.read_cntvct_el0 = arm64_858921_read_cntvct_el0,
+	},
+#endif
+#ifdef CONFIG_SUN50I_ERRATUM_UNKNOWN1
+	{
+		.match_type = ate_match_dt,
+		.id = "allwinner,erratum-unknown1",
+		.desc = "Allwinner erratum UNKNOWN1",
+		.read_cntp_tval_el0 = sun50i_a64_read_cntp_tval_el0,
+		.read_cntv_tval_el0 = sun50i_a64_read_cntv_tval_el0,
+		.read_cntpct_el0 = sun50i_a64_read_cntpct_el0,
+		.read_cntvct_el0 = sun50i_a64_read_cntvct_el0,
+		.set_next_event_phys = erratum_set_next_event_tval_phys,
+		.set_next_event_virt = erratum_set_next_event_tval_virt,
+	},
+#endif
+#ifdef CONFIG_ARM64_ERRATUM_1188873
+	{
+		.match_type = ate_match_local_cap_id,
+		.id = (void *)ARM64_WORKAROUND_1188873,
+		.desc = "ARM erratum 1188873",
+		.read_cntvct_el0 = arm64_1188873_read_cntvct_el0,
 	},
 #endif
 };
@@ -772,15 +842,24 @@ static void arch_timer_evtstrm_enable(int divider)
 
 static void arch_timer_configure_evtstream(void)
 {
-	int evt_stream_div, pos;
+	int evt_stream_div, lsb;
 
-	/* Find the closest power of two to the divisor */
-	evt_stream_div = arch_timer_rate / ARCH_TIMER_EVT_STREAM_FREQ;
-	pos = fls(evt_stream_div);
-	if (pos > 1 && !(evt_stream_div & (1 << (pos - 2))))
-		pos--;
+	/*
+	 * As the event stream can at most be generated at half the frequency
+	 * of the counter, use half the frequency when computing the divider.
+	 */
+	evt_stream_div = arch_timer_rate / ARCH_TIMER_EVT_STREAM_FREQ / 2;
+
+	/*
+	 * Find the closest power of two to the divisor. If the adjacent bit
+	 * of lsb (last set bit, starts from 0) is set, then we use (lsb + 1).
+	 */
+	lsb = fls(evt_stream_div) - 1;
+	if (lsb > 0 && (evt_stream_div & BIT(lsb - 1)))
+		lsb++;
+
 	/* enable event stream */
-	arch_timer_evtstrm_enable(min(pos, 15));
+	arch_timer_evtstrm_enable(max(0, min(lsb, 15)));
 }
 
 static void arch_counter_set_user_access(void)

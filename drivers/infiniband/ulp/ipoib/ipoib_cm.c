@@ -757,7 +757,8 @@ void ipoib_cm_send(struct net_device *dev, struct sk_buff *skb, struct ipoib_cm_
 		return;
 	}
 
-	if ((priv->tx_head - priv->tx_tail) == ipoib_sendq_size - 1) {
+	if ((priv->global_tx_head - priv->global_tx_tail) ==
+	    ipoib_sendq_size - 1) {
 		ipoib_dbg(priv, "TX ring 0x%x full, stopping kernel net queue\n",
 			  tx->qp->qp_num);
 		netif_stop_queue(dev);
@@ -766,12 +767,14 @@ void ipoib_cm_send(struct net_device *dev, struct sk_buff *skb, struct ipoib_cm_
 	skb_orphan(skb);
 	skb_dst_drop(skb);
 
-	if (netif_queue_stopped(dev))
-		if (ib_req_notify_cq(priv->send_cq, IB_CQ_NEXT_COMP |
-				     IB_CQ_REPORT_MISSED_EVENTS)) {
+	if (netif_queue_stopped(dev)) {
+		rc = ib_req_notify_cq(priv->send_cq, IB_CQ_NEXT_COMP |
+				      IB_CQ_REPORT_MISSED_EVENTS);
+		if (unlikely(rc < 0))
 			ipoib_warn(priv, "IPoIB/CM:request notify on send CQ failed\n");
+		else if (rc)
 			napi_schedule(&priv->send_napi);
-		}
+	}
 
 	rc = post_send(priv, tx, tx->tx_head & (ipoib_sendq_size - 1), tx_req);
 	if (unlikely(rc)) {
@@ -785,7 +788,7 @@ void ipoib_cm_send(struct net_device *dev, struct sk_buff *skb, struct ipoib_cm_
 	} else {
 		netif_trans_update(dev);
 		++tx->tx_head;
-		++priv->tx_head;
+		++priv->global_tx_head;
 	}
 }
 
@@ -819,10 +822,11 @@ void ipoib_cm_handle_tx_wc(struct net_device *dev, struct ib_wc *wc)
 	netif_tx_lock(dev);
 
 	++tx->tx_tail;
-	++priv->tx_tail;
+	++priv->global_tx_tail;
 
 	if (unlikely(netif_queue_stopped(dev) &&
-		     (priv->tx_head - priv->tx_tail) <= ipoib_sendq_size >> 1 &&
+		     ((priv->global_tx_head - priv->global_tx_tail) <=
+		      ipoib_sendq_size >> 1) &&
 		     test_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags)))
 		netif_wake_queue(dev);
 
@@ -1025,12 +1029,14 @@ static int ipoib_cm_rep_handler(struct ib_cm_id *cm_id, struct ib_cm_event *even
 
 	skb_queue_head_init(&skqueue);
 
+	netif_tx_lock_bh(p->dev);
 	spin_lock_irq(&priv->lock);
 	set_bit(IPOIB_FLAG_OPER_UP, &p->flags);
 	if (p->neigh)
 		while ((skb = __skb_dequeue(&p->neigh->queue)))
 			__skb_queue_tail(&skqueue, skb);
 	spin_unlock_irq(&priv->lock);
+	netif_tx_unlock_bh(p->dev);
 
 	while ((skb = __skb_dequeue(&skqueue))) {
 		skb->dev = p->dev;
@@ -1229,8 +1235,9 @@ timeout:
 		dev_kfree_skb_any(tx_req->skb);
 		netif_tx_lock_bh(p->dev);
 		++p->tx_tail;
-		++priv->tx_tail;
-		if (unlikely(priv->tx_head - priv->tx_tail == ipoib_sendq_size >> 1) &&
+		++priv->global_tx_tail;
+		if (unlikely((priv->global_tx_head - priv->global_tx_tail) <=
+			     ipoib_sendq_size >> 1) &&
 		    netif_queue_stopped(p->dev) &&
 		    test_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags))
 			netif_wake_queue(p->dev);
@@ -1308,7 +1315,6 @@ struct ipoib_cm_tx *ipoib_cm_create_tx(struct net_device *dev, struct ipoib_path
 
 	neigh->cm = tx;
 	tx->neigh = neigh;
-	tx->path = path;
 	tx->dev = dev;
 	list_add(&tx->list, &priv->cm.start_list);
 	set_bit(IPOIB_FLAG_INITIALIZED, &tx->flags);
@@ -1367,7 +1373,7 @@ static void ipoib_cm_tx_start(struct work_struct *work)
 				neigh->daddr + QPN_AND_OPTIONS_OFFSET);
 			goto free_neigh;
 		}
-		memcpy(&pathrec, &p->path->pathrec, sizeof pathrec);
+		memcpy(&pathrec, &path->pathrec, sizeof(pathrec));
 
 		spin_unlock_irqrestore(&priv->lock, flags);
 		netif_tx_unlock_bh(dev);
@@ -1434,11 +1440,15 @@ static void ipoib_cm_skb_reap(struct work_struct *work)
 		spin_unlock_irqrestore(&priv->lock, flags);
 		netif_tx_unlock_bh(dev);
 
-		if (skb->protocol == htons(ETH_P_IP))
+		if (skb->protocol == htons(ETH_P_IP)) {
+			memset(IPCB(skb), 0, sizeof(*IPCB(skb)));
 			icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED, htonl(mtu));
+		}
 #if IS_ENABLED(CONFIG_IPV6)
-		else if (skb->protocol == htons(ETH_P_IPV6))
+		else if (skb->protocol == htons(ETH_P_IPV6)) {
+			memset(IP6CB(skb), 0, sizeof(*IP6CB(skb)));
 			icmpv6_send(skb, ICMPV6_PKT_TOOBIG, 0, mtu);
+		}
 #endif
 		dev_kfree_skb_any(skb);
 

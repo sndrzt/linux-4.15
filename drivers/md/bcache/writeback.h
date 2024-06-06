@@ -5,6 +5,21 @@
 #define CUTOFF_WRITEBACK	40
 #define CUTOFF_WRITEBACK_SYNC	70
 
+#define WRITEBACK_RATE_UPDATE_SECS_MAX		60
+#define WRITEBACK_RATE_UPDATE_SECS_DEFAULT	5
+
+
+#define BCH_WRITEBACK_FRAGMENT_THRESHOLD_LOW 50
+#define BCH_WRITEBACK_FRAGMENT_THRESHOLD_MID 57
+#define BCH_WRITEBACK_FRAGMENT_THRESHOLD_HIGH 64
+
+/*
+ * 14 (16384ths) is chosen here as something that each backing device
+ * should be a reasonable fraction of the share, and not to blow up
+ * until individual backing devices are a petabyte.
+ */
+#define WRITEBACK_SHARE_SHIFT   14
+
 static inline uint64_t bcache_dev_sectors_dirty(struct bcache_device *d)
 {
 	uint64_t i, ret = 0;
@@ -26,7 +41,7 @@ static inline uint64_t  bcache_flash_devs_sectors_dirty(struct cache_set *c)
 
 		if (!d || !UUID_FLASH_ONLY(&c->uuids[i]))
 			continue;
-	   ret += bcache_dev_sectors_dirty(d);
+		ret += bcache_dev_sectors_dirty(d);
 	}
 
 	mutex_unlock(&bch_register_lock);
@@ -69,6 +84,12 @@ static inline bool should_writeback(struct cached_dev *dc, struct bio *bio,
 	    in_use > CUTOFF_WRITEBACK_SYNC)
 		return false;
 
+	if (bio_op(bio) == REQ_OP_DISCARD)
+		return false;
+
+	if (bio_op(bio) == REQ_OP_DISCARD)
+		return false;
+
 	if (dc->partial_stripes_expensive &&
 	    bcache_dev_stripe_dirty(dc, bio->bi_iter.bi_sector,
 				    bio_sectors(bio)))
@@ -92,8 +113,6 @@ static inline void bch_writeback_add(struct cached_dev *dc)
 {
 	if (!atomic_read(&dc->has_dirty) &&
 	    !atomic_xchg(&dc->has_dirty, 1)) {
-		refcount_inc(&dc->count);
-
 		if (BDEV_STATE(&dc->sb) != BDEV_STATE_DIRTY) {
 			SET_BDEV_STATE(&dc->sb, BDEV_STATE_DIRTY);
 			/* XXX: should do this synchronously */

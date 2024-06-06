@@ -2940,7 +2940,8 @@ nv50_msto_enable(struct drm_encoder *encoder)
 
 	slots = drm_dp_find_vcpi_slots(&mstm->mgr, mstc->pbn);
 	r = drm_dp_mst_allocate_vcpi(&mstm->mgr, mstc->port, mstc->pbn, slots);
-	WARN_ON(!r);
+	if (!r)
+		DRM_DEBUG_KMS("Failed to allocate VCPI\n");
 
 	if (!mstm->links++)
 		nv50_outp_acquire(mstm->outp);
@@ -3216,10 +3217,11 @@ nv50_mstm_destroy_connector(struct drm_dp_mst_topology_mgr *mgr,
 
 	drm_connector_unregister(&mstc->connector);
 
-	drm_modeset_lock_all(drm->dev);
 	drm_fb_helper_remove_one_connector(&drm->fbcon->helper, &mstc->connector);
+
+	drm_modeset_lock(&drm->dev->mode_config.connection_mutex, NULL);
 	mstc->port = NULL;
-	drm_modeset_unlock_all(drm->dev);
+	drm_modeset_unlock(&drm->dev->mode_config.connection_mutex);
 
 	drm_connector_unreference(&mstc->connector);
 }
@@ -3229,9 +3231,7 @@ nv50_mstm_register_connector(struct drm_connector *connector)
 {
 	struct nouveau_drm *drm = nouveau_drm(connector->dev);
 
-	drm_modeset_lock_all(drm->dev);
 	drm_fb_helper_add_one_connector(&drm->fbcon->helper, connector);
-	drm_modeset_unlock_all(drm->dev);
 
 	drm_connector_register(connector);
 }
@@ -3314,17 +3314,20 @@ nv50_mstm_enable(struct nv50_mstm *mstm, u8 dpcd, int state)
 	int ret;
 
 	if (dpcd >= 0x12) {
-		ret = drm_dp_dpcd_readb(mstm->mgr.aux, DP_MSTM_CTRL, &dpcd);
+		/* Even if we're enabling MST, start with disabling the
+		 * branching unit to clear any sink-side MST topology state
+		 * that wasn't set by us
+		 */
+		ret = drm_dp_dpcd_writeb(mstm->mgr.aux, DP_MSTM_CTRL, 0);
 		if (ret < 0)
 			return ret;
-
-		dpcd &= ~DP_MST_EN;
-		if (state)
-			dpcd |= DP_MST_EN;
-
-		ret = drm_dp_dpcd_writeb(mstm->mgr.aux, DP_MSTM_CTRL, dpcd);
-		if (ret < 0)
-			return ret;
+		if (state) {
+			/* Now, start initializing */
+			ret = drm_dp_dpcd_writeb(mstm->mgr.aux, DP_MSTM_CTRL,
+						 DP_MST_EN);
+			if (ret < 0)
+				return ret;
+		}
 	}
 
 	return nvif_mthd(disp, 0, &args, sizeof(args));
@@ -3333,31 +3336,58 @@ nv50_mstm_enable(struct nv50_mstm *mstm, u8 dpcd, int state)
 int
 nv50_mstm_detect(struct nv50_mstm *mstm, u8 dpcd[8], int allow)
 {
-	int ret, state = 0;
+	struct drm_dp_aux *aux;
+	int ret;
+	bool old_state, new_state;
+	u8 mstm_ctrl;
 
 	if (!mstm)
 		return 0;
 
-	if (dpcd[0] >= 0x12) {
-		ret = drm_dp_dpcd_readb(mstm->mgr.aux, DP_MSTM_CAP, &dpcd[1]);
+	mutex_lock(&mstm->mgr.lock);
+
+	old_state = mstm->mgr.mst_state;
+	new_state = old_state;
+	aux = mstm->mgr.aux;
+
+	if (old_state) {
+		/* Just check that the MST hub is still as we expect it */
+		ret = drm_dp_dpcd_readb(aux, DP_MSTM_CTRL, &mstm_ctrl);
+		if (ret < 0 || !(mstm_ctrl & DP_MST_EN)) {
+			DRM_DEBUG_KMS("Hub gone, disabling MST topology\n");
+			new_state = false;
+		}
+	} else if (dpcd[0] >= 0x12) {
+		ret = drm_dp_dpcd_readb(aux, DP_MSTM_CAP, &dpcd[1]);
 		if (ret < 0)
-			return ret;
+			goto probe_error;
 
 		if (!(dpcd[1] & DP_MST_CAP))
 			dpcd[0] = 0x11;
 		else
-			state = allow;
+			new_state = allow;
 	}
 
-	ret = nv50_mstm_enable(mstm, dpcd[0], state);
-	if (ret)
-		return ret;
+	if (new_state == old_state) {
+		mutex_unlock(&mstm->mgr.lock);
+		return new_state;
+	}
 
-	ret = drm_dp_mst_topology_mgr_set_mst(&mstm->mgr, state);
+	ret = nv50_mstm_enable(mstm, dpcd[0], new_state);
+	if (ret)
+		goto probe_error;
+
+	mutex_unlock(&mstm->mgr.lock);
+
+	ret = drm_dp_mst_topology_mgr_set_mst(&mstm->mgr, new_state);
 	if (ret)
 		return nv50_mstm_enable(mstm, dpcd[0], 0);
 
-	return mstm->mgr.mst_state;
+	return new_state;
+
+probe_error:
+	mutex_unlock(&mstm->mgr.lock);
+	return ret;
 }
 
 static void
@@ -3370,8 +3400,16 @@ nv50_mstm_fini(struct nv50_mstm *mstm)
 static void
 nv50_mstm_init(struct nv50_mstm *mstm)
 {
-	if (mstm && mstm->mgr.mst_state)
-		drm_dp_mst_topology_mgr_resume(&mstm->mgr);
+	int ret;
+
+	if (!mstm || !mstm->mgr.mst_state)
+		return;
+
+	ret = drm_dp_mst_topology_mgr_resume(&mstm->mgr);
+	if (ret == -1) {
+		drm_dp_mst_topology_mgr_set_mst(&mstm->mgr, false);
+		drm_kms_helper_hotplug_event(mstm->mgr.dev);
+	}
 }
 
 static void
@@ -3379,6 +3417,7 @@ nv50_mstm_del(struct nv50_mstm **pmstm)
 {
 	struct nv50_mstm *mstm = *pmstm;
 	if (mstm) {
+		drm_dp_mst_topology_mgr_destroy(&mstm->mgr);
 		kfree(*pmstm);
 		*pmstm = NULL;
 	}
@@ -4151,7 +4190,7 @@ nv50_disp_atomic_commit(struct drm_device *dev,
 		nv50_disp_atomic_commit_tail(state);
 
 	drm_for_each_crtc(crtc, dev) {
-		if (crtc->state->enable) {
+		if (crtc->state->active) {
 			if (!drm->have_disp_power_ref) {
 				drm->have_disp_power_ref = true;
 				return 0;
@@ -4399,10 +4438,6 @@ nv50_display_destroy(struct drm_device *dev)
 	kfree(disp);
 }
 
-MODULE_PARM_DESC(atomic, "Expose atomic ioctl (default: disabled)");
-static int nouveau_atomic = 0;
-module_param_named(atomic, nouveau_atomic, int, 0400);
-
 int
 nv50_display_create(struct drm_device *dev)
 {
@@ -4426,8 +4461,7 @@ nv50_display_create(struct drm_device *dev)
 	nouveau_display(dev)->fini = nv50_display_fini;
 	disp->disp = &nouveau_display(dev)->disp;
 	dev->mode_config.funcs = &nv50_disp_func;
-	if (nouveau_atomic)
-		dev->driver->driver_features |= DRIVER_ATOMIC;
+	dev->driver->driver_features |= DRIVER_PREFER_XBGR_30BPP;
 
 	/* small shared memory area we use for notifiers and semaphores */
 	ret = nouveau_bo_new(&drm->client, 4096, 0x1000, TTM_PL_FLAG_VRAM,

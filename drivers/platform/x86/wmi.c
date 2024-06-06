@@ -352,7 +352,14 @@ static acpi_status __query_block(struct wmi_block *wblock, u8 instance,
 	 * the WQxx method failed - we should disable collection anyway.
 	 */
 	if ((block->flags & ACPI_WMI_EXPENSIVE) && ACPI_SUCCESS(wc_status)) {
-		status = acpi_execute_simple_method(handle, wc_method, 0);
+		/*
+		 * Ignore whether this WCxx call succeeds or not since
+		 * the previously executed WQxx method call might have
+		 * succeeded, and returning the failing status code
+		 * of this call would throw away the result of the WQxx
+		 * call, potentially leaking memory.
+		 */
+		acpi_execute_simple_method(handle, wc_method, 0);
 	}
 
 	return status;
@@ -776,6 +783,9 @@ static int wmi_dev_match(struct device *dev, struct device_driver *driver)
 	struct wmi_block *wblock = dev_to_wblock(dev);
 	const struct wmi_device_id *id = wmi_driver->id_table;
 
+	if (id == NULL)
+		return 0;
+
 	while (id->guid_string) {
 		uuid_le driver_guid;
 
@@ -903,7 +913,6 @@ static int wmi_dev_probe(struct device *dev)
 	struct wmi_driver *wdriver =
 		container_of(dev->driver, struct wmi_driver, driver);
 	int ret = 0;
-	int count;
 	char *buf;
 
 	if (ACPI_FAILURE(wmi_method_enable(wblock, 1)))
@@ -925,15 +934,14 @@ static int wmi_dev_probe(struct device *dev)
 			goto probe_failure;
 		}
 
-		count = get_order(wblock->req_buf_size);
-		wblock->handler_data = (void *)__get_free_pages(GFP_KERNEL,
-								count);
+		wblock->handler_data = kmalloc(wblock->req_buf_size,
+					       GFP_KERNEL);
 		if (!wblock->handler_data) {
 			ret = -ENOMEM;
 			goto probe_failure;
 		}
 
-		buf = kmalloc(strlen(wdriver->driver.name) + 4, GFP_KERNEL);
+		buf = kmalloc(strlen(wdriver->driver.name) + 5, GFP_KERNEL);
 		if (!buf) {
 			ret = -ENOMEM;
 			goto probe_string_failure;
@@ -973,8 +981,7 @@ static int wmi_dev_remove(struct device *dev)
 	if (wdriver->filter_callback) {
 		misc_deregister(&wblock->char_dev);
 		kfree(wblock->char_dev.name);
-		free_pages((unsigned long)wblock->handler_data,
-			   get_order(wblock->req_buf_size));
+		kfree(wblock->handler_data);
 	}
 
 	if (wdriver->remove)

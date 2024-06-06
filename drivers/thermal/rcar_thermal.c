@@ -401,8 +401,8 @@ static irqreturn_t rcar_thermal_irq(int irq, void *data)
 	rcar_thermal_for_each_priv(priv, common) {
 		if (rcar_thermal_had_changed(priv, status)) {
 			rcar_thermal_irq_disable(priv);
-			schedule_delayed_work(&priv->work,
-					      msecs_to_jiffies(300));
+			queue_delayed_work(system_freezable_wq, &priv->work,
+					   msecs_to_jiffies(300));
 		}
 	}
 
@@ -420,6 +420,7 @@ static int rcar_thermal_remove(struct platform_device *pdev)
 
 	rcar_thermal_for_each_priv(priv, common) {
 		rcar_thermal_irq_disable(priv);
+		cancel_delayed_work_sync(&priv->work);
 		if (rcar_use_of_thermal(dev))
 			thermal_remove_hwmon_sysfs(priv->zone);
 		else
@@ -466,8 +467,10 @@ static int rcar_thermal_probe(struct platform_device *pdev)
 		 */
 		res = platform_get_resource(pdev, IORESOURCE_MEM, mres++);
 		common->base = devm_ioremap_resource(dev, res);
-		if (IS_ERR(common->base))
-			return PTR_ERR(common->base);
+		if (IS_ERR(common->base)) {
+			ret = PTR_ERR(common->base);
+			goto error_unregister;
+		}
 
 		idle = 0; /* polling delay is not needed */
 	}

@@ -538,7 +538,7 @@ static void wake_migration_worker(struct cache *cache)
 
 static struct dm_bio_prison_cell_v2 *alloc_prison_cell(struct cache *cache)
 {
-	return dm_bio_prison_alloc_cell_v2(cache->prison, GFP_NOWAIT);
+	return dm_bio_prison_alloc_cell_v2(cache->prison, GFP_NOIO);
 }
 
 static void free_prison_cell(struct cache *cache, struct dm_bio_prison_cell_v2 *cell)
@@ -550,9 +550,7 @@ static struct dm_cache_migration *alloc_migration(struct cache *cache)
 {
 	struct dm_cache_migration *mg;
 
-	mg = mempool_alloc(cache->migration_pool, GFP_NOWAIT);
-	if (!mg)
-		return NULL;
+	mg = mempool_alloc(cache->migration_pool, GFP_NOIO);
 
 	memset(mg, 0, sizeof(*mg));
 
@@ -660,10 +658,6 @@ static bool bio_detain_shared(struct cache *cache, dm_oblock_t oblock, struct bi
 	struct dm_bio_prison_cell_v2 *cell_prealloc, *cell;
 
 	cell_prealloc = alloc_prison_cell(cache); /* FIXME: allow wait if calling from worker */
-	if (!cell_prealloc) {
-		defer_bio(cache, bio);
-		return false;
-	}
 
 	build_key(oblock, end, &key);
 	r = dm_cell_get_v2(cache->prison, &key, lock_level(bio), bio, cell_prealloc, &cell);
@@ -1013,14 +1007,14 @@ static void abort_transaction(struct cache *cache)
 	if (get_cache_mode(cache) >= CM_READ_ONLY)
 		return;
 
-	if (dm_cache_metadata_set_needs_check(cache->cmd)) {
-		DMERR("%s: failed to set 'needs_check' flag in metadata", dev_name);
-		set_cache_mode(cache, CM_FAIL);
-	}
-
 	DMERR_LIMIT("%s: aborting current metadata transaction", dev_name);
 	if (dm_cache_metadata_abort(cache->cmd)) {
 		DMERR("%s: failed to abort metadata transaction", dev_name);
+		set_cache_mode(cache, CM_FAIL);
+	}
+
+	if (dm_cache_metadata_set_needs_check(cache->cmd)) {
+		DMERR("%s: failed to set 'needs_check' flag in metadata", dev_name);
 		set_cache_mode(cache, CM_FAIL);
 	}
 }
@@ -1497,11 +1491,6 @@ static int mg_lock_writes(struct dm_cache_migration *mg)
 	struct dm_bio_prison_cell_v2 *prealloc;
 
 	prealloc = alloc_prison_cell(cache);
-	if (!prealloc) {
-		DMERR_LIMIT("%s: alloc_prison_cell failed", cache_device_name(cache));
-		mg_complete(mg, false);
-		return -ENOMEM;
-	}
 
 	/*
 	 * Prevent writes to the block, but allow reads to continue.
@@ -1539,11 +1528,6 @@ static int mg_start(struct cache *cache, struct policy_work *op, struct bio *bio
 	}
 
 	mg = alloc_migration(cache);
-	if (!mg) {
-		policy_complete_background_work(cache->policy, op, false);
-		background_work_end(cache);
-		return -ENOMEM;
-	}
 
 	mg->op = op;
 	mg->overwrite_bio = bio;
@@ -1632,10 +1616,6 @@ static int invalidate_lock(struct dm_cache_migration *mg)
 	struct dm_bio_prison_cell_v2 *prealloc;
 
 	prealloc = alloc_prison_cell(cache);
-	if (!prealloc) {
-		invalidate_complete(mg, false);
-		return -ENOMEM;
-	}
 
 	build_key(mg->invalidate_oblock, oblock_succ(mg->invalidate_oblock), &key);
 	r = dm_cell_lock_v2(cache->prison, &key,
@@ -1673,10 +1653,6 @@ static int invalidate_start(struct cache *cache, dm_cblock_t cblock,
 		return -EPERM;
 
 	mg = alloc_migration(cache);
-	if (!mg) {
-		background_work_end(cache);
-		return -ENOMEM;
-	}
 
 	mg->overwrite_bio = bio;
 	mg->invalidate_cblock = cblock;
@@ -2016,6 +1992,7 @@ static void destroy(struct cache *cache)
 	if (cache->prison)
 		dm_bio_prison_destroy_v2(cache->prison);
 
+	cancel_delayed_work_sync(&cache->waker);
 	if (cache->wq)
 		destroy_workqueue(cache->wq);
 
@@ -2248,7 +2225,7 @@ static int parse_features(struct cache_args *ca, struct dm_arg_set *as,
 		{0, 2, "Invalid number of cache feature arguments"},
 	};
 
-	int r;
+	int r, mode_ctr = 0;
 	unsigned argc;
 	const char *arg;
 	struct cache_features *cf = &ca->features;
@@ -2262,14 +2239,20 @@ static int parse_features(struct cache_args *ca, struct dm_arg_set *as,
 	while (argc--) {
 		arg = dm_shift_arg(as);
 
-		if (!strcasecmp(arg, "writeback"))
+		if (!strcasecmp(arg, "writeback")) {
 			cf->io_mode = CM_IO_WRITEBACK;
+			mode_ctr++;
+		}
 
-		else if (!strcasecmp(arg, "writethrough"))
+		else if (!strcasecmp(arg, "writethrough")) {
 			cf->io_mode = CM_IO_WRITETHROUGH;
+			mode_ctr++;
+		}
 
-		else if (!strcasecmp(arg, "passthrough"))
+		else if (!strcasecmp(arg, "passthrough")) {
 			cf->io_mode = CM_IO_PASSTHROUGH;
+			mode_ctr++;
+		}
 
 		else if (!strcasecmp(arg, "metadata2"))
 			cf->metadata_version = 2;
@@ -2278,6 +2261,11 @@ static int parse_features(struct cache_args *ca, struct dm_arg_set *as,
 			*error = "Unrecognised cache feature requested";
 			return -EINVAL;
 		}
+	}
+
+	if (mode_ctr > 1) {
+		*error = "Duplicate cache io_mode features requested";
+		return -EINVAL;
 	}
 
 	return 0;
@@ -2878,8 +2866,8 @@ static void cache_postsuspend(struct dm_target *ti)
 	prevent_background_work(cache);
 	BUG_ON(atomic_read(&cache->nr_io_migrations));
 
-	cancel_delayed_work(&cache->waker);
-	flush_workqueue(cache->wq);
+	cancel_delayed_work_sync(&cache->waker);
+	drain_workqueue(cache->wq);
 	WARN_ON(cache->tracker.in_flight);
 
 	/*
@@ -3004,8 +2992,13 @@ static dm_cblock_t get_cache_dev_size(struct cache *cache)
 
 static bool can_resize(struct cache *cache, dm_cblock_t new_size)
 {
-	if (from_cblock(new_size) > from_cblock(cache->cache_size))
-		return true;
+	if (from_cblock(new_size) > from_cblock(cache->cache_size)) {
+		if (cache->sized) {
+			DMERR("%s: unable to extend cache due to missing cache table reload",
+			      cache_device_name(cache));
+			return false;
+		}
+	}
 
 	/*
 	 * We can't drop a dirty block when shrinking the cache.
@@ -3473,14 +3466,13 @@ static int __init dm_cache_init(void)
 	int r;
 
 	migration_cache = KMEM_CACHE(dm_cache_migration, 0);
-	if (!migration_cache) {
-		dm_unregister_target(&cache_target);
+	if (!migration_cache)
 		return -ENOMEM;
-	}
 
 	r = dm_register_target(&cache_target);
 	if (r) {
 		DMERR("cache target registration failed: %d", r);
+		kmem_cache_destroy(migration_cache);
 		return r;
 	}
 

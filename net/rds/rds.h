@@ -150,7 +150,7 @@ struct rds_connection {
 
 	/* Protocol version */
 	unsigned int		c_version;
-	struct net		*c_net;
+	possible_net_t		c_net;
 
 	struct list_head	c_map_item;
 	unsigned long		c_map_queued;
@@ -165,13 +165,13 @@ struct rds_connection {
 static inline
 struct net *rds_conn_net(struct rds_connection *conn)
 {
-	return conn->c_net;
+	return read_pnet(&conn->c_net);
 }
 
 static inline
 void rds_conn_net_set(struct rds_connection *conn, struct net *net)
 {
-	conn->c_net = get_net(net);
+	write_pnet(&conn->c_net, net);
 }
 
 #define RDS_FLAG_CONG_BITMAP	0x01
@@ -356,6 +356,18 @@ static inline u32 rds_rdma_cookie_offset(rds_rdma_cookie_t cookie)
 #define RDS_MSG_PAGEVEC		7
 #define RDS_MSG_FLUSH		8
 
+struct rds_iov_vector {
+	struct rds_iovec *iov;
+	int               len;
+};
+
+struct rds_iov_vector_arr {
+	struct rds_iov_vector *vec;
+	int                    len;
+	int                    indx;
+	int                    incr;
+};
+
 struct rds_message {
 	refcount_t		m_refcount;
 	struct list_head	m_sock_item;
@@ -453,6 +465,11 @@ struct rds_notifier {
 	uint64_t		n_user_token;
 	int			n_status;
 };
+
+/* Available as part of RDS core, so doesn't need to participate
+ * in get_preferred transport etc
+ */
+#define	RDS_TRANS_LOOP	3
 
 /**
  * struct rds_transport -  transport specific behavioural hooks
@@ -839,13 +856,13 @@ int rds_get_mr(struct rds_sock *rs, char __user *optval, int optlen);
 int rds_get_mr_for_dest(struct rds_sock *rs, char __user *optval, int optlen);
 int rds_free_mr(struct rds_sock *rs, char __user *optval, int optlen);
 void rds_rdma_drop_keys(struct rds_sock *rs);
-int rds_rdma_extra_size(struct rds_rdma_args *args);
-int rds_cmsg_rdma_args(struct rds_sock *rs, struct rds_message *rm,
-			  struct cmsghdr *cmsg);
+int rds_rdma_extra_size(struct rds_rdma_args *args,
+			struct rds_iov_vector *iov);
 int rds_cmsg_rdma_dest(struct rds_sock *rs, struct rds_message *rm,
 			  struct cmsghdr *cmsg);
 int rds_cmsg_rdma_args(struct rds_sock *rs, struct rds_message *rm,
-			  struct cmsghdr *cmsg);
+			  struct cmsghdr *cmsg,
+			  struct rds_iov_vector *vec);
 int rds_cmsg_rdma_map(struct rds_sock *rs, struct rds_message *rm,
 			  struct cmsghdr *cmsg);
 void rds_rdma_free_op(struct rm_rdma_op *ro);

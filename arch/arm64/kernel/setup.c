@@ -64,6 +64,9 @@
 #include <asm/xen/hypervisor.h>
 #include <asm/mmu_context.h>
 
+static int num_standard_resources;
+static struct resource *standard_resources;
+
 phys_addr_t __fdt_pointer __initdata;
 
 /*
@@ -180,8 +183,12 @@ static void __init smp_build_mpidr_hash(void)
 
 static void __init setup_machine_fdt(phys_addr_t dt_phys)
 {
-	void *dt_virt = fixmap_remap_fdt(dt_phys);
+	int size;
+	void *dt_virt = fixmap_remap_fdt(dt_phys, &size, PAGE_KERNEL);
 	const char *name;
+
+	if (dt_virt)
+		memblock_reserve(dt_phys, size);
 
 	if (!dt_virt || !early_init_dt_scan(dt_virt)) {
 		pr_crit("\n"
@@ -193,6 +200,9 @@ static void __init setup_machine_fdt(phys_addr_t dt_phys)
 		while (true)
 			cpu_relax();
 	}
+
+	/* Early fixups are done, map the FDT as read-only now */
+	fixmap_remap_fdt(dt_phys, &size, PAGE_KERNEL_RO);
 
 	name = of_flat_dt_get_machine_name();
 	if (!name)
@@ -206,14 +216,19 @@ static void __init request_standard_resources(void)
 {
 	struct memblock_region *region;
 	struct resource *res;
+	unsigned long i = 0;
 
 	kernel_code.start   = __pa_symbol(_text);
 	kernel_code.end     = __pa_symbol(__init_begin - 1);
 	kernel_data.start   = __pa_symbol(_sdata);
 	kernel_data.end     = __pa_symbol(_end - 1);
 
+	num_standard_resources = memblock.memory.cnt;
+	standard_resources = alloc_bootmem_low(num_standard_resources *
+					       sizeof(*standard_resources));
+
 	for_each_memblock(memory, region) {
-		res = alloc_bootmem_low(sizeof(*res));
+		res = &standard_resources[i++];
 		if (memblock_is_nomap(region)) {
 			res->name  = "reserved";
 			res->flags = IORESOURCE_MEM;
@@ -240,6 +255,48 @@ static void __init request_standard_resources(void)
 #endif
 	}
 }
+
+static int __init reserve_memblock_reserved_regions(void)
+{
+	phys_addr_t start, end, roundup_end = 0;
+	struct resource *mem;
+	u64 i, mem_idx = 0;
+
+	if (!standard_resources)
+		return 0;
+
+	for_each_reserved_mem_region(i, &start, &end) {
+		if (end <= roundup_end)
+			continue; /* done already */
+
+		start = __pfn_to_phys(PFN_DOWN(start));
+		end = __pfn_to_phys(PFN_UP(end)) - 1;
+		roundup_end = end;
+
+		while (start > standard_resources[mem_idx].end) {
+			mem_idx++;
+			if (mem_idx >= num_standard_resources)
+				return 0; /* no more 'System RAM' */
+		}
+		do {
+			mem = &standard_resources[mem_idx];
+
+			if (mem->start > end)
+				continue; /* doesn't overlap with memory */
+
+			start = max(start, mem->start);
+			reserve_region_with_split(mem, start,
+						  min(end, mem->end),
+						  "reserved");
+
+			if (mem->end < end)
+				mem_idx++;
+		} while (mem->end < end && mem_idx < num_standard_resources);
+	}
+
+	return 0;
+}
+arch_initcall(reserve_memblock_reserved_regions);
 
 u64 __cpu_logical_map[NR_CPUS] = { [0 ... NR_CPUS-1] = INVALID_HWID };
 

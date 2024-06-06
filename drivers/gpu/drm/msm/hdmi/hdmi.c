@@ -148,6 +148,10 @@ static struct hdmi *msm_hdmi_init(struct platform_device *pdev)
 	/* HDCP needs physical address of hdmi register */
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
 		config->mmio_name);
+	if (!res) {
+		ret = -EINVAL;
+		goto fail;
+	}
 	hdmi->mmio_phy_addr = res->start;
 
 	hdmi->qfprom_mmio = msm_ioremap(pdev,
@@ -287,6 +291,11 @@ int msm_hdmi_modeset_init(struct hdmi *hdmi,
 	struct platform_device *pdev = hdmi->pdev;
 	int ret;
 
+	if (priv->num_bridges == ARRAY_SIZE(priv->bridges)) {
+		DRM_DEV_ERROR(dev->dev, "too many bridges\n");
+		return -ENOSPC;
+	}
+
 	hdmi->dev = dev;
 	hdmi->encoder = encoder;
 
@@ -321,6 +330,12 @@ int msm_hdmi_modeset_init(struct hdmi *hdmi,
 	if (ret < 0) {
 		dev_err(dev->dev, "failed to request IRQ%u: %d\n",
 				hdmi->irq, ret);
+		goto fail;
+	}
+
+	ret = msm_hdmi_hpd_enable(hdmi->connector);
+	if (ret < 0) {
+		DRM_DEV_ERROR(&hdmi->pdev->dev, "failed to enable HPD: %d\n", ret);
 		goto fail;
 	}
 

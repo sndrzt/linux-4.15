@@ -1373,7 +1373,7 @@ __acquires(bitmap->lock)
 	if (bitmap->bp[page].hijacked ||
 	    bitmap->bp[page].map == NULL)
 		csize = ((sector_t)1) << (bitmap->chunkshift +
-					  PAGE_COUNTER_SHIFT - 1);
+					  PAGE_COUNTER_SHIFT);
 	else
 		csize = ((sector_t)1) << bitmap->chunkshift;
 	*blocks = csize - (offset & (csize - 1));
@@ -1733,7 +1733,7 @@ void bitmap_flush(struct mddev *mddev)
 /*
  * free memory that was allocated
  */
-void bitmap_free(struct bitmap *bitmap)
+void md_bitmap_free(struct bitmap *bitmap)
 {
 	unsigned long k, pages;
 	struct bitmap_page *bp;
@@ -1767,7 +1767,7 @@ void bitmap_free(struct bitmap *bitmap)
 	kfree(bp);
 	kfree(bitmap);
 }
-EXPORT_SYMBOL(bitmap_free);
+EXPORT_SYMBOL(md_bitmap_free);
 
 void bitmap_wait_behind_writes(struct mddev *mddev)
 {
@@ -1800,7 +1800,7 @@ void bitmap_destroy(struct mddev *mddev)
 	if (mddev->thread)
 		mddev->thread->timeout = MAX_SCHEDULE_TIMEOUT;
 
-	bitmap_free(bitmap);
+	md_bitmap_free(bitmap);
 }
 
 /*
@@ -1891,7 +1891,7 @@ struct bitmap *bitmap_create(struct mddev *mddev, int slot)
 
 	return bitmap;
  error:
-	bitmap_free(bitmap);
+	md_bitmap_free(bitmap);
 	return ERR_PTR(err);
 }
 
@@ -1962,7 +1962,7 @@ struct bitmap *get_bitmap_from_slot(struct mddev *mddev, int slot)
 
 	rv = bitmap_init_from_disk(bitmap, 0);
 	if (rv) {
-		bitmap_free(bitmap);
+		md_bitmap_free(bitmap);
 		return ERR_PTR(rv);
 	}
 
@@ -2134,6 +2134,7 @@ int bitmap_resize(struct bitmap *bitmap, sector_t blocks,
 		memcpy(page_address(store.sb_page),
 		       page_address(bitmap->storage.sb_page),
 		       sizeof(bitmap_super_t));
+	spin_lock_irq(&bitmap->counts.lock);
 	bitmap_file_unmap(&bitmap->storage);
 	bitmap->storage = store;
 
@@ -2149,7 +2150,6 @@ int bitmap_resize(struct bitmap *bitmap, sector_t blocks,
 	blocks = min(old_counts.chunks << old_counts.chunkshift,
 		     chunks << chunkshift);
 
-	spin_lock_irq(&bitmap->counts.lock);
 	/* For cluster raid, need to pre-allocate bitmap */
 	if (mddev_is_clustered(bitmap->mddev)) {
 		unsigned long page;

@@ -26,6 +26,7 @@
 #include <linux/xattr.h>
 #include <linux/pid_namespace.h>
 #include <linux/refcount.h>
+#include <linux/user_namespace.h>
 
 /** Max number of pages that can be used in a single read request */
 #define FUSE_MAX_PAGES_PER_REQ 32
@@ -117,6 +118,8 @@ enum {
 	FUSE_I_INIT_RDPLUS,
 	/** An operation changing file size is in progress  */
 	FUSE_I_SIZE_UNSTABLE,
+	/* Bad inode */
+	FUSE_I_BAD,
 };
 
 struct fuse_conn;
@@ -310,6 +313,8 @@ struct fuse_req {
 	/** refcount */
 	refcount_t count;
 
+	bool user_pages;
+
 	/** Unique ID for the interrupt request */
 	u64 intr_unique;
 
@@ -465,6 +470,9 @@ struct fuse_conn {
 
 	/** The pid namespace for this mount */
 	struct pid_namespace *pid_ns;
+
+	/** The user namespace for this mount */
+	struct user_namespace *user_ns;
 
 	/** Maximum read size */
 	unsigned max_read;
@@ -687,6 +695,17 @@ static inline u64 get_node_id(struct inode *inode)
 	return get_fuse_inode(inode)->nodeid;
 }
 
+static inline void fuse_make_bad(struct inode *inode)
+{
+	remove_inode_hash(inode);
+	set_bit(FUSE_I_BAD, &get_fuse_inode(inode)->state);
+}
+
+static inline bool fuse_is_bad(struct inode *inode)
+{
+	return unlikely(test_bit(FUSE_I_BAD, &get_fuse_inode(inode)->state));
+}
+
 /** Device operations */
 extern const struct file_operations fuse_dev_operations;
 
@@ -739,7 +758,7 @@ void fuse_sync_release(struct fuse_file *ff, int flags);
 /**
  * Send RELEASE or RELEASEDIR request
  */
-void fuse_release_common(struct file *file, int opcode);
+void fuse_release_common(struct file *file, bool isdir);
 
 /**
  * Send FSYNC or FSYNCDIR request
@@ -852,6 +871,7 @@ void fuse_request_send_background_locked(struct fuse_conn *fc,
 
 /* Abort all requests */
 void fuse_abort_conn(struct fuse_conn *fc);
+void fuse_wait_aborted(struct fuse_conn *fc);
 
 /**
  * Invalidate inode attributes
@@ -870,7 +890,7 @@ struct fuse_conn *fuse_conn_get(struct fuse_conn *fc);
 /**
  * Initialize fuse_conn
  */
-void fuse_conn_init(struct fuse_conn *fc);
+void fuse_conn_init(struct fuse_conn *fc, struct user_namespace *user_ns);
 
 /**
  * Release reference to fuse_conn
@@ -894,6 +914,8 @@ void fuse_ctl_remove_conn(struct fuse_conn *fc);
  * Is file type valid?
  */
 int fuse_valid_type(int m);
+
+bool fuse_invalid_attr(struct fuse_attr *attr);
 
 /**
  * Is current process allowed to perform filesystem operation?
@@ -964,8 +986,8 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 
 void fuse_set_initialized(struct fuse_conn *fc);
 
-void fuse_unlock_inode(struct inode *inode);
-void fuse_lock_inode(struct inode *inode);
+void fuse_unlock_inode(struct inode *inode, bool locked);
+bool fuse_lock_inode(struct inode *inode);
 
 int fuse_setxattr(struct inode *inode, const char *name, const void *value,
 		  size_t size, int flags);

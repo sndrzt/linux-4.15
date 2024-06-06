@@ -130,6 +130,8 @@ static void mce_kbd_rx_timeout(struct timer_list *t)
 
 	for (i = 0; i < MCIR2_MASK_KEYS_START; i++)
 		input_report_key(mce_kbd->idev, kbd_keycodes[i], 0);
+
+	input_sync(mce_kbd->idev);
 }
 
 static enum mce_kbd_mode mce_kbd_mode(struct mce_kbd_dec *data)
@@ -319,11 +321,13 @@ again:
 		case MCIR2_KEYBOARD_NBITS:
 			scancode = data->body & 0xffff;
 			IR_dprintk(1, "keyboard data 0x%08x\n", data->body);
-			if (dev->timeout)
-				delay = usecs_to_jiffies(dev->timeout / 1000);
-			else
-				delay = msecs_to_jiffies(100);
-			mod_timer(&data->rx_timeout, jiffies + delay);
+			if (scancode) {
+				delay = nsecs_to_jiffies(dev->timeout) +
+					msecs_to_jiffies(100);
+				mod_timer(&data->rx_timeout, jiffies + delay);
+			} else {
+				del_timer(&data->rx_timeout);
+			}
 			/* Pass data to keyboard buffer parser */
 			ir_mce_kbd_process_keyboard_data(data->idev, scancode);
 			break;

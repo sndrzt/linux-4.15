@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017 Broadcom. All Rights Reserved. The term      *
+ * Copyright (C) 2017-2018 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Limited and/or its subsidiaries.  *
  * Copyright (C) 2004-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -56,9 +56,6 @@ void lpfc_register_new_vport(struct lpfc_hba *, struct lpfc_vport *,
 void lpfc_unreg_vpi(struct lpfc_hba *, uint16_t, LPFC_MBOXQ_t *);
 void lpfc_init_link(struct lpfc_hba *, LPFC_MBOXQ_t *, uint32_t, uint32_t);
 void lpfc_request_features(struct lpfc_hba *, struct lpfcMboxq *);
-void lpfc_supported_pages(struct lpfcMboxq *);
-void lpfc_pc_sli4_params(struct lpfcMboxq *);
-int lpfc_pc_sli4_params_get(struct lpfc_hba *, LPFC_MBOXQ_t *);
 int lpfc_sli4_mbox_rsrc_extent(struct lpfc_hba *, struct lpfcMboxq *,
 			   uint16_t, uint16_t, bool);
 int lpfc_get_sli4_parameters(struct lpfc_hba *, LPFC_MBOXQ_t *);
@@ -254,6 +251,9 @@ void lpfc_nvmet_ctxbuf_post(struct lpfc_hba *phba,
 			    struct lpfc_nvmet_ctxbuf *ctxp);
 int lpfc_nvmet_rcv_unsol_abort(struct lpfc_vport *vport,
 			       struct fc_frame_header *fc_hdr);
+void lpfc_nvmet_wqfull_process(struct lpfc_hba *phba, struct lpfc_queue *wq);
+void lpfc_sli_flush_nvme_rings(struct lpfc_hba *phba);
+void lpfc_nvme_wait_for_io_drain(struct lpfc_hba *phba);
 void lpfc_sli4_build_dflt_fcf_record(struct lpfc_hba *, struct fcf_record *,
 			uint16_t);
 int lpfc_sli4_rq_put(struct lpfc_queue *hq, struct lpfc_queue *dq,

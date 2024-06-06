@@ -18,6 +18,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <linux/arm-smccc.h>
 #include <linux/init.h>
 #include <linux/linkage.h>
 
@@ -28,6 +29,8 @@
 #include <asm/errno.h>
 #include <asm/esr.h>
 #include <asm/irq.h>
+#include <asm/memory.h>
+#include <asm/mmu.h>
 #include <asm/processor.h>
 #include <asm/ptrace.h>
 #include <asm/thread_info.h>
@@ -69,8 +72,24 @@
 #define BAD_FIQ		2
 #define BAD_ERROR	3
 
-	.macro kernel_ventry	label
+	.macro kernel_ventry, el, label, regsize = 64
 	.align 7
+.Lventry_start\@:
+	.if	\el == 0
+	/*
+	 * This must be the first instruction of the EL0 vector entries. It is
+	 * skipped by the trampoline vectors, to trigger the cleanup.
+	 */
+	b	.Lskip_tramp_vectors_cleanup\@
+	.if	\regsize == 64
+	mrs	x30, tpidrro_el0
+	msr	tpidrro_el0, xzr
+	.else
+	mov	x30, xzr
+	.endif
+.Lskip_tramp_vectors_cleanup\@:
+	.endif
+
 	sub	sp, sp, #S_FRAME_SIZE
 #ifdef CONFIG_VMAP_STACK
 	/*
@@ -82,7 +101,7 @@
 	tbnz	x0, #THREAD_SHIFT, 0f
 	sub	x0, sp, x0			// x0'' = sp' - x0' = (sp + x0) - sp = x0
 	sub	sp, sp, x0			// sp'' = sp' - x0 = (sp + x0) - x0 = sp
-	b	\label
+	b	el\()\el\()_\label
 
 0:
 	/*
@@ -114,7 +133,35 @@
 	sub	sp, sp, x0
 	mrs	x0, tpidrro_el0
 #endif
-	b	\label
+	b	el\()\el\()_\label
+.org .Lventry_start\@ + 128	// Did we overflow the ventry slot?
+	.endm
+
+	.macro tramp_alias, dst, sym, tmp
+	mov_q	\dst, TRAMP_VALIAS
+	adr_l	\tmp, \sym
+	add	\dst, \dst, \tmp
+	adr_l	\tmp, .entry.tramp.text
+	sub	\dst, \dst, \tmp
+	.endm
+
+	// This macro corrupts x0-x3. It is the caller's duty
+	// to save/restore them if required.
+	.macro	apply_ssbd, state, targ, tmp1, tmp2
+#ifdef CONFIG_ARM64_SSBD
+alternative_cb	arm64_enable_wa2_handling
+	b	\targ
+alternative_cb_end
+	ldr_this_cpu	\tmp2, arm64_ssbd_callback_required, \tmp1
+	cbz	\tmp2, \targ
+	ldr	\tmp2, [tsk, #TSK_TI_FLAGS]
+	tbnz	\tmp2, #TIF_SSBD, \targ
+	mov	w0, #ARM_SMCCC_ARCH_WORKAROUND_2
+	mov	w1, #\state
+alternative_cb	arm64_update_smccc_conduit
+	nop					// Patched to SMC/HVC #0
+alternative_cb_end
+#endif
 	.endm
 
 	.macro	kernel_entry, el, regsize = 64
@@ -143,14 +190,22 @@
 	ldr	x19, [tsk, #TSK_TI_FLAGS]	// since we can unmask debug
 	disable_step_tsk x19, x20		// exceptions when scheduling.
 
+	apply_ssbd 1, 1f, x22, x23
+
+#ifdef CONFIG_ARM64_SSBD
+	ldp	x0, x1, [sp, #16 * 0]
+	ldp	x2, x3, [sp, #16 * 1]
+#endif
+1:
+
 	mov	x29, xzr			// fp pointed to user-space
 	.else
 	add	x21, sp, #S_FRAME_SIZE
 	get_thread_info tsk
-	/* Save the task's original addr_limit and set USER_DS (TASK_SIZE_64) */
+	/* Save the task's original addr_limit and set USER_DS */
 	ldr	x20, [tsk, #TSK_TI_ADDR_LIMIT]
 	str	x20, [sp, #S_ORIG_ADDR_LIMIT]
-	mov	x20, #TASK_SIZE_64
+	mov	x20, #USER_DS
 	str	x20, [tsk, #TSK_TI_ADDR_LIMIT]
 	/* No need to reset PSTATE.UAO, hardware's already set it to 0 for us */
 	.endif /* \el == 0 */
@@ -185,7 +240,7 @@ alternative_else_nop_endif
 
 	.if	\el != 0
 	mrs	x21, ttbr0_el1
-	tst	x21, #0xffff << 48		// Check for the reserved ASID
+	tst	x21, #TTBR_ASID_MASK		// Check for the reserved ASID
 	orr	x23, x23, #PSR_PAN_BIT		// Set the emulated PAN in the saved SPSR
 	b.eq	1f				// TTBR0 access already disabled
 	and	x23, x23, #~PSR_PAN_BIT		// Clear the emulated PAN in the saved SPSR
@@ -248,7 +303,7 @@ alternative_else_nop_endif
 	tbnz	x22, #22, 1f			// Skip re-enabling TTBR0 access if the PSR_PAN_BIT is set
 	.endif
 
-	__uaccess_ttbr0_enable x0
+	__uaccess_ttbr0_enable x0, x1
 
 	.if	\el == 0
 	/*
@@ -257,7 +312,7 @@ alternative_else_nop_endif
 	 * Cavium erratum 27456 (broadcast TLBI instructions may cause I-cache
 	 * corruption).
 	 */
-	post_ttbr0_update_workaround
+	bl	post_ttbr_update_workaround
 	.endif
 1:
 	.if	\el != 0
@@ -269,18 +324,22 @@ alternative_else_nop_endif
 	.if	\el == 0
 	ldr	x23, [sp, #S_SP]		// load return stack pointer
 	msr	sp_el0, x23
+	tst	x22, #PSR_MODE32_BIT		// native task?
+	b.eq	3f
+
 #ifdef CONFIG_ARM64_ERRATUM_845719
 alternative_if ARM64_WORKAROUND_845719
-	tbz	x22, #4, 1f
 #ifdef CONFIG_PID_IN_CONTEXTIDR
 	mrs	x29, contextidr_el1
 	msr	contextidr_el1, x29
 #else
 	msr contextidr_el1, xzr
 #endif
-1:
 alternative_else_nop_endif
 #endif
+3:
+	apply_ssbd 0, 5f, x0, x1
+5:
 	.endif
 
 	msr	elr_el1, x21			// set up the return data
@@ -300,9 +359,27 @@ alternative_else_nop_endif
 	ldp	x24, x25, [sp, #16 * 12]
 	ldp	x26, x27, [sp, #16 * 13]
 	ldp	x28, x29, [sp, #16 * 14]
+
+	.if	\el == 0
+alternative_if_not ARM64_UNMAP_KERNEL_AT_EL0
 	ldr	lr, [sp, #S_LR]
 	add	sp, sp, #S_FRAME_SIZE		// restore sp
-	eret					// return to kernel
+	eret
+alternative_else_nop_endif
+#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+	bne	4f
+	msr	far_el1, x29
+	tramp_alias	x30, tramp_exit_native, x29
+	br	x30
+4:
+	tramp_alias	x30, tramp_exit_compat, x29
+	br	x30
+#endif
+	.else
+	ldr	lr, [sp, #S_LR]
+	add	sp, sp, #S_FRAME_SIZE		// restore sp
+	eret
+	.endif
 	.endm
 
 	.macro	irq_stack_entry
@@ -342,6 +419,7 @@ alternative_else_nop_endif
  * x7 is reserved for the system call number in 32-bit mode.
  */
 wsc_nr	.req	w25		// number of system calls
+xsc_nr	.req	x25		// number of system calls (zero-extended)
 wscno	.req	w26		// syscall number
 xscno	.req	x26		// syscall number (zero-extended)
 stbl	.req	x27		// syscall table pointer
@@ -367,31 +445,31 @@ tsk	.req	x28		// current thread_info
 
 	.align	11
 ENTRY(vectors)
-	kernel_ventry	el1_sync_invalid		// Synchronous EL1t
-	kernel_ventry	el1_irq_invalid			// IRQ EL1t
-	kernel_ventry	el1_fiq_invalid			// FIQ EL1t
-	kernel_ventry	el1_error_invalid		// Error EL1t
+	kernel_ventry	1, sync_invalid			// Synchronous EL1t
+	kernel_ventry	1, irq_invalid			// IRQ EL1t
+	kernel_ventry	1, fiq_invalid			// FIQ EL1t
+	kernel_ventry	1, error_invalid		// Error EL1t
 
-	kernel_ventry	el1_sync			// Synchronous EL1h
-	kernel_ventry	el1_irq				// IRQ EL1h
-	kernel_ventry	el1_fiq_invalid			// FIQ EL1h
-	kernel_ventry	el1_error			// Error EL1h
+	kernel_ventry	1, sync				// Synchronous EL1h
+	kernel_ventry	1, irq				// IRQ EL1h
+	kernel_ventry	1, fiq_invalid			// FIQ EL1h
+	kernel_ventry	1, error			// Error EL1h
 
-	kernel_ventry	el0_sync			// Synchronous 64-bit EL0
-	kernel_ventry	el0_irq				// IRQ 64-bit EL0
-	kernel_ventry	el0_fiq_invalid			// FIQ 64-bit EL0
-	kernel_ventry	el0_error			// Error 64-bit EL0
+	kernel_ventry	0, sync				// Synchronous 64-bit EL0
+	kernel_ventry	0, irq				// IRQ 64-bit EL0
+	kernel_ventry	0, fiq_invalid			// FIQ 64-bit EL0
+	kernel_ventry	0, error			// Error 64-bit EL0
 
 #ifdef CONFIG_COMPAT
-	kernel_ventry	el0_sync_compat			// Synchronous 32-bit EL0
-	kernel_ventry	el0_irq_compat			// IRQ 32-bit EL0
-	kernel_ventry	el0_fiq_invalid_compat		// FIQ 32-bit EL0
-	kernel_ventry	el0_error_compat		// Error 32-bit EL0
+	kernel_ventry	0, sync_compat, 32		// Synchronous 32-bit EL0
+	kernel_ventry	0, irq_compat, 32		// IRQ 32-bit EL0
+	kernel_ventry	0, fiq_invalid_compat, 32	// FIQ 32-bit EL0
+	kernel_ventry	0, error_compat, 32		// Error 32-bit EL0
 #else
-	kernel_ventry	el0_sync_invalid		// Synchronous 32-bit EL0
-	kernel_ventry	el0_irq_invalid			// IRQ 32-bit EL0
-	kernel_ventry	el0_fiq_invalid			// FIQ 32-bit EL0
-	kernel_ventry	el0_error_invalid		// Error 32-bit EL0
+	kernel_ventry	0, sync_invalid, 32		// Synchronous 32-bit EL0
+	kernel_ventry	0, irq_invalid, 32		// IRQ 32-bit EL0
+	kernel_ventry	0, fiq_invalid, 32		// FIQ 32-bit EL0
+	kernel_ventry	0, error_invalid, 32		// Error 32-bit EL0
 #endif
 END(vectors)
 
@@ -528,7 +606,7 @@ el1_undef:
 	inherit_daif	pstate=x23, tmp=x2
 	mov	x0, sp
 	bl	do_undefinstr
-	ASM_BUG()
+	kernel_exit 1
 el1_dbg:
 	/*
 	 * Debug exception handling
@@ -685,12 +763,15 @@ el0_ia:
 	 * Instruction abort handling
 	 */
 	mrs	x26, far_el1
-	enable_daif
+	enable_da_f
+#ifdef CONFIG_TRACE_IRQFLAGS
+	bl	trace_hardirqs_off
+#endif
 	ct_user_exit
 	mov	x0, x26
 	mov	x1, x25
 	mov	x2, sp
-	bl	do_mem_abort
+	bl	do_el0_ia_bp_hardening
 	b	ret_to_user
 el0_fpsimd_acc:
 	/*
@@ -727,7 +808,10 @@ el0_sp_pc:
 	 * Stack or PC alignment exception handling
 	 */
 	mrs	x26, far_el1
-	enable_daif
+	enable_da_f
+#ifdef CONFIG_TRACE_IRQFLAGS
+	bl	trace_hardirqs_off
+#endif
 	ct_user_exit
 	mov	x0, x26
 	mov	x1, x25
@@ -762,7 +846,7 @@ el0_dbg:
 	mov	x1, x25
 	mov	x2, sp
 	bl	do_debug_exception
-	enable_daif
+	enable_da_f
 	ct_user_exit
 	b	ret_to_user
 el0_inv:
@@ -785,6 +869,11 @@ el0_irq_naked:
 #endif
 
 	ct_user_exit
+#ifdef CONFIG_HARDEN_BRANCH_PREDICTOR
+	tbz	x22, #55, 1f
+	bl	do_el0_irq_bp_hardening
+1:
+#endif
 	irq_handler
 
 #ifdef CONFIG_TRACE_IRQFLAGS
@@ -809,7 +898,7 @@ el0_error_naked:
 	enable_dbg
 	mov	x0, sp
 	bl	do_serror
-	enable_daif
+	enable_da_f
 	ct_user_exit
 	b	ret_to_user
 ENDPROC(el0_error)
@@ -896,6 +985,7 @@ el0_svc_naked:					// compat entry point
 	b.ne	__sys_trace
 	cmp     wscno, wsc_nr			// check upper syscall limit
 	b.hs	ni_sys
+	mask_nospec64 xscno, xsc_nr, x19	// enforce bounds for syscall number
 	ldr	x16, [stbl, xscno, lsl #3]	// address in the syscall table
 	blr	x16				// call sys_* routine
 	b	ret_fast_syscall
@@ -942,6 +1032,222 @@ __ni_sys_trace:
 	b	__sys_trace_return
 
 	.popsection				// .entry.text
+
+	// Move from tramp_pg_dir to swapper_pg_dir
+	.macro tramp_map_kernel, tmp
+	mrs	\tmp, ttbr1_el1
+	sub	\tmp, \tmp, #(SWAPPER_DIR_SIZE + RESERVED_TTBR0_SIZE)
+	bic	\tmp, \tmp, #USER_ASID_FLAG
+	msr	ttbr1_el1, \tmp
+#ifdef CONFIG_QCOM_FALKOR_ERRATUM_1003
+alternative_if ARM64_WORKAROUND_QCOM_FALKOR_E1003
+	/* ASID already in \tmp[63:48] */
+	movk	\tmp, #:abs_g2_nc:(TRAMP_VALIAS >> 12)
+	movk	\tmp, #:abs_g1_nc:(TRAMP_VALIAS >> 12)
+	/* 2MB boundary containing the vectors, so we nobble the walk cache */
+	movk	\tmp, #:abs_g0_nc:((TRAMP_VALIAS & ~(SZ_2M - 1)) >> 12)
+	isb
+	tlbi	vae1, \tmp
+	dsb	nsh
+alternative_else_nop_endif
+#endif /* CONFIG_QCOM_FALKOR_ERRATUM_1003 */
+	.endm
+
+	.macro tramp_unmap_kernel, tmp
+	mrs	\tmp, ttbr1_el1
+	add	\tmp, \tmp, #(SWAPPER_DIR_SIZE + RESERVED_TTBR0_SIZE)
+	orr	\tmp, \tmp, #USER_ASID_FLAG
+	msr	ttbr1_el1, \tmp
+	/*
+	 * We avoid running the post_ttbr_update_workaround here because
+	 * it's only needed by Cavium ThunderX, which requires KPTI to be
+	 * disabled.
+	 */
+	.endm
+
+	.macro tramp_data_page	dst
+	adr_l	\dst, .entry.tramp.text
+	sub	\dst, \dst, PAGE_SIZE
+	.endm
+
+	.macro tramp_data_read_var	dst, var
+#ifdef CONFIG_RANDOMIZE_BASE
+	tramp_data_page		\dst
+	add	\dst, \dst, #:lo12:__entry_tramp_data_\var
+	ldr	\dst, [\dst]
+#else
+	ldr	\dst, =\var
+#endif
+	.endm
+
+#define BHB_MITIGATION_NONE	0
+#define BHB_MITIGATION_LOOP	1
+#define BHB_MITIGATION_FW	2
+#define BHB_MITIGATION_INSN	3
+
+	.macro tramp_ventry, vector_start, regsize, kpti, bhb
+	.align	7
+1:
+	.if	\regsize == 64
+	msr	tpidrro_el0, x30	// Restored in kernel_ventry
+	.endif
+
+	.if	\bhb == BHB_MITIGATION_LOOP
+	/*
+	 * This sequence must appear before the first indirect branch. i.e. the
+	 * ret out of tramp_ventry. It appears here because x30 is free.
+	 */
+	__mitigate_spectre_bhb_loop	x30
+	.endif // \bhb == BHB_MITIGATION_LOOP
+
+	.if	\bhb == BHB_MITIGATION_INSN
+	clearbhb
+	isb
+	.endif // \bhb == BHB_MITIGATION_INSN
+
+	.if	\kpti == 1
+	/*
+	 * Defend against branch aliasing attacks by pushing a dummy
+	 * entry onto the return stack and using a RET instruction to
+	 * enter the full-fat kernel vectors.
+	 */
+	bl	2f
+	b	.
+2:
+	tramp_map_kernel	x30
+alternative_insn isb, nop, ARM64_WORKAROUND_QCOM_FALKOR_E1003
+	tramp_data_read_var	x30, vectors
+	prfm	plil1strm, [x30, #(1b - \vector_start)]
+	msr	vbar_el1, x30
+	isb
+	.else
+	ldr	x30, =vectors
+	.endif // \kpti == 1
+
+	.if	\bhb == BHB_MITIGATION_FW
+	/*
+	 * The firmware sequence must appear before the first indirect branch.
+	 * i.e. the ret out of tramp_ventry. But it also needs the stack to be
+	 * mapped to save/restore the registers the SMC clobbers.
+	 */
+	__mitigate_spectre_bhb_fw
+	.endif // \bhb == BHB_MITIGATION_FW
+
+	add	x30, x30, #(1b - \vector_start + 4)
+	ret
+.org 1b + 128	// Did we overflow the ventry slot?
+	.endm
+
+	.macro tramp_exit, regsize = 64
+	tramp_data_read_var	x30, this_cpu_vector
+alternative_if_not ARM64_HAS_VIRT_HOST_EXTN
+	mrs	x29, tpidr_el1
+alternative_else
+	mrs	x29, tpidr_el2
+alternative_endif
+	ldr	x30, [x30, x29]
+
+	msr	vbar_el1, x30
+	ldr	lr, [sp, #S_LR]
+	tramp_unmap_kernel	x29
+	.if	\regsize == 64
+	mrs	x29, far_el1
+	.endif
+	add	sp, sp, #S_FRAME_SIZE		// restore sp
+	eret
+	.endm
+
+	.macro	generate_tramp_vector,	kpti, bhb
+.Lvector_start\@:
+	.space	0x400
+
+	.rept	4
+	tramp_ventry	.Lvector_start\@, 64, \kpti, \bhb
+	.endr
+	.rept	4
+	tramp_ventry	.Lvector_start\@, 32, \kpti, \bhb
+	.endr
+	.endm
+
+#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+/*
+ * Exception vectors trampoline.
+ * The order must match __bp_harden_el1_vectors and the
+ * arm64_bp_harden_el1_vectors enum.
+ */
+	.pushsection ".entry.tramp.text", "ax"
+	.align	11
+ENTRY(tramp_vectors)
+#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
+	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_LOOP
+	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_FW
+	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_INSN
+#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
+	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_NONE
+END(tramp_vectors)
+
+ENTRY(tramp_exit_native)
+	tramp_exit
+END(tramp_exit_native)
+
+ENTRY(tramp_exit_compat)
+	tramp_exit	32
+END(tramp_exit_compat)
+
+	.ltorg
+	.popsection				// .entry.tramp.text
+#ifdef CONFIG_RANDOMIZE_BASE
+	.pushsection ".rodata", "a"
+	.align PAGE_SHIFT
+	.globl	__entry_tramp_data_start
+__entry_tramp_data_start:
+__entry_tramp_data_vectors:
+	.quad	vectors
+#ifdef CONFIG_ARM_SDE_INTERFACE
+__entry_tramp_data___sdei_asm_trampoline_next_handler:
+	.quad	__sdei_asm_handler
+#endif /* CONFIG_ARM_SDE_INTERFACE */
+__entry_tramp_data_this_cpu_vector:
+	.quad	this_cpu_vector
+	.popsection				// .rodata
+#endif /* CONFIG_RANDOMIZE_BASE */
+#endif /* CONFIG_UNMAP_KERNEL_AT_EL0 */
+
+/*
+ * Exception vectors for spectre mitigations on entry from EL1 when
+ * kpti is not in use.
+ */
+	.macro generate_el1_vector, bhb
+.Lvector_start\@:
+	kernel_ventry	1, sync_invalid			// Synchronous EL1t
+	kernel_ventry	1, irq_invalid			// IRQ EL1t
+	kernel_ventry	1, fiq_invalid			// FIQ EL1t
+	kernel_ventry	1, error_invalid		// Error EL1t
+
+	kernel_ventry	1, sync				// Synchronous EL1h
+	kernel_ventry	1, irq				// IRQ EL1h
+	kernel_ventry	1, fiq_invalid			// FIQ EL1h
+	kernel_ventry	1, error_invalid		// Error EL1h
+
+	.rept	4
+	tramp_ventry	.Lvector_start\@, 64, 0, \bhb
+	.endr
+	.rept 4
+	tramp_ventry	.Lvector_start\@, 32, 0, \bhb
+	.endr
+	.endm
+
+/* The order must match tramp_vecs and the arm64_bp_harden_el1_vectors enum. */
+	.pushsection ".entry.text", "ax"
+	.align	11
+ENTRY(__bp_harden_el1_vectors)
+#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
+	generate_el1_vector	bhb=BHB_MITIGATION_LOOP
+	generate_el1_vector	bhb=BHB_MITIGATION_FW
+	generate_el1_vector	bhb=BHB_MITIGATION_INSN
+#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
+END(__bp_harden_el1_vectors)
+	.popsection
 
 /*
  * Special system call wrappers.
@@ -996,3 +1302,180 @@ ENTRY(ret_from_fork)
 	b	ret_to_user
 ENDPROC(ret_from_fork)
 NOKPROBE(ret_from_fork)
+
+#ifdef CONFIG_ARM_SDE_INTERFACE
+
+#include <asm/sdei.h>
+#include <uapi/linux/arm_sdei.h>
+
+.macro sdei_handler_exit exit_mode
+	/* On success, this call never returns... */
+	cmp	\exit_mode, #SDEI_EXIT_SMC
+	b.ne	99f
+	smc	#0
+	b	.
+99:	hvc	#0
+	b	.
+.endm
+
+#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+/*
+ * The regular SDEI entry point may have been unmapped along with the rest of
+ * the kernel. This trampoline restores the kernel mapping to make the x1 memory
+ * argument accessible.
+ *
+ * This clobbers x4, __sdei_handler() will restore this from firmware's
+ * copy.
+ */
+.ltorg
+.pushsection ".entry.tramp.text", "ax"
+ENTRY(__sdei_asm_entry_trampoline)
+	mrs	x4, ttbr1_el1
+	tbz	x4, #USER_ASID_BIT, 1f
+
+	tramp_map_kernel tmp=x4
+	isb
+	mov	x4, xzr
+
+	/*
+	 * Use reg->interrupted_regs.addr_limit to remember whether to unmap
+	 * the kernel on exit.
+	 */
+1:	str	x4, [x1, #(SDEI_EVENT_INTREGS + S_ORIG_ADDR_LIMIT)]
+
+#ifdef CONFIG_RANDOMIZE_BASE
+	adr	x4, tramp_vectors + PAGE_SIZE
+	add	x4, x4, #:lo12:__sdei_asm_trampoline_next_handler
+	ldr	x4, [x4]
+#else
+	ldr	x4, =__sdei_asm_handler
+#endif
+	br	x4
+ENDPROC(__sdei_asm_entry_trampoline)
+NOKPROBE(__sdei_asm_entry_trampoline)
+
+/*
+ * Make the exit call and restore the original ttbr1_el1
+ *
+ * x0 & x1: setup for the exit API call
+ * x2: exit_mode
+ * x4: struct sdei_registered_event argument from registration time.
+ */
+ENTRY(__sdei_asm_exit_trampoline)
+	ldr	x4, [x4, #(SDEI_EVENT_INTREGS + S_ORIG_ADDR_LIMIT)]
+	cbnz	x4, 1f
+
+	tramp_unmap_kernel	tmp=x4
+
+1:	sdei_handler_exit exit_mode=x2
+ENDPROC(__sdei_asm_exit_trampoline)
+NOKPROBE(__sdei_asm_exit_trampoline)
+	.ltorg
+.popsection		// .entry.tramp.text
+#ifdef CONFIG_RANDOMIZE_BASE
+.pushsection ".rodata", "a"
+__sdei_asm_trampoline_next_handler:
+	.quad	__sdei_asm_handler
+.popsection		// .rodata
+#endif /* CONFIG_RANDOMIZE_BASE */
+#endif /* CONFIG_UNMAP_KERNEL_AT_EL0 */
+
+/*
+ * Software Delegated Exception entry point.
+ *
+ * x0: Event number
+ * x1: struct sdei_registered_event argument from registration time.
+ * x2: interrupted PC
+ * x3: interrupted PSTATE
+ * x4: maybe clobbered by the trampoline
+ *
+ * Firmware has preserved x0->x17 for us, we must save/restore the rest to
+ * follow SMC-CC. We save (or retrieve) all the registers as the handler may
+ * want them.
+ */
+ENTRY(__sdei_asm_handler)
+	stp     x2, x3, [x1, #SDEI_EVENT_INTREGS + S_PC]
+	stp     x4, x5, [x1, #SDEI_EVENT_INTREGS + 16 * 2]
+	stp     x6, x7, [x1, #SDEI_EVENT_INTREGS + 16 * 3]
+	stp     x8, x9, [x1, #SDEI_EVENT_INTREGS + 16 * 4]
+	stp     x10, x11, [x1, #SDEI_EVENT_INTREGS + 16 * 5]
+	stp     x12, x13, [x1, #SDEI_EVENT_INTREGS + 16 * 6]
+	stp     x14, x15, [x1, #SDEI_EVENT_INTREGS + 16 * 7]
+	stp     x16, x17, [x1, #SDEI_EVENT_INTREGS + 16 * 8]
+	stp     x18, x19, [x1, #SDEI_EVENT_INTREGS + 16 * 9]
+	stp     x20, x21, [x1, #SDEI_EVENT_INTREGS + 16 * 10]
+	stp     x22, x23, [x1, #SDEI_EVENT_INTREGS + 16 * 11]
+	stp     x24, x25, [x1, #SDEI_EVENT_INTREGS + 16 * 12]
+	stp     x26, x27, [x1, #SDEI_EVENT_INTREGS + 16 * 13]
+	stp     x28, x29, [x1, #SDEI_EVENT_INTREGS + 16 * 14]
+	mov	x4, sp
+	stp     lr, x4, [x1, #SDEI_EVENT_INTREGS + S_LR]
+
+	mov	x19, x1
+
+#ifdef CONFIG_VMAP_STACK
+	/*
+	 * entry.S may have been using sp as a scratch register, find whether
+	 * this is a normal or critical event and switch to the appropriate
+	 * stack for this CPU.
+	 */
+	ldrb	w4, [x19, #SDEI_EVENT_PRIORITY]
+	cbnz	w4, 1f
+	ldr_this_cpu dst=x5, sym=sdei_stack_normal_ptr, tmp=x6
+	b	2f
+1:	ldr_this_cpu dst=x5, sym=sdei_stack_critical_ptr, tmp=x6
+2:	mov	x6, #SDEI_STACK_SIZE
+	add	x5, x5, x6
+	mov	sp, x5
+#endif
+
+	/*
+	 * We may have interrupted userspace, or a guest, or exit-from or
+	 * return-to either of these. We can't trust sp_el0, restore it.
+	 */
+	mrs	x28, sp_el0
+	ldr_this_cpu	dst=x0, sym=__entry_task, tmp=x1
+	msr	sp_el0, x0
+
+	/* If we interrupted the kernel point to the previous stack/frame. */
+	and     x0, x3, #0xc
+	mrs     x1, CurrentEL
+	cmp     x0, x1
+	csel	x29, x29, xzr, eq	// fp, or zero
+	csel	x4, x2, xzr, eq		// elr, or zero
+
+	stp	x29, x4, [sp, #-16]!
+	mov	x29, sp
+
+	add	x0, x19, #SDEI_EVENT_INTREGS
+	mov	x1, x19
+	bl	__sdei_handler
+
+	msr	sp_el0, x28
+	/* restore regs >x17 that we clobbered */
+	mov	x4, x19         // keep x4 for __sdei_asm_exit_trampoline
+	ldp	x28, x29, [x4, #SDEI_EVENT_INTREGS + 16 * 14]
+	ldp	x18, x19, [x4, #SDEI_EVENT_INTREGS + 16 * 9]
+	ldp	lr, x1, [x4, #SDEI_EVENT_INTREGS + S_LR]
+	mov	sp, x1
+
+	mov	x1, x0			// address to complete_and_resume
+	/* x0 = (x0 <= 1) ? EVENT_COMPLETE:EVENT_COMPLETE_AND_RESUME */
+	cmp	x0, #1
+	mov_q	x2, SDEI_1_0_FN_SDEI_EVENT_COMPLETE
+	mov_q	x3, SDEI_1_0_FN_SDEI_EVENT_COMPLETE_AND_RESUME
+	csel	x0, x2, x3, ls
+
+	ldr_l	x2, sdei_exit_mode
+
+alternative_if_not ARM64_UNMAP_KERNEL_AT_EL0
+	sdei_handler_exit exit_mode=x2
+alternative_else_nop_endif
+
+#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+	tramp_alias	dst=x5, sym=__sdei_asm_exit_trampoline, tmp=x3
+	br	x5
+#endif
+ENDPROC(__sdei_asm_handler)
+NOKPROBE(__sdei_asm_handler)
+#endif /* CONFIG_ARM_SDE_INTERFACE */

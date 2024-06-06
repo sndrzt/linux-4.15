@@ -190,7 +190,7 @@ int adreno_hw_init(struct msm_gpu *gpu)
 		ring->next = ring->start;
 
 		/* reset completed fence seqno: */
-		ring->memptrs->fence = ring->seqno;
+		ring->memptrs->fence = ring->fctx->completed_fence;
 		ring->memptrs->rptr = 0;
 	}
 
@@ -461,7 +461,7 @@ void adreno_wait_ring(struct msm_ringbuffer *ring, uint32_t ndwords)
 {
 	if (spin_until(ring_freewords(ring) >= ndwords))
 		DRM_DEV_ERROR(ring->gpu->dev->dev,
-			"timeout waiting for space in ringubffer %d\n",
+			"timeout waiting for space in ringbuffer %d\n",
 			ring->id);
 }
 

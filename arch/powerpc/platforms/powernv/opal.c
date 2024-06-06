@@ -388,7 +388,7 @@ int opal_put_chars(uint32_t vtermno, const char *data, int total_len)
 		/* Closed or other error drop */
 		if (rc != OPAL_SUCCESS && rc != OPAL_BUSY &&
 		    rc != OPAL_BUSY_EVENT) {
-			written = total_len;
+			written += total_len;
 			break;
 		}
 		if (rc == OPAL_SUCCESS) {
@@ -500,9 +500,12 @@ void pnv_platform_error_reboot(struct pt_regs *regs, const char *msg)
 	 *    opal to trigger checkstop explicitly for error analysis.
 	 *    The FSP PRD component would have already got notified
 	 *    about this error through other channels.
+	 * 4. We are running on a newer skiboot that by default does
+	 *    not cause a checkstop, drops us back to the kernel to
+	 *    extract context and state at the time of the error.
 	 */
 
-	ppc_md.restart(NULL);
+	panic(msg);
 }
 
 int opal_machine_check(struct pt_regs *regs)
@@ -617,7 +620,10 @@ static ssize_t symbol_map_read(struct file *fp, struct kobject *kobj,
 				       bin_attr->size);
 }
 
-static BIN_ATTR_RO(symbol_map, 0);
+static struct bin_attribute symbol_map_attr = {
+	.attr = {.name = "symbol_map", .mode = 0400},
+	.read = symbol_map_read
+};
 
 static void opal_export_symmap(void)
 {
@@ -634,10 +640,10 @@ static void opal_export_symmap(void)
 		return;
 
 	/* Setup attributes */
-	bin_attr_symbol_map.private = __va(be64_to_cpu(syms[0]));
-	bin_attr_symbol_map.size = be64_to_cpu(syms[1]);
+	symbol_map_attr.private = __va(be64_to_cpu(syms[0]));
+	symbol_map_attr.size = be64_to_cpu(syms[1]);
 
-	rc = sysfs_create_bin_file(opal_kobj, &bin_attr_symbol_map);
+	rc = sysfs_create_bin_file(opal_kobj, &symbol_map_attr);
 	if (rc)
 		pr_warn("Error %d creating OPAL symbols file\n", rc);
 }
@@ -674,6 +680,7 @@ static void opal_export_attrs(void)
 	kobj = kobject_create_and_add("exports", opal_kobj);
 	if (!kobj) {
 		pr_warn("kobject_create_and_add() of exports failed\n");
+		of_node_put(np);
 		return;
 	}
 
@@ -927,6 +934,7 @@ EXPORT_SYMBOL_GPL(opal_flash_read);
 EXPORT_SYMBOL_GPL(opal_flash_write);
 EXPORT_SYMBOL_GPL(opal_flash_erase);
 EXPORT_SYMBOL_GPL(opal_prd_msg);
+EXPORT_SYMBOL_GPL(opal_check_token);
 
 /* Convert a region of vmalloc memory to an opal sg list */
 struct opal_sg_list *opal_vmalloc_to_sg_list(void *vmalloc_addr,
@@ -1039,3 +1047,5 @@ EXPORT_SYMBOL_GPL(opal_write_oppanel_async);
 EXPORT_SYMBOL_GPL(opal_int_set_mfrr);
 EXPORT_SYMBOL_GPL(opal_int_eoi);
 EXPORT_SYMBOL_GPL(opal_error_code);
+/* Export the below symbol for NX compression */
+EXPORT_SYMBOL(opal_nx_coproc_init);

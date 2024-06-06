@@ -147,7 +147,8 @@ static int intel_th_remove(struct device *dev)
 			th->thdev[i] = NULL;
 		}
 
-		th->num_thdevs = lowest;
+		if (lowest >= 0)
+			th->num_thdevs = lowest;
 	}
 
 	if (thdrv->attr_group)
@@ -222,6 +223,22 @@ static ssize_t port_show(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_RO(port);
 
+static void intel_th_trace_prepare(struct intel_th_device *thdev)
+{
+	struct intel_th_device *hub = to_intel_th_hub(thdev);
+	struct intel_th_driver *hubdrv = to_intel_th_driver(hub->dev.driver);
+
+	if (hub->type != INTEL_TH_SWITCH)
+		return;
+
+	if (thdev->type != INTEL_TH_OUTPUT)
+		return;
+
+	pm_runtime_get_sync(&thdev->dev);
+	hubdrv->prepare(hub, &thdev->output);
+	pm_runtime_put(&thdev->dev);
+}
+
 static int intel_th_output_activate(struct intel_th_device *thdev)
 {
 	struct intel_th_driver *thdrv =
@@ -242,6 +259,7 @@ static int intel_th_output_activate(struct intel_th_device *thdev)
 	if (ret)
 		goto fail_put;
 
+	intel_th_trace_prepare(thdev);
 	if (thdrv->activate)
 		ret = thdrv->activate(thdev);
 	else
@@ -495,7 +513,7 @@ static const struct intel_th_subdevice {
 				.flags	= IORESOURCE_MEM,
 			},
 			{
-				.start	= TH_MMIO_SW,
+				.start	= 1, /* use resource[1] */
 				.end	= 0,
 				.flags	= IORESOURCE_MEM,
 			},
@@ -588,6 +606,7 @@ intel_th_subdevice_alloc(struct intel_th *th,
 	struct intel_th_device *thdev;
 	struct resource res[3];
 	unsigned int req = 0;
+	bool is64bit = false;
 	int r, err;
 
 	thdev = intel_th_device_alloc(th, subdev->type, subdev->name,
@@ -597,12 +616,18 @@ intel_th_subdevice_alloc(struct intel_th *th,
 
 	thdev->drvdata = th->drvdata;
 
+	for (r = 0; r < th->num_resources; r++)
+		if (th->resource[r].flags & IORESOURCE_MEM_64) {
+			is64bit = true;
+			break;
+		}
+
 	memcpy(res, subdev->res,
 	       sizeof(struct resource) * subdev->nres);
 
 	for (r = 0; r < subdev->nres; r++) {
 		struct resource *devres = th->resource;
-		int bar = TH_MMIO_CONFIG;
+		int bar = 0; /* cut subdevices' MMIO from resource[0] */
 
 		/*
 		 * Take .end == 0 to mean 'take the whole bar',
@@ -611,6 +636,8 @@ intel_th_subdevice_alloc(struct intel_th *th,
 		 */
 		if (!res[r].end && res[r].flags == IORESOURCE_MEM) {
 			bar = res[r].start;
+			if (is64bit)
+				bar *= 2;
 			res[r].start = 0;
 			res[r].end = resource_size(&devres[bar]) - 1;
 		}
@@ -627,10 +654,8 @@ intel_th_subdevice_alloc(struct intel_th *th,
 	}
 
 	err = intel_th_device_add_resources(thdev, res, subdev->nres);
-	if (err) {
-		put_device(&thdev->dev);
+	if (err)
 		goto fail_put_device;
-	}
 
 	if (subdev->type == INTEL_TH_OUTPUT) {
 		thdev->dev.devt = MKDEV(th->major, th->num_thdevs);
@@ -643,10 +668,8 @@ intel_th_subdevice_alloc(struct intel_th *th,
 	}
 
 	err = device_add(&thdev->dev);
-	if (err) {
-		put_device(&thdev->dev);
+	if (err)
 		goto fail_free_res;
-	}
 
 	/* need switch driver to be loaded to enumerate the rest */
 	if (subdev->type == INTEL_TH_SWITCH && !req) {
@@ -935,13 +958,28 @@ EXPORT_SYMBOL_GPL(intel_th_trace_disable);
 int intel_th_set_output(struct intel_th_device *thdev,
 			unsigned int master)
 {
-	struct intel_th_device *hub = to_intel_th_device(thdev->dev.parent);
+	struct intel_th_device *hub = to_intel_th_hub(thdev);
 	struct intel_th_driver *hubdrv = to_intel_th_driver(hub->dev.driver);
+	int ret;
 
-	if (!hubdrv->set_output)
-		return -ENOTSUPP;
+	/*
+	 * hub is instantiated together with the source device that
+	 * calls here, so guaranteed to be present.
+	 */
+	hubdrv = to_intel_th_driver(hub->dev.driver);
+	if (!hubdrv || !try_module_get(hubdrv->driver.owner))
+		return -EINVAL;
 
-	return hubdrv->set_output(hub, master);
+	if (!hubdrv->set_output) {
+		ret = -ENOTSUPP;
+		goto out;
+	}
+
+	ret = hubdrv->set_output(hub, master);
+
+out:
+	module_put(hubdrv->driver.owner);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(intel_th_set_output);
 

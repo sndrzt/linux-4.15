@@ -199,6 +199,7 @@ struct mlxsw_sp_port_vlan {
 	struct list_head list;
 	struct mlxsw_sp_port *mlxsw_sp_port;
 	struct mlxsw_sp_fid *fid;
+	unsigned int ref_count;
 	u16 vid;
 	struct mlxsw_sp_bridge_port *bridge_port;
 	struct list_head bridge_vlan_node;
@@ -448,6 +449,8 @@ mlxsw_sp_netdevice_ipip_ul_event(struct mlxsw_sp *mlxsw_sp,
 void
 mlxsw_sp_port_vlan_router_leave(struct mlxsw_sp_port_vlan *mlxsw_sp_port_vlan);
 void mlxsw_sp_rif_destroy(struct mlxsw_sp_rif *rif);
+void mlxsw_sp_rif_destroy_by_dev(struct mlxsw_sp *mlxsw_sp,
+				 struct net_device *dev);
 
 /* spectrum_kvdl.c */
 int mlxsw_sp_kvdl_init(struct mlxsw_sp *mlxsw_sp);

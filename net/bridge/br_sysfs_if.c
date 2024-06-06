@@ -50,9 +50,8 @@ static BRPORT_ATTR(_name, S_IRUGO | S_IWUSR,			\
 static int store_flag(struct net_bridge_port *p, unsigned long v,
 		      unsigned long mask)
 {
-	unsigned long flags;
-
-	flags = p->flags;
+	unsigned long flags = p->flags;
+	int err;
 
 	if (v)
 		flags |= mask;
@@ -60,6 +59,10 @@ static int store_flag(struct net_bridge_port *p, unsigned long v,
 		flags &= ~mask;
 
 	if (flags != p->flags) {
+		err = br_switchdev_set_port_flag(p, flags, mask);
+		if (err)
+			return err;
+
 		p->flags = flags;
 		br_port_flags_change(p, mask);
 	}
@@ -247,13 +250,15 @@ static const struct brport_attribute *brport_attrs[] = {
 };
 
 #define to_brport_attr(_at) container_of(_at, struct brport_attribute, attr)
-#define to_brport(obj)	container_of(obj, struct net_bridge_port, kobj)
 
 static ssize_t brport_show(struct kobject *kobj,
 			   struct attribute *attr, char *buf)
 {
 	struct brport_attribute *brport_attr = to_brport_attr(attr);
-	struct net_bridge_port *p = to_brport(kobj);
+	struct net_bridge_port *p = kobj_to_brport(kobj);
+
+	if (!brport_attr->show)
+		return -EINVAL;
 
 	return brport_attr->show(p, buf);
 }
@@ -263,7 +268,7 @@ static ssize_t brport_store(struct kobject *kobj,
 			    const char *buf, size_t count)
 {
 	struct brport_attribute *brport_attr = to_brport_attr(attr);
-	struct net_bridge_port *p = to_brport(kobj);
+	struct net_bridge_port *p = kobj_to_brport(kobj);
 	ssize_t ret = -EINVAL;
 	char *endp;
 	unsigned long val;

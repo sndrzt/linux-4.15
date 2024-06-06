@@ -437,8 +437,7 @@ struct rxrpc_connection {
 	spinlock_t		state_lock;	/* state-change lock */
 	enum rxrpc_conn_cache_state cache_state;
 	enum rxrpc_conn_proto_state state;	/* current state of connection */
-	u32			local_abort;	/* local abort code */
-	u32			remote_abort;	/* remote abort code */
+	u32			abort_code;	/* Abort code of connection abort */
 	int			debug_id;	/* debug ID for printks */
 	atomic_t		serial;		/* packet serial number counter */
 	unsigned int		hi_serial;	/* highest serial number received */
@@ -448,7 +447,18 @@ struct rxrpc_connection {
 	u8			security_size;	/* security header size */
 	u8			security_ix;	/* security type */
 	u8			out_clientflag;	/* RXRPC_CLIENT_INITIATED if we are client */
+	short			error;		/* Local error code */
 };
+
+static inline bool rxrpc_to_server(const struct rxrpc_skb_priv *sp)
+{
+	return sp->hdr.flags & RXRPC_CLIENT_INITIATED;
+}
+
+static inline bool rxrpc_to_client(const struct rxrpc_skb_priv *sp)
+{
+	return !rxrpc_to_server(sp);
+}
 
 /*
  * Flags in call->flags.
@@ -464,6 +474,8 @@ enum rxrpc_call_flag {
 	RXRPC_CALL_SEND_PING,		/* A ping will need to be sent */
 	RXRPC_CALL_PINGING,		/* Ping in process */
 	RXRPC_CALL_RETRANS_TIMEOUT,	/* Retransmission due to timeout occurred */
+	RXRPC_CALL_BEGAN_RX_TIMER,	/* We began the expect_rx_by timer */
+	RXRPC_CALL_DISCONNECTED,	/* The call has been disconnected */
 };
 
 /*
@@ -591,6 +603,7 @@ struct rxrpc_call {
 						 * not hard-ACK'd packet follows this.
 						 */
 	rxrpc_seq_t		tx_top;		/* Highest Tx slot allocated. */
+	u16			tx_backoff;	/* Delay to insert due to Tx failure */
 
 	/* TCP-style slow-start congestion control [RFC5681].  Since the SMSS
 	 * is fixed, we keep these numbers in terms of segments (ie. DATA
@@ -875,6 +888,7 @@ void rxrpc_disconnect_client_call(struct rxrpc_call *);
 void rxrpc_put_client_conn(struct rxrpc_connection *);
 void rxrpc_discard_expired_client_conns(struct work_struct *);
 void rxrpc_destroy_all_client_connections(struct rxrpc_net *);
+void rxrpc_clean_up_local_conns(struct rxrpc_local *);
 
 /*
  * conn_event.c

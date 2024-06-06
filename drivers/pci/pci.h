@@ -342,6 +342,26 @@ static inline resource_size_t pci_resource_alignment(struct pci_dev *dev,
 
 void pci_enable_acs(struct pci_dev *dev);
 
+#ifdef CONFIG_PCIEASPM
+void pcie_aspm_init_link_state(struct pci_dev *pdev);
+void pcie_aspm_exit_link_state(struct pci_dev *pdev);
+void pcie_aspm_pm_state_change(struct pci_dev *pdev);
+void pcie_aspm_powersave_config_link(struct pci_dev *pdev);
+#else
+static inline void pcie_aspm_init_link_state(struct pci_dev *pdev) { }
+static inline void pcie_aspm_exit_link_state(struct pci_dev *pdev) { }
+static inline void pcie_aspm_pm_state_change(struct pci_dev *pdev) { }
+static inline void pcie_aspm_powersave_config_link(struct pci_dev *pdev) { }
+#endif
+
+#ifdef CONFIG_PCIEASPM_DEBUG
+void pcie_aspm_create_sysfs_dev_files(struct pci_dev *pdev);
+void pcie_aspm_remove_sysfs_dev_files(struct pci_dev *pdev);
+#else
+static inline void pcie_aspm_create_sysfs_dev_files(struct pci_dev *pdev) { }
+static inline void pcie_aspm_remove_sysfs_dev_files(struct pci_dev *pdev) { }
+#endif
+
 #ifdef CONFIG_PCIE_PTM
 void pci_ptm_init(struct pci_dev *dev);
 #else
@@ -366,6 +386,12 @@ static inline int pci_dev_specific_reset(struct pci_dev *dev, int probe)
 #if defined(CONFIG_PCI_QUIRKS) && defined(CONFIG_ARM64)
 int acpi_get_rc_resources(struct device *dev, const char *hid, u16 segment,
 			  struct resource *res);
+#else
+static inline int acpi_get_rc_resources(struct device *dev, const char *hid,
+					u16 segment, struct resource *res)
+{
+	return -ENODEV;
+}
 #endif
 
 u32 pci_rebar_get_possible_sizes(struct pci_dev *pdev, int bar);

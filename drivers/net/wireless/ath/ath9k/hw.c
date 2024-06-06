@@ -250,8 +250,9 @@ void ath9k_hw_get_channel_centers(struct ath_hw *ah,
 /* Chip Revisions */
 /******************/
 
-static void ath9k_hw_read_revisions(struct ath_hw *ah)
+static bool ath9k_hw_read_revisions(struct ath_hw *ah)
 {
+	u32 srev;
 	u32 val;
 
 	if (ah->get_mac_revision)
@@ -267,25 +268,33 @@ static void ath9k_hw_read_revisions(struct ath_hw *ah)
 			val = REG_READ(ah, AR_SREV);
 			ah->hw_version.macRev = MS(val, AR_SREV_REVISION2);
 		}
-		return;
+		return true;
 	case AR9300_DEVID_AR9340:
 		ah->hw_version.macVersion = AR_SREV_VERSION_9340;
-		return;
+		return true;
 	case AR9300_DEVID_QCA955X:
 		ah->hw_version.macVersion = AR_SREV_VERSION_9550;
-		return;
+		return true;
 	case AR9300_DEVID_AR953X:
 		ah->hw_version.macVersion = AR_SREV_VERSION_9531;
-		return;
+		return true;
 	case AR9300_DEVID_QCA956X:
 		ah->hw_version.macVersion = AR_SREV_VERSION_9561;
-		return;
+		return true;
 	}
 
-	val = REG_READ(ah, AR_SREV) & AR_SREV_ID;
+	srev = REG_READ(ah, AR_SREV);
+
+	if (srev == -1) {
+		ath_err(ath9k_hw_common(ah),
+			"Failed to read SREV register");
+		return false;
+	}
+
+	val = srev & AR_SREV_ID;
 
 	if (val == 0xFF) {
-		val = REG_READ(ah, AR_SREV);
+		val = srev;
 		ah->hw_version.macVersion =
 			(val & AR_SREV_VERSION2) >> AR_SREV_TYPE2_S;
 		ah->hw_version.macRev = MS(val, AR_SREV_REVISION2);
@@ -304,6 +313,8 @@ static void ath9k_hw_read_revisions(struct ath_hw *ah)
 		if (ah->hw_version.macVersion == AR_SREV_VERSION_5416_PCIE)
 			ah->is_pciexpress = true;
 	}
+
+	return true;
 }
 
 /************************************/
@@ -557,7 +568,10 @@ static int __ath9k_hw_init(struct ath_hw *ah)
 	struct ath_common *common = ath9k_hw_common(ah);
 	int r = 0;
 
-	ath9k_hw_read_revisions(ah);
+	if (!ath9k_hw_read_revisions(ah)) {
+		ath_err(common, "Could not read hardware revisions");
+		return -EOPNOTSUPP;
+	}
 
 	switch (ah->hw_version.macVersion) {
 	case AR_SREV_VERSION_5416_PCI:
@@ -922,6 +936,7 @@ static void ath9k_hw_init_interrupt_masks(struct ath_hw *ah,
 		AR_IMR_RXERR |
 		AR_IMR_RXORN |
 		AR_IMR_BCNMISC;
+	u32 msi_cfg = 0;
 
 	if (AR_SREV_9340(ah) || AR_SREV_9550(ah) || AR_SREV_9531(ah) ||
 	    AR_SREV_9561(ah))
@@ -929,28 +944,46 @@ static void ath9k_hw_init_interrupt_masks(struct ath_hw *ah,
 
 	if (AR_SREV_9300_20_OR_LATER(ah)) {
 		imr_reg |= AR_IMR_RXOK_HP;
-		if (ah->config.rx_intr_mitigation)
+		if (ah->config.rx_intr_mitigation) {
 			imr_reg |= AR_IMR_RXINTM | AR_IMR_RXMINTR;
-		else
+			msi_cfg |= AR_INTCFG_MSI_RXINTM | AR_INTCFG_MSI_RXMINTR;
+		} else {
 			imr_reg |= AR_IMR_RXOK_LP;
-
+			msi_cfg |= AR_INTCFG_MSI_RXOK;
+		}
 	} else {
-		if (ah->config.rx_intr_mitigation)
+		if (ah->config.rx_intr_mitigation) {
 			imr_reg |= AR_IMR_RXINTM | AR_IMR_RXMINTR;
-		else
+			msi_cfg |= AR_INTCFG_MSI_RXINTM | AR_INTCFG_MSI_RXMINTR;
+		} else {
 			imr_reg |= AR_IMR_RXOK;
+			msi_cfg |= AR_INTCFG_MSI_RXOK;
+		}
 	}
 
-	if (ah->config.tx_intr_mitigation)
+	if (ah->config.tx_intr_mitigation) {
 		imr_reg |= AR_IMR_TXINTM | AR_IMR_TXMINTR;
-	else
+		msi_cfg |= AR_INTCFG_MSI_TXINTM | AR_INTCFG_MSI_TXMINTR;
+	} else {
 		imr_reg |= AR_IMR_TXOK;
+		msi_cfg |= AR_INTCFG_MSI_TXOK;
+	}
 
 	ENABLE_REGWRITE_BUFFER(ah);
 
 	REG_WRITE(ah, AR_IMR, imr_reg);
 	ah->imrs2_reg |= AR_IMR_S2_GTT;
 	REG_WRITE(ah, AR_IMR_S2, ah->imrs2_reg);
+
+	if (ah->msi_enabled) {
+		ah->msi_reg = REG_READ(ah, AR_PCIE_MSI);
+		ah->msi_reg |= AR_PCIE_MSI_HW_DBI_WR_EN;
+		ah->msi_reg &= AR_PCIE_MSI_HW_INT_PENDING_ADDR_MSI_64;
+		REG_WRITE(ah, AR_INTCFG, msi_cfg);
+		ath_dbg(ath9k_hw_common(ah), ANY,
+			"value of AR_INTCFG=0x%X, msi_cfg=0x%X\n",
+			REG_READ(ah, AR_INTCFG), msi_cfg);
+	}
 
 	if (!AR_SREV_9100(ah)) {
 		REG_WRITE(ah, AR_INTR_SYNC_CAUSE, 0xFFFFFFFF);
@@ -1581,7 +1614,6 @@ static void ath9k_hw_apply_gpio_override(struct ath_hw *ah)
 		ath9k_hw_gpio_request_out(ah, i, NULL,
 					  AR_GPIO_OUTPUT_MUX_AS_OUTPUT);
 		ath9k_hw_set_gpio(ah, i, !!(ah->gpio_val & BIT(i)));
-		ath9k_hw_gpio_free(ah, i);
 	}
 }
 
@@ -2688,14 +2720,17 @@ static void ath9k_hw_gpio_cfg_output_mux(struct ath_hw *ah, u32 gpio, u32 type)
 static void ath9k_hw_gpio_cfg_soc(struct ath_hw *ah, u32 gpio, bool out,
 				  const char *label)
 {
+	int err;
+
 	if (ah->caps.gpio_requested & BIT(gpio))
 		return;
 
-	/* may be requested by BSP, free anyway */
-	gpio_free(gpio);
-
-	if (gpio_request_one(gpio, out ? GPIOF_OUT_INIT_LOW : GPIOF_IN, label))
+	err = gpio_request_one(gpio, out ? GPIOF_OUT_INIT_LOW : GPIOF_IN, label);
+	if (err) {
+		ath_err(ath9k_hw_common(ah), "request GPIO%d failed:%d\n",
+			gpio, err);
 		return;
+	}
 
 	ah->caps.gpio_requested |= BIT(gpio);
 }
@@ -2915,16 +2950,19 @@ void ath9k_hw_apply_txpower(struct ath_hw *ah, struct ath9k_channel *chan,
 	struct ath_regulatory *reg = ath9k_hw_regulatory(ah);
 	struct ieee80211_channel *channel;
 	int chan_pwr, new_pwr;
+	u16 ctl = NO_CTL;
 
 	if (!chan)
 		return;
+
+	if (!test)
+		ctl = ath9k_regd_get_ctl(reg, chan);
 
 	channel = chan->chan;
 	chan_pwr = min_t(int, channel->max_power * 2, MAX_RATE_POWER);
 	new_pwr = min_t(int, chan_pwr, reg->power_limit);
 
-	ah->eep_ops->set_txpower(ah, chan,
-				 ath9k_regd_get_ctl(reg, chan),
+	ah->eep_ops->set_txpower(ah, chan, ctl,
 				 get_antenna_gain(ah, chan), new_pwr, test);
 }
 

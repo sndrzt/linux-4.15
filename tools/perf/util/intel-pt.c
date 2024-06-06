@@ -209,14 +209,17 @@ static void intel_pt_dump_event(struct intel_pt *pt, unsigned char *buf,
 static int intel_pt_do_fix_overlap(struct intel_pt *pt, struct auxtrace_buffer *a,
 				   struct auxtrace_buffer *b)
 {
+	bool consecutive = false;
 	void *start;
 
 	start = intel_pt_find_overlap(a->data, a->size, b->data, b->size,
-				      pt->have_tsc);
+				      pt->have_tsc, &consecutive);
 	if (!start)
 		return -EINVAL;
 	b->use_size = b->data + b->size - start;
 	b->use_data = start;
+	if (b->use_size && consecutive)
+		b->consecutive = true;
 	return 0;
 }
 
@@ -531,8 +534,10 @@ static int intel_pt_walk_next_insn(struct intel_pt_insn *intel_pt_insn,
 
 			*ip += intel_pt_insn->length;
 
-			if (to_ip && *ip == to_ip)
+			if (to_ip && *ip == to_ip) {
+				intel_pt_insn->length = 0;
 				goto out_no_cache;
+			}
 
 			if (*ip >= al.map->end)
 				break;
@@ -780,6 +785,7 @@ static struct intel_pt_queue *intel_pt_alloc_queue(struct intel_pt *pt,
 						   unsigned int queue_nr)
 {
 	struct intel_pt_params params = { .get_trace = 0, };
+	struct perf_env *env = pt->machine->env;
 	struct intel_pt_queue *ptq;
 
 	ptq = zalloc(sizeof(struct intel_pt_queue));
@@ -861,6 +867,9 @@ static struct intel_pt_queue *intel_pt_alloc_queue(struct intel_pt *pt,
 		}
 	}
 
+	if (env->cpuid && !strncmp(env->cpuid, "GenuineIntel,6,92,", 18))
+		params.flags |= INTEL_PT_FUP_WITH_NLIP;
+
 	ptq->decoder = intel_pt_decoder_new(&params);
 	if (!ptq->decoder)
 		goto out_free;
@@ -898,6 +907,8 @@ static void intel_pt_set_pid_tid_cpu(struct intel_pt *pt,
 
 	if (queue->tid == -1 || pt->have_sched_switch) {
 		ptq->tid = machine__get_current_tid(pt->machine, ptq->cpu);
+		if (ptq->tid == -1)
+			ptq->pid = -1;
 		thread__zput(ptq->thread);
 	}
 
@@ -913,6 +924,7 @@ static void intel_pt_set_pid_tid_cpu(struct intel_pt *pt,
 
 static void intel_pt_sample_flags(struct intel_pt_queue *ptq)
 {
+	ptq->insn_len = 0;
 	if (ptq->state->flags & INTEL_PT_ABORT_TX) {
 		ptq->flags = PERF_IP_FLAG_BRANCH | PERF_IP_FLAG_TX_ABORT;
 	} else if (ptq->state->flags & INTEL_PT_ASYNC) {
@@ -1554,6 +1566,7 @@ static int intel_pt_sample(struct intel_pt_queue *ptq)
 
 	if (intel_pt_is_switch_ip(ptq, state->to_ip)) {
 		switch (ptq->switch_state) {
+		case INTEL_PT_SS_NOT_TRACING:
 		case INTEL_PT_SS_UNKNOWN:
 		case INTEL_PT_SS_EXPECTING_SWITCH_IP:
 			err = intel_pt_next_tid(pt, ptq);
@@ -1922,10 +1935,8 @@ static int intel_pt_context_switch(struct intel_pt *pt, union perf_event *event,
 		tid = sample->tid;
 	}
 
-	if (tid == -1) {
-		pr_err("context_switch event has no tid\n");
-		return -EINVAL;
-	}
+	if (tid == -1)
+		intel_pt_log("context_switch event has no tid\n");
 
 	intel_pt_log("context_switch: cpu %d pid %d tid %d time %"PRIu64" tsc %#"PRIx64"\n",
 		     cpu, pid, tid, sample->time, perf_time_to_tsc(sample->time,
@@ -2382,6 +2393,7 @@ static const char * const intel_pt_info_fmts[] = {
 	[INTEL_PT_SNAPSHOT_MODE]	= "  Snapshot mode       %"PRId64"\n",
 	[INTEL_PT_PER_CPU_MMAPS]	= "  Per-cpu maps        %"PRId64"\n",
 	[INTEL_PT_MTC_BIT]		= "  MTC bit             %#"PRIx64"\n",
+	[INTEL_PT_MTC_FREQ_BITS]	= "  MTC freq bits       %#"PRIx64"\n",
 	[INTEL_PT_TSC_CTC_N]		= "  TSC:CTC numerator   %"PRIu64"\n",
 	[INTEL_PT_TSC_CTC_D]		= "  TSC:CTC denominator %"PRIu64"\n",
 	[INTEL_PT_CYC_BIT]		= "  CYC bit             %#"PRIx64"\n",
@@ -2396,8 +2408,12 @@ static void intel_pt_print_info(u64 *arr, int start, int finish)
 	if (!dump_trace)
 		return;
 
-	for (i = start; i <= finish; i++)
-		fprintf(stdout, intel_pt_info_fmts[i], arr[i]);
+	for (i = start; i <= finish; i++) {
+		const char *fmt = intel_pt_info_fmts[i];
+
+		if (fmt)
+			fprintf(stdout, fmt, arr[i]);
+	}
 }
 
 static void intel_pt_print_info_str(const char *name, const char *str)
@@ -2519,6 +2535,8 @@ int intel_pt_process_auxtrace_info(union perf_event *event,
 	}
 
 	pt->timeless_decoding = intel_pt_timeless_decoding(pt);
+	if (pt->timeless_decoding && !pt->tc.time_mult)
+		pt->tc.time_mult = 1;
 	pt->have_tsc = intel_pt_have_tsc(pt);
 	pt->sampling_mode = false;
 	pt->est_tsc = !pt->timeless_decoding;

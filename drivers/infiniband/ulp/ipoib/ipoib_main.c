@@ -248,7 +248,8 @@ static int ipoib_change_mtu(struct net_device *dev, int new_mtu)
 		return 0;
 	}
 
-	if (new_mtu > IPOIB_UD_MTU(priv->max_ib_mtu))
+	if (new_mtu < (ETH_MIN_MTU + IPOIB_ENCAP_LEN) ||
+	    new_mtu > IPOIB_UD_MTU(priv->max_ib_mtu))
 		return -EINVAL;
 
 	priv->admin_mtu = new_mtu;
@@ -775,6 +776,22 @@ static void path_rec_completion(int status,
 	spin_lock_irqsave(&priv->lock, flags);
 
 	if (!IS_ERR_OR_NULL(ah)) {
+		/*
+		 * pathrec.dgid is used as the database key from the LLADDR,
+		 * it must remain unchanged even if the SA returns a different
+		 * GID to use in the AH.
+		 */
+		if (memcmp(pathrec->dgid.raw, path->pathrec.dgid.raw,
+			   sizeof(union ib_gid))) {
+			ipoib_dbg(
+				priv,
+				"%s got PathRec for gid %pI6 while asked for %pI6\n",
+				dev->name, pathrec->dgid.raw,
+				path->pathrec.dgid.raw);
+			memcpy(pathrec->dgid.raw, path->pathrec.dgid.raw,
+			       sizeof(union ib_gid));
+		}
+
 		path->pathrec = *pathrec;
 
 		old_ah   = path->ah;
@@ -1153,9 +1170,11 @@ static void ipoib_timeout(struct net_device *dev)
 
 	ipoib_warn(priv, "transmit timeout: latency %d msecs\n",
 		   jiffies_to_msecs(jiffies - dev_trans_start(dev)));
-	ipoib_warn(priv, "queue stopped %d, tx_head %u, tx_tail %u\n",
-		   netif_queue_stopped(dev),
-		   priv->tx_head, priv->tx_tail);
+	ipoib_warn(priv,
+		   "queue stopped %d, tx_head %u, tx_tail %u, global_tx_head %u, global_tx_tail %u\n",
+		   netif_queue_stopped(dev), priv->tx_head, priv->tx_tail,
+		   priv->global_tx_head, priv->global_tx_tail);
+
 	/* XXX reset QP, etc. */
 }
 
@@ -1679,7 +1698,7 @@ static int ipoib_dev_init_default(struct net_device *dev)
 		goto out_rx_ring_cleanup;
 	}
 
-	/* priv->tx_head, tx_tail & tx_outstanding are already 0 */
+	/* priv->tx_head, tx_tail and global_tx_tail/head are already 0 */
 
 	if (ipoib_transport_dev_init(dev, priv->ca)) {
 		pr_warn("%s: ipoib_transport_dev_init failed\n",
@@ -1748,7 +1767,8 @@ int ipoib_dev_init(struct net_device *dev, struct ib_device *ca, int port)
 		goto out_free_pd;
 	}
 
-	if (ipoib_neigh_hash_init(priv) < 0) {
+	ret = ipoib_neigh_hash_init(priv);
+	if (ret) {
 		pr_warn("%s failed to init neigh hash\n", dev->name);
 		goto out_dev_uninit;
 	}
@@ -1804,6 +1824,8 @@ void ipoib_dev_cleanup(struct net_device *dev)
 
 	/* no more works over the priv->wq */
 	if (priv->wq) {
+		/* See ipoib_mcast_carrier_on_task() */
+		WARN_ON(test_bit(IPOIB_FLAG_OPER_UP, &priv->flags));
 		flush_workqueue(priv->wq);
 		destroy_workqueue(priv->wq);
 		priv->wq = NULL;
@@ -1828,6 +1850,7 @@ static int ipoib_get_vf_config(struct net_device *dev, int vf,
 		return err;
 
 	ivf->vf = vf;
+	memcpy(ivf->mac, dev->dev_addr, dev->addr_len);
 
 	return 0;
 }
@@ -2207,8 +2230,10 @@ static struct net_device *ipoib_add_port(const char *format,
 	int result = -ENOMEM;
 
 	priv = ipoib_intf_alloc(hca, port, format);
-	if (!priv)
+	if (!priv) {
+		pr_warn("%s, %d: ipoib_intf_alloc failed\n", hca->name, port);
 		goto alloc_mem_failed;
+	}
 
 	SET_NETDEV_DEV(priv->dev, hca->dev.parent);
 	priv->dev->dev_id = port - 1;
@@ -2268,6 +2293,9 @@ static struct net_device *ipoib_add_port(const char *format,
 	INIT_IB_EVENT_HANDLER(&priv->event_handler,
 			      priv->ca, ipoib_event);
 	ib_register_event_handler(&priv->event_handler);
+
+	/* call event handler to ensure pkey in sync */
+	queue_work(ipoib_workqueue, &priv->flush_heavy);
 
 	result = register_netdev(priv->dev);
 	if (result) {
@@ -2337,8 +2365,7 @@ static void ipoib_add_one(struct ib_device *device)
 	}
 
 	if (!count) {
-		pr_err("Failed to init port, removing it\n");
-		ipoib_remove_one(device, dev_list);
+		kfree(dev_list);
 		return;
 	}
 

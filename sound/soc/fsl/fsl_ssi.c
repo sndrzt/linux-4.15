@@ -358,8 +358,7 @@ static irqreturn_t fsl_ssi_isr(int irq, void *dev_id)
 {
 	struct fsl_ssi_private *ssi_private = dev_id;
 	struct regmap *regs = ssi_private->regs;
-	__be32 sisr;
-	__be32 sisr2;
+	u32 sisr, sisr2;
 
 	/* We got an interrupt, so read the status register to see what we
 	   were interrupted for.  We mask it with the Interrupt Enable register
@@ -1436,6 +1435,7 @@ static int fsl_ssi_probe(struct platform_device *pdev)
 	struct fsl_ssi_private *ssi_private;
 	int ret = 0;
 	struct device_node *np = pdev->dev.of_node;
+	struct device_node *root;
 	const struct of_device_id *of_id;
 	const char *p, *sprop;
 	const uint32_t *iprop;
@@ -1624,7 +1624,9 @@ static int fsl_ssi_probe(struct platform_device *pdev)
 	 * device tree.  We also pass the address of the CPU DAI driver
 	 * structure.
 	 */
-	sprop = of_get_property(of_find_node_by_path("/"), "compatible", NULL);
+	root = of_find_node_by_path("/");
+	sprop = of_get_property(root, "compatible", NULL);
+	of_node_put(root);
 	/* Sometimes the compatible name has a "fsl," prefix, so we strip it. */
 	p = strrchr(sprop, ',');
 	if (p)

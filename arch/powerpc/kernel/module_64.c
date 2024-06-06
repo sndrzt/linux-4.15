@@ -487,12 +487,22 @@ static bool is_early_mcount_callsite(u32 *instruction)
    restore r2. */
 static int restore_r2(u32 *instruction, struct module *me)
 {
-	if (is_early_mcount_callsite(instruction - 1))
+	u32 *prev_insn = instruction - 1;
+
+	if (is_early_mcount_callsite(prev_insn))
+		return 1;
+
+	/*
+	 * Make sure the branch isn't a sibling call.  Sibling calls aren't
+	 * "link" branches and they don't return, so they don't need the r2
+	 * restore afterwards.
+	 */
+	if (!instr_is_relative_link_branch(*prev_insn))
 		return 1;
 
 	if (*instruction != PPC_INST_NOP) {
-		pr_err("%s: Expect noop after relocate, got %08x\n",
-		       me->name, *instruction);
+		pr_err("%s: Expected nop after call, got %08x at %pS\n",
+			me->name, *instruction, instruction);
 		return 0;
 	}
 	/* ld r2,R2_STACK_OFFSET(r1) */
@@ -614,7 +624,8 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 
 		case R_PPC_REL24:
 			/* FIXME: Handle weak symbols here --RR */
-			if (sym->st_shndx == SHN_UNDEF) {
+			if (sym->st_shndx == SHN_UNDEF ||
+			    sym->st_shndx == SHN_LIVEPATCH) {
 				/* External: go via stub */
 				value = stub_for_addr(sechdrs, value, me);
 				if (!value)
@@ -647,7 +658,14 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 
 		case R_PPC64_REL32:
 			/* 32 bits relative (used by relative exception tables) */
-			*(u32 *)location = value - (unsigned long)location;
+			/* Convert value to relative */
+			value -= (unsigned long)location;
+			if (value + 0x80000000 > 0xffffffff) {
+				pr_err("%s: REL32 %li out of range!\n",
+				       me->name, (long int)value);
+				return -ENOEXEC;
+			}
+			*(u32 *)location = value;
 			break;
 
 		case R_PPC64_TOCSAVE:
@@ -679,7 +697,7 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 			/*
 			 * If found, replace it with:
 			 *	addis r2, r12, (.TOC.-func)@ha
-			 *	addi r2, r12, (.TOC.-func)@l
+			 *	addi  r2,  r2, (.TOC.-func)@l
 			 */
 			((uint32_t *)location)[0] = 0x3c4c0000 + PPC_HA(value);
 			((uint32_t *)location)[1] = 0x38420000 + PPC_LO(value);

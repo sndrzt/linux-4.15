@@ -713,7 +713,7 @@ int etnaviv_gpu_init(struct etnaviv_gpu *gpu)
 	if (IS_ERR(gpu->cmdbuf_suballoc)) {
 		dev_err(gpu->dev, "Failed to create cmdbuf suballocator\n");
 		ret = PTR_ERR(gpu->cmdbuf_suballoc);
-		goto fail;
+		goto destroy_iommu;
 	}
 
 	/* Create buffer: */
@@ -721,7 +721,7 @@ int etnaviv_gpu_init(struct etnaviv_gpu *gpu)
 	if (!gpu->buffer) {
 		ret = -ENOMEM;
 		dev_err(gpu->dev, "could not create command buffer\n");
-		goto destroy_iommu;
+		goto destroy_suballoc;
 	}
 
 	if (gpu->mmu->version == ETNAVIV_IOMMU_V1 &&
@@ -753,6 +753,9 @@ int etnaviv_gpu_init(struct etnaviv_gpu *gpu)
 free_buffer:
 	etnaviv_cmdbuf_free(gpu->buffer);
 	gpu->buffer = NULL;
+destroy_suballoc:
+	etnaviv_cmdbuf_suballoc_destroy(gpu->cmdbuf_suballoc);
+	gpu->cmdbuf_suballoc = NULL;
 destroy_iommu:
 	etnaviv_iommu_destroy(gpu->mmu);
 	gpu->mmu = NULL;
@@ -1431,7 +1434,7 @@ int etnaviv_gpu_submit(struct etnaviv_gpu *gpu,
 	gpu->active_fence = submit->fence->seqno;
 
 	if (gpu->lastctx != cmdbuf->ctx) {
-		gpu->mmu->need_flush = true;
+		gpu->mmu->flush_seq++;
 		gpu->switch_context = true;
 		gpu->lastctx = cmdbuf->ctx;
 	}
@@ -1738,7 +1741,7 @@ static int etnaviv_gpu_bind(struct device *dev, struct device *master,
 	struct etnaviv_gpu *gpu = dev_get_drvdata(dev);
 	int ret;
 
-	if (IS_ENABLED(CONFIG_THERMAL)) {
+	if (IS_ENABLED(CONFIG_DRM_ETNAVIV_THERMAL)) {
 		gpu->cooling = thermal_of_cooling_device_register(dev->of_node,
 				(char *)dev_name(dev), gpu, &cooling_ops);
 		if (IS_ERR(gpu->cooling))
@@ -1751,7 +1754,8 @@ static int etnaviv_gpu_bind(struct device *dev, struct device *master,
 	ret = etnaviv_gpu_clk_enable(gpu);
 #endif
 	if (ret < 0) {
-		thermal_cooling_device_unregister(gpu->cooling);
+		if (IS_ENABLED(CONFIG_DRM_ETNAVIV_THERMAL))
+			thermal_cooling_device_unregister(gpu->cooling);
 		return ret;
 	}
 
@@ -1808,7 +1812,8 @@ static void etnaviv_gpu_unbind(struct device *dev, struct device *master,
 
 	gpu->drm = NULL;
 
-	thermal_cooling_device_unregister(gpu->cooling);
+	if (IS_ENABLED(CONFIG_DRM_ETNAVIV_THERMAL))
+		thermal_cooling_device_unregister(gpu->cooling);
 	gpu->cooling = NULL;
 }
 

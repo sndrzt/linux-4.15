@@ -1796,7 +1796,11 @@ static void i40evf_disable_vf(struct i40evf_adapter *adapter)
 
 	adapter->flags |= I40EVF_FLAG_PF_COMMS_FAILED;
 
-	if (netif_running(adapter->netdev)) {
+	/* We don't use netif_running() because it may be true prior to
+	 * ndo_open() returning, so we can't assume it means all our open
+	 * tasks have finished, since we're not holding the rtnl_lock here.
+	 */
+	if (adapter->state == __I40EVF_RUNNING) {
 		set_bit(__I40E_VSI_DOWN, adapter->vsi.state);
 		netif_carrier_off(adapter->netdev);
 		netif_tx_disable(adapter->netdev);
@@ -1854,6 +1858,13 @@ static void i40evf_reset_task(struct work_struct *work)
 	struct i40evf_mac_filter *f;
 	u32 reg_val;
 	int i = 0, err;
+	bool running;
+
+	/* When device is being removed it doesn't make sense to run the reset
+	 * task, just return in such a case.
+	 */
+	if (test_bit(__I40EVF_IN_REMOVE_TASK, &adapter->crit_section))
+		return;
 
 	while (test_and_set_bit(__I40EVF_IN_CLIENT_TASK,
 				&adapter->crit_section))
@@ -1913,7 +1924,13 @@ static void i40evf_reset_task(struct work_struct *work)
 	}
 
 continue_reset:
-	if (netif_running(netdev)) {
+	/* We don't use netif_running() because it may be true prior to
+	 * ndo_open() returning, so we can't assume it means all our open
+	 * tasks have finished, since we're not holding the rtnl_lock here.
+	 */
+	running = (adapter->state == __I40EVF_RUNNING);
+
+	if (running) {
 		netif_carrier_off(netdev);
 		netif_tx_stop_all_queues(netdev);
 		adapter->link_up = false;
@@ -1964,7 +1981,10 @@ continue_reset:
 
 	mod_timer(&adapter->watchdog_timer, jiffies + 2);
 
-	if (netif_running(adapter->netdev)) {
+	/* We were running when the reset started, so we need to restore some
+	 * state here.
+	 */
+	if (running) {
 		/* allocate transmit descriptors */
 		err = i40evf_setup_all_tx_resources(adapter);
 		if (err)
@@ -2044,7 +2064,7 @@ static void i40evf_adminq_task(struct work_struct *work)
 
 	/* check for error indications */
 	val = rd32(hw, hw->aq.arq.len);
-	if (val == 0xdeadbeef) /* indicates device in reset */
+	if (val == 0xdeadbeef || val == 0xffffffff) /* device in reset */
 		goto freedom;
 	oldval = val;
 	if (val & I40E_VF_ARQLEN1_ARQVFE_MASK) {
@@ -2438,7 +2458,8 @@ static netdev_features_t i40evf_fix_features(struct net_device *netdev,
 {
 	struct i40evf_adapter *adapter = netdev_priv(netdev);
 
-	if (!(adapter->vf_res->vf_cap_flags & VIRTCHNL_VF_OFFLOAD_VLAN))
+	if (adapter->vf_res &&
+	    !(adapter->vf_res->vf_cap_flags & VIRTCHNL_VF_OFFLOAD_VLAN))
 		features &= ~(NETIF_F_HW_VLAN_CTAG_TX |
 			      NETIF_F_HW_VLAN_CTAG_RX |
 			      NETIF_F_HW_VLAN_CTAG_FILTER);
@@ -2584,6 +2605,8 @@ int i40evf_process_config(struct i40evf_adapter *adapter)
 
 	if (vfres->vf_cap_flags & VIRTCHNL_VF_OFFLOAD_VLAN)
 		netdev->features |= NETIF_F_HW_VLAN_CTAG_FILTER;
+
+	netdev->priv_flags |= IFF_UNICAST_FLT;
 
 	adapter->vsi.id = adapter->vsi_res->vsi_id;
 
@@ -2962,6 +2985,7 @@ static int i40evf_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 err_ioremap:
 	free_netdev(netdev);
 err_alloc_etherdev:
+	pci_disable_pcie_error_reporting(pdev);
 	pci_release_regions(pdev);
 err_pci_reg:
 err_dma:
@@ -3066,7 +3090,8 @@ static void i40evf_remove(struct pci_dev *pdev)
 	struct i40evf_mac_filter *f, *ftmp;
 	struct i40e_hw *hw = &adapter->hw;
 	int err;
-
+	/* Indicate we are in remove and not to run reset_task */
+	set_bit(__I40EVF_IN_REMOVE_TASK, &adapter->crit_section);
 	cancel_delayed_work_sync(&adapter->init_task);
 	cancel_work_sync(&adapter->reset_task);
 	cancel_delayed_work_sync(&adapter->client_task);
@@ -3102,6 +3127,8 @@ static void i40evf_remove(struct pci_dev *pdev)
 		del_timer_sync(&adapter->watchdog_timer);
 
 	flush_scheduled_work();
+
+	cancel_work_sync(&adapter->adminq_task);
 
 	i40evf_free_rss(adapter);
 

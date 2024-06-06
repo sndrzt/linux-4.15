@@ -83,6 +83,7 @@ void mlx5i_init(struct mlx5_core_dev *mdev,
 	priv->hard_mtu = MLX5_IB_GRH_BYTES + MLX5_IPOIB_HARD_LEN;
 	mutex_init(&priv->state_lock);
 
+	INIT_DELAYED_WORK(&priv->update_stats_work, mlx5e_update_stats_work);
 	mlx5e_build_nic_params(mdev, &priv->channels.params, profile->max_nch(mdev));
 	mlx5i_build_nic_params(mdev, &priv->channels.params);
 
@@ -484,9 +485,9 @@ static int mlx5i_close(struct net_device *netdev)
 
 	netif_carrier_off(epriv->netdev);
 	mlx5_fs_remove_rx_underlay_qpn(mdev, ipriv->qp.qpn);
-	mlx5i_uninit_underlay_qp(epriv);
 	mlx5e_deactivate_priv_channels(epriv);
 	mlx5e_close_channels(&epriv->channels);;
+	mlx5i_uninit_underlay_qp(epriv);
 unlock:
 	mutex_unlock(&epriv->state_lock);
 	return 0;
@@ -628,7 +629,9 @@ struct net_device *mlx5_rdma_netdev_alloc(struct mlx5_core_dev *mdev,
 
 	profile->init(mdev, netdev, profile, ipriv);
 
-	mlx5e_attach_netdev(epriv);
+	err = mlx5e_attach_netdev(epriv);
+	if (err)
+		goto detach;
 	netif_carrier_off(netdev);
 
 	/* set rdma_netdev func pointers */
@@ -641,6 +644,11 @@ struct net_device *mlx5_rdma_netdev_alloc(struct mlx5_core_dev *mdev,
 
 	return netdev;
 
+detach:
+	profile->cleanup(epriv);
+	if (ipriv->sub_interface)
+		return NULL;
+	mlx5e_destroy_mdev_resources(mdev);
 destroy_ht:
 	mlx5i_pkey_qpn_ht_cleanup(netdev);
 destroy_wq:

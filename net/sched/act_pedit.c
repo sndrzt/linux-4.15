@@ -46,7 +46,7 @@ static struct tcf_pedit_key_ex *tcf_pedit_keys_ex_parse(struct nlattr *nla,
 	int err = -EINVAL;
 	int rem;
 
-	if (!nla || !n)
+	if (!nla)
 		return NULL;
 
 	keys_ex = kcalloc(n, sizeof(*k), GFP_KERNEL);
@@ -109,16 +109,18 @@ static int tcf_pedit_key_ex_dump(struct sk_buff *skb,
 {
 	struct nlattr *keys_start = nla_nest_start(skb, TCA_PEDIT_KEYS_EX);
 
+	if (!keys_start)
+		goto nla_failure;
 	for (; n > 0; n--) {
 		struct nlattr *key_start;
 
 		key_start = nla_nest_start(skb, TCA_PEDIT_KEY_EX);
+		if (!key_start)
+			goto nla_failure;
 
 		if (nla_put_u16(skb, TCA_PEDIT_KEY_EX_HTYPE, keys_ex->htype) ||
-		    nla_put_u16(skb, TCA_PEDIT_KEY_EX_CMD, keys_ex->cmd)) {
-			nlmsg_trim(skb, keys_start);
-			return -EINVAL;
-		}
+		    nla_put_u16(skb, TCA_PEDIT_KEY_EX_CMD, keys_ex->cmd))
+			goto nla_failure;
 
 		nla_nest_end(skb, key_start);
 
@@ -128,6 +130,9 @@ static int tcf_pedit_key_ex_dump(struct sk_buff *skb,
 	nla_nest_end(skb, keys_start);
 
 	return 0;
+nla_failure:
+	nla_nest_cancel(skb, keys_start);
+	return -EINVAL;
 }
 
 static int tcf_pedit_init(struct net *net, struct nlattr *nla,
@@ -142,7 +147,7 @@ static int tcf_pedit_init(struct net *net, struct nlattr *nla,
 	struct tcf_pedit *p;
 	struct tc_pedit_key *keys = NULL;
 	struct tcf_pedit_key_ex *keys_ex;
-	int ksize;
+	int i, ksize;
 
 	if (nla == NULL)
 		return -EINVAL;
@@ -158,6 +163,9 @@ static int tcf_pedit_init(struct net *net, struct nlattr *nla,
 		return -EINVAL;
 
 	parm = nla_data(pattr);
+	if (!parm->nkeys)
+		return -EINVAL;
+
 	ksize = parm->nkeys * sizeof(struct tc_pedit_key);
 	if (nla_len(pattr) < sizeof(*parm) + ksize)
 		return -EINVAL;
@@ -167,8 +175,6 @@ static int tcf_pedit_init(struct net *net, struct nlattr *nla,
 		return PTR_ERR(keys_ex);
 
 	if (!tcf_idr_check(tn, parm->index, a, bind)) {
-		if (!parm->nkeys)
-			return -EINVAL;
 		ret = tcf_idr_create(tn, parm->index, est, a,
 				     &act_pedit_ops, bind, false);
 		if (ret)
@@ -176,7 +182,7 @@ static int tcf_pedit_init(struct net *net, struct nlattr *nla,
 		p = to_pedit(*a);
 		keys = kmalloc(ksize, GFP_KERNEL);
 		if (keys == NULL) {
-			tcf_idr_cleanup(*a, est);
+			tcf_idr_release(*a, bind);
 			kfree(keys_ex);
 			return -ENOMEM;
 		}
@@ -206,6 +212,22 @@ static int tcf_pedit_init(struct net *net, struct nlattr *nla,
 		p->tcfp_nkeys = parm->nkeys;
 	}
 	memcpy(p->tcfp_keys, parm->keys, ksize);
+	p->tcfp_off_max_hint = 0;
+	for (i = 0; i < p->tcfp_nkeys; ++i) {
+		u32 cur = p->tcfp_keys[i].off;
+
+		/* sanitize the shift value for any later use */
+		p->tcfp_keys[i].shift = min_t(size_t, BITS_PER_TYPE(int) - 1,
+					      p->tcfp_keys[i].shift);
+
+		/* The AT option can read a single byte, we can bound the actual
+		 * value with uchar max.
+		 */
+		cur += (0xff & p->tcfp_keys[i].offmask) >> p->tcfp_keys[i].shift;
+
+		/* Each key touches 4 bytes starting from the computed offset */
+		p->tcfp_off_max_hint = max(p->tcfp_off_max_hint, cur + 4);
+	}
 
 	kfree(p->tcfp_keys_ex);
 	p->tcfp_keys_ex = keys_ex;
@@ -272,12 +294,17 @@ static int tcf_pedit(struct sk_buff *skb, const struct tc_action *a,
 		     struct tcf_result *res)
 {
 	struct tcf_pedit *p = to_pedit(a);
+	u32 max_offset;
 	int i;
 
-	if (skb_unclone(skb, GFP_ATOMIC))
-		return p->tcf_action;
-
 	spin_lock(&p->tcf_lock);
+
+	max_offset = (skb_transport_header_was_set(skb) ?
+		      skb_transport_offset(skb) :
+		      skb_network_offset(skb)) +
+		     p->tcfp_off_max_hint;
+	if (skb_ensure_writable(skb, min(skb->len, max_offset)))
+		goto unlock;
 
 	tcf_lastuse_update(&p->tcf_tm);
 
@@ -365,6 +392,7 @@ bad:
 	p->tcf_qstats.overlimits++;
 done:
 	bstats_update(&p->tcf_bstats, skb);
+unlock:
 	spin_unlock(&p->tcf_lock);
 	return p->tcf_action;
 }
@@ -395,7 +423,10 @@ static int tcf_pedit_dump(struct sk_buff *skb, struct tc_action *a,
 	opt->bindcnt = p->tcf_bindcnt - bind;
 
 	if (p->tcfp_keys_ex) {
-		tcf_pedit_key_ex_dump(skb, p->tcfp_keys_ex, p->tcfp_nkeys);
+		if (tcf_pedit_key_ex_dump(skb,
+					  p->tcfp_keys_ex,
+					  p->tcfp_nkeys))
+			goto nla_put_failure;
 
 		if (nla_put(skb, TCA_PEDIT_PARMS_EX, s, opt))
 			goto nla_put_failure;
@@ -450,7 +481,7 @@ static __net_init int pedit_init_net(struct net *net)
 {
 	struct tc_action_net *tn = net_generic(net, pedit_net_id);
 
-	return tc_action_net_init(tn, &act_pedit_ops);
+	return tc_action_net_init(net, tn, &act_pedit_ops);
 }
 
 static void __net_exit pedit_exit_net(struct net *net)

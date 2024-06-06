@@ -219,7 +219,7 @@ intel_overlay_map_regs(struct intel_overlay *overlay)
 	if (OVERLAY_NEEDS_PHYSICAL(dev_priv))
 		regs = (struct overlay_registers __iomem *)overlay->reg_bo->phys_handle->vaddr;
 	else
-		regs = io_mapping_map_wc(&dev_priv->ggtt.mappable,
+		regs = io_mapping_map_wc(&dev_priv->ggtt.iomap,
 					 overlay->flip_addr,
 					 PAGE_SIZE);
 
@@ -965,6 +965,9 @@ static int check_overlay_dst(struct intel_overlay *overlay,
 	const struct intel_crtc_state *pipe_config =
 		overlay->crtc->config;
 
+	if (rec->dst_height == 0 || rec->dst_width == 0)
+		return -EINVAL;
+
 	if (rec->dst_x < pipe_config->pipe_src_w &&
 	    rec->dst_x + rec->dst_width <= pipe_config->pipe_src_w &&
 	    rec->dst_y < pipe_config->pipe_src_h &&
@@ -1508,7 +1511,7 @@ intel_overlay_map_regs_atomic(struct intel_overlay *overlay)
 		regs = (struct overlay_registers __iomem *)
 			overlay->reg_bo->phys_handle->vaddr;
 	else
-		regs = io_mapping_map_atomic_wc(&dev_priv->ggtt.mappable,
+		regs = io_mapping_map_atomic_wc(&dev_priv->ggtt.iomap,
 						overlay->flip_addr);
 
 	return regs;

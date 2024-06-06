@@ -50,6 +50,12 @@
 #define BCM_LM_DIAG_PKT 0x07
 #define BCM_LM_DIAG_SIZE 63
 
+#define BCM_TYPE49_PKT 0x31
+#define BCM_TYPE49_SIZE 0
+
+#define BCM_TYPE52_PKT 0x34
+#define BCM_TYPE52_SIZE 0
+
 #define BCM_AUTOSUSPEND_DELAY	5000 /* default autosleep delay */
 
 /* device driver resources */
@@ -89,6 +95,10 @@ struct bcm_data {
 /* List of BCM BT UART devices */
 static DEFINE_MUTEX(bcm_device_lock);
 static LIST_HEAD(bcm_device_list);
+
+static int irq_polarity = -1;
+module_param(irq_polarity, int, 0444);
+MODULE_PARM_DESC(irq_polarity, "IRQ polarity 0: active-high 1: active-low");
 
 static inline void host_set_baudrate(struct hci_uart *hu, unsigned int speed)
 {
@@ -307,6 +317,9 @@ static int bcm_open(struct hci_uart *hu)
 
 	bt_dev_dbg(hu->hdev, "hu %p", hu);
 
+	if (!hci_uart_has_flow_control(hu))
+		return -EOPNOTSUPP;
+
 	bcm = kzalloc(sizeof(*bcm), GFP_KERNEL);
 	if (!bcm)
 		return -ENOMEM;
@@ -379,7 +392,7 @@ static int bcm_close(struct hci_uart *hu)
 		pm_runtime_disable(bdev->dev);
 		pm_runtime_set_suspended(bdev->dev);
 
-		if (device_can_wakeup(bdev->dev)) {
+		if (bdev->irq > 0) {
 			devm_free_irq(bdev->dev, bdev->irq, bdev);
 			device_init_wakeup(bdev->dev, false);
 		}
@@ -487,12 +500,28 @@ finalize:
 	.lsize = 0, \
 	.maxlen = BCM_NULL_SIZE
 
+#define BCM_RECV_TYPE49 \
+	.type = BCM_TYPE49_PKT, \
+	.hlen = BCM_TYPE49_SIZE, \
+	.loff = 0, \
+	.lsize = 0, \
+	.maxlen = BCM_TYPE49_SIZE
+
+#define BCM_RECV_TYPE52 \
+	.type = BCM_TYPE52_PKT, \
+	.hlen = BCM_TYPE52_SIZE, \
+	.loff = 0, \
+	.lsize = 0, \
+	.maxlen = BCM_TYPE52_SIZE
+
 static const struct h4_recv_pkt bcm_recv_pkts[] = {
 	{ H4_RECV_ACL,      .recv = hci_recv_frame },
 	{ H4_RECV_SCO,      .recv = hci_recv_frame },
 	{ H4_RECV_EVENT,    .recv = hci_recv_frame },
 	{ BCM_RECV_LM_DIAG, .recv = hci_recv_diag  },
 	{ BCM_RECV_NULL,    .recv = hci_recv_diag  },
+	{ BCM_RECV_TYPE49,  .recv = hci_recv_diag  },
+	{ BCM_RECV_TYPE52,  .recv = hci_recv_diag  },
 };
 
 static int bcm_recv(struct hci_uart *hu, const void *data, int count)
@@ -577,11 +606,9 @@ static int bcm_suspend_device(struct device *dev)
 	}
 
 	/* Suspend the device */
-	if (bdev->device_wakeup) {
-		gpiod_set_value(bdev->device_wakeup, false);
-		bt_dev_dbg(bdev, "suspend, delaying 15 ms");
-		mdelay(15);
-	}
+	gpiod_set_value(bdev->device_wakeup, false);
+	bt_dev_dbg(bdev, "suspend, delaying 15 ms");
+	mdelay(15);
 
 	return 0;
 }
@@ -592,11 +619,9 @@ static int bcm_resume_device(struct device *dev)
 
 	bt_dev_dbg(bdev, "");
 
-	if (bdev->device_wakeup) {
-		gpiod_set_value(bdev->device_wakeup, true);
-		bt_dev_dbg(bdev, "resume, delaying 15 ms");
-		mdelay(15);
-	}
+	gpiod_set_value(bdev->device_wakeup, true);
+	bt_dev_dbg(bdev, "resume, delaying 15 ms");
+	mdelay(15);
 
 	/* When this executes, the device has woken up already */
 	if (bdev->is_suspended && bdev->hu) {
@@ -632,7 +657,7 @@ static int bcm_suspend(struct device *dev)
 	if (pm_runtime_active(dev))
 		bcm_suspend_device(dev);
 
-	if (device_may_wakeup(dev)) {
+	if (device_may_wakeup(dev) && bdev->irq > 0) {
 		error = enable_irq_wake(bdev->irq);
 		if (!error)
 			bt_dev_dbg(bdev, "BCM irq: enabled");
@@ -662,7 +687,7 @@ static int bcm_resume(struct device *dev)
 	if (!bdev->hu)
 		goto unlock;
 
-	if (device_may_wakeup(dev)) {
+	if (device_may_wakeup(dev) && bdev->irq > 0) {
 		disable_irq_wake(bdev->irq);
 		bt_dev_dbg(bdev, "BCM irq: disabled");
 	}
@@ -705,22 +730,6 @@ static const struct acpi_gpio_mapping acpi_bcm_int_first_gpios[] = {
 #ifdef CONFIG_ACPI
 /* IRQ polarity of some chipsets are not defined correctly in ACPI table. */
 static const struct dmi_system_id bcm_active_low_irq_dmi_table[] = {
-	{
-		.ident = "Asus T100TA",
-		.matches = {
-			DMI_EXACT_MATCH(DMI_SYS_VENDOR,
-					"ASUSTeK COMPUTER INC."),
-			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "T100TA"),
-		},
-	},
-	{
-		.ident = "Asus T100CHI",
-		.matches = {
-			DMI_EXACT_MATCH(DMI_SYS_VENDOR,
-					"ASUSTeK COMPUTER INC."),
-			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "T100CHI"),
-		},
-	},
 	{	/* Handle ThinkPad 8 tablets with BCM2E55 chipset ACPI ID */
 		.ident = "Lenovo ThinkPad 8",
 		.matches = {
@@ -748,7 +757,9 @@ static int bcm_resource(struct acpi_resource *ares, void *data)
 	switch (ares->type) {
 	case ACPI_RESOURCE_TYPE_EXTENDED_IRQ:
 		irq = &ares->data.extended_irq;
-		dev->irq_active_low = irq->polarity == ACPI_ACTIVE_LOW;
+		if (irq->polarity != ACPI_ACTIVE_LOW)
+			dev_info(dev->dev, "ACPI Interrupt resource is active-high, this is usually wrong, treating the IRQ as active-low\n");
+		dev->irq_active_low = true;
 		break;
 
 	case ACPI_RESOURCE_TYPE_GPIO:
@@ -779,8 +790,11 @@ static int bcm_get_resources(struct bcm_device *dev)
 
 	dev->clk = devm_clk_get(dev->dev, NULL);
 
-	dev->device_wakeup = devm_gpiod_get_optional(dev->dev,
-						     "device-wakeup",
+	/* Handle deferred probing */
+	if (dev->clk == ERR_PTR(-EPROBE_DEFER))
+		return PTR_ERR(dev->clk);
+
+	dev->device_wakeup = devm_gpiod_get_optional(dev->dev, "device-wakeup",
 						     GPIOD_OUT_LOW);
 	if (IS_ERR(dev->device_wakeup))
 		return PTR_ERR(dev->device_wakeup);
@@ -839,11 +853,17 @@ static int bcm_acpi_probe(struct bcm_device *dev)
 	}
 	acpi_dev_free_resource_list(&resources);
 
-	dmi_id = dmi_first_match(bcm_active_low_irq_dmi_table);
-	if (dmi_id) {
-		dev_warn(dev->dev, "%s: Overwriting IRQ polarity to active low",
-			    dmi_id->ident);
-		dev->irq_active_low = true;
+	if (irq_polarity != -1) {
+		dev->irq_active_low = irq_polarity;
+		dev_warn(dev->dev, "Overwriting IRQ polarity to active %s by module-param\n",
+			 dev->irq_active_low ? "low" : "high");
+	} else {
+		dmi_id = dmi_first_match(bcm_active_low_irq_dmi_table);
+		if (dmi_id) {
+			dev_warn(dev->dev, "%s: Overwriting IRQ polarity to active low",
+				 dmi_id->ident);
+			dev->irq_active_low = true;
+		}
 	}
 
 	return 0;
@@ -871,7 +891,12 @@ static int bcm_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	dev->dev = &pdev->dev;
-	dev->irq = platform_get_irq(pdev, 0);
+
+	ret = platform_get_irq(pdev, 0);
+	if (ret < 0)
+		return ret;
+
+	dev->irq = ret;
 
 	if (has_acpi_companion(&pdev->dev)) {
 		ret = bcm_acpi_probe(dev);

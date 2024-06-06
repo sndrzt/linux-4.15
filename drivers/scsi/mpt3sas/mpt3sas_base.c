@@ -2190,9 +2190,11 @@ _base_config_dma_addressing(struct MPT3SAS_ADAPTER *ioc, struct pci_dev *pdev)
 {
 	struct sysinfo s;
 	u64 consistent_dma_mask;
+	/* Set 63 bit DMA mask for all SAS3 and SAS35 controllers */
+	int dma_mask = (ioc->hba_mpi_version_belonged > MPI2_VERSION) ? 63 : 64;
 
 	if (ioc->dma_mask)
-		consistent_dma_mask = DMA_BIT_MASK(64);
+		consistent_dma_mask = DMA_BIT_MASK(dma_mask);
 	else
 		consistent_dma_mask = DMA_BIT_MASK(32);
 
@@ -2200,11 +2202,11 @@ _base_config_dma_addressing(struct MPT3SAS_ADAPTER *ioc, struct pci_dev *pdev)
 		const uint64_t required_mask =
 		    dma_get_required_mask(&pdev->dev);
 		if ((required_mask > DMA_BIT_MASK(32)) &&
-		    !pci_set_dma_mask(pdev, DMA_BIT_MASK(64)) &&
+		    !pci_set_dma_mask(pdev, DMA_BIT_MASK(dma_mask)) &&
 		    !pci_set_consistent_dma_mask(pdev, consistent_dma_mask)) {
 			ioc->base_add_sg_single = &_base_add_sg_single_64;
 			ioc->sge_size = sizeof(Mpi2SGESimple64_t);
-			ioc->dma_mask = 64;
+			ioc->dma_mask = dma_mask;
 			goto out;
 		}
 	}
@@ -2230,7 +2232,7 @@ static int
 _base_change_consistent_dma_mask(struct MPT3SAS_ADAPTER *ioc,
 				      struct pci_dev *pdev)
 {
-	if (pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64))) {
+	if (pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(ioc->dma_mask))) {
 		if (pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(32)))
 			return -ENODEV;
 	}
@@ -2387,8 +2389,11 @@ _base_assign_reply_queues(struct MPT3SAS_ADAPTER *ioc)
 				continue;
 			}
 
-			for_each_cpu(cpu, mask)
+			for_each_cpu_and(cpu, mask, cpu_online_mask) {
+				if (cpu >= ioc->cpu_msix_table_sz)
+					break;
 				ioc->cpu_msix_table[cpu] = reply_q->msix_index;
+			}
 		}
 		return;
 	}
@@ -2524,10 +2529,9 @@ mpt3sas_base_unmap_resources(struct MPT3SAS_ADAPTER *ioc)
 	_base_free_irq(ioc);
 	_base_disable_msix(ioc);
 
-	if (ioc->combined_reply_queue) {
-		kfree(ioc->replyPostRegisterIndex);
-		ioc->replyPostRegisterIndex = NULL;
-	}
+	kfree(ioc->replyPostRegisterIndex);
+	ioc->replyPostRegisterIndex = NULL;
+
 
 	if (ioc->chip_phys) {
 		iounmap(ioc->chip);
@@ -2634,7 +2638,7 @@ mpt3sas_base_map_resources(struct MPT3SAS_ADAPTER *ioc)
 	/* Use the Combined reply queue feature only for SAS3 C0 & higher
 	 * revision HBAs and also only when reply queue count is greater than 8
 	 */
-	if (ioc->combined_reply_queue && ioc->reply_queue_count > 8) {
+	if (ioc->combined_reply_queue) {
 		/* Determine the Supplemental Reply Post Host Index Registers
 		 * Addresse. Supplemental Reply Post Host Index Registers
 		 * starts at offset MPI25_SUP_REPLY_POST_HOST_INDEX_OFFSET and
@@ -2658,8 +2662,7 @@ mpt3sas_base_map_resources(struct MPT3SAS_ADAPTER *ioc)
 			     MPI25_SUP_REPLY_POST_HOST_INDEX_OFFSET +
 			     (i * MPT3_SUP_REPLY_POST_HOST_INDEX_REG_OFFSET));
 		}
-	} else
-		ioc->combined_reply_queue = 0;
+	}
 
 	if (ioc->is_warpdrive) {
 		ioc->reply_post_host_index[0] = (resource_size_t __iomem *)
@@ -3677,7 +3680,7 @@ _base_static_config_pages(struct MPT3SAS_ADAPTER *ioc)
 	 * flag unset in NVDATA.
 	 */
 	mpt3sas_config_get_manufacturing_pg11(ioc, &mpi_reply, &ioc->manu_pg11);
-	if (ioc->manu_pg11.EEDPTagMode == 0) {
+	if (!ioc->is_gen35_ioc && ioc->manu_pg11.EEDPTagMode == 0) {
 		pr_err("%s: overriding NVDATA EEDPTagMode setting\n",
 		    ioc->name);
 		ioc->manu_pg11.EEDPTagMode &= ~0x3;
@@ -3811,7 +3814,9 @@ _base_release_memory_pools(struct MPT3SAS_ADAPTER *ioc)
 		ioc->scsi_lookup = NULL;
 	}
 	kfree(ioc->hpr_lookup);
+	ioc->hpr_lookup = NULL;
 	kfree(ioc->internal_lookup);
+	ioc->internal_lookup = NULL;
 	if (ioc->chain_lookup) {
 		for (i = 0; i < ioc->chain_depth; i++) {
 			if (ioc->chain_lookup[i].chain_buffer)
@@ -4035,7 +4040,7 @@ _base_allocate_memory_pools(struct MPT3SAS_ADAPTER *ioc)
 		total_sz += sz;
 	} while (ioc->rdpq_array_enable && (++i < ioc->reply_queue_count));
 
-	if (ioc->dma_mask == 64) {
+	if (ioc->dma_mask > 32) {
 		if (_base_change_consistent_dma_mask(ioc, ioc->pdev) != 0) {
 			pr_warn(MPT3SAS_FMT
 			    "no suitable consistent DMA mask for %s\n",
@@ -5044,6 +5049,9 @@ _base_get_ioc_facts(struct MPT3SAS_ADAPTER *ioc)
 	facts->WhoInit = mpi_reply.WhoInit;
 	facts->NumberOfPorts = mpi_reply.NumberOfPorts;
 	facts->MaxMSIxVectors = mpi_reply.MaxMSIxVectors;
+	if (ioc->msix_enable && (facts->MaxMSIxVectors <=
+	    MAX_COMBINED_MSIX_VECTORS(ioc->is_gen35_ioc)))
+		ioc->combined_reply_queue = 0;
 	facts->RequestCredit = le16_to_cpu(mpi_reply.RequestCredit);
 	facts->MaxReplyDescriptorPostQueueDepth =
 	    le16_to_cpu(mpi_reply.MaxReplyDescriptorPostQueueDepth);
@@ -5188,7 +5196,7 @@ _base_send_ioc_init(struct MPT3SAS_ADAPTER *ioc)
 
 	r = _base_handshake_req_reply_wait(ioc,
 	    sizeof(Mpi2IOCInitRequest_t), (u32 *)&mpi_request,
-	    sizeof(Mpi2IOCInitReply_t), (u16 *)&mpi_reply, 10);
+	    sizeof(Mpi2IOCInitReply_t), (u16 *)&mpi_reply, 30);
 
 	if (r != 0) {
 		pr_err(MPT3SAS_FMT "%s: handshake failed (r=%d)\n",
@@ -6071,14 +6079,18 @@ mpt3sas_base_attach(struct MPT3SAS_ADAPTER *ioc)
 		ioc->pend_os_device_add_sz++;
 	ioc->pend_os_device_add = kzalloc(ioc->pend_os_device_add_sz,
 	    GFP_KERNEL);
-	if (!ioc->pend_os_device_add)
+	if (!ioc->pend_os_device_add) {
+		r = -ENOMEM;
 		goto out_free_resources;
+	}
 
 	ioc->device_remove_in_progress_sz = ioc->pend_os_device_add_sz;
 	ioc->device_remove_in_progress =
 		kzalloc(ioc->device_remove_in_progress_sz, GFP_KERNEL);
-	if (!ioc->device_remove_in_progress)
+	if (!ioc->device_remove_in_progress) {
+		r = -ENOMEM;
 		goto out_free_resources;
+	}
 
 	ioc->fwfault_debug = mpt3sas_fwfault_debug;
 
@@ -6289,14 +6301,14 @@ _base_reset_handler(struct MPT3SAS_ADAPTER *ioc, int reset_phase)
 }
 
 /**
- * _wait_for_commands_to_complete - reset controller
+ * mpt3sas_wait_for_commands_to_complete - reset controller
  * @ioc: Pointer to MPT_ADAPTER structure
  *
  * This function waiting(3s) for all pending commands to complete
  * prior to putting controller in reset.
  */
-static void
-_wait_for_commands_to_complete(struct MPT3SAS_ADAPTER *ioc)
+void
+mpt3sas_wait_for_commands_to_complete(struct MPT3SAS_ADAPTER *ioc)
 {
 	u32 ioc_state;
 	unsigned long flags;
@@ -6375,7 +6387,7 @@ mpt3sas_base_hard_reset_handler(struct MPT3SAS_ADAPTER *ioc,
 			is_fault = 1;
 	}
 	_base_reset_handler(ioc, MPT3_IOC_PRE_RESET);
-	_wait_for_commands_to_complete(ioc);
+	mpt3sas_wait_for_commands_to_complete(ioc);
 	_base_mask_interrupts(ioc);
 	r = _base_make_ioc_ready(ioc, type);
 	if (r)

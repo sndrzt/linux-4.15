@@ -64,6 +64,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/ctype.h>
 #include <linux/uaccess.h>
+#include <linux/security.h>
 
 #include <linux/percpu.h>
 #include <linux/crash_dump.h>
@@ -820,6 +821,12 @@ void __init setup_arch(char **cmdline_p)
 	memblock_reserve(__pa_symbol(_text),
 			 (unsigned long)__bss_stop - (unsigned long)_text);
 
+	/*
+	 * Make sure page 0 is always reserved because on systems with
+	 * L1TF its contents can be leaked to user processes.
+	 */
+	memblock_reserve(0, PAGE_SIZE);
+
 	early_reserve_initrd();
 
 	/*
@@ -998,6 +1005,9 @@ void __init setup_arch(char **cmdline_p)
 	if (efi_enabled(EFI_BOOT))
 		efi_init();
 
+	efi_set_secure_boot(boot_params.secure_boot);
+	init_lockdown();
+
 	dmi_scan_machine();
 	dmi_memdev_walk();
 	dmi_set_dump_stack_arch_desc();
@@ -1098,6 +1108,7 @@ void __init setup_arch(char **cmdline_p)
 		efi_fake_memmap();
 		efi_find_mirror();
 		efi_esrt_init();
+		efi_mokvar_table_init();
 
 		/*
 		 * The EFI specification says that boot service code won't be
@@ -1151,34 +1162,17 @@ void __init setup_arch(char **cmdline_p)
 	/* Allocate bigger log buffer */
 	setup_log_buf(1);
 
-	if (efi_enabled(EFI_BOOT)) {
-		switch (boot_params.secure_boot) {
-		case efi_secureboot_mode_disabled:
-			pr_info("Secure boot disabled\n");
-			break;
-		case efi_secureboot_mode_enabled:
-			pr_info("Secure boot enabled\n");
-			break;
-		default:
-			pr_info("Secure boot could not be determined\n");
-			break;
-		}
-	}
-
 	reserve_initrd();
 
 	acpi_table_upgrade();
+	/* Look for ACPI tables and reserve memory occupied by them. */
+	acpi_boot_table_init();
 
 	vsmp_init();
 
 	io_delay_init();
 
 	early_platform_quirks();
-
-	/*
-	 * Parse the ACPI tables for possible boot-time SMP configuration.
-	 */
-	acpi_boot_table_init();
 
 	early_acpi_boot_init();
 
@@ -1205,20 +1199,13 @@ void __init setup_arch(char **cmdline_p)
 
 	kasan_init();
 
-#ifdef CONFIG_X86_32
-	/* sync back kernel address range */
-	clone_pgd_range(initial_page_table + KERNEL_PGD_BOUNDARY,
-			swapper_pg_dir     + KERNEL_PGD_BOUNDARY,
-			KERNEL_PGD_PTRS);
-
 	/*
-	 * sync back low identity map too.  It is used for example
-	 * in the 32-bit EFI stub.
+	 * Sync back kernel address range.
+	 *
+	 * FIXME: Can the later sync in setup_cpu_entry_areas() replace
+	 * this call?
 	 */
-	clone_pgd_range(initial_page_table,
-			swapper_pg_dir     + KERNEL_PGD_BOUNDARY,
-			min(KERNEL_PGD_PTRS, KERNEL_PGD_BOUNDARY));
-#endif
+	sync_initial_page_table();
 
 	tboot_probe();
 
@@ -1255,7 +1242,7 @@ void __init setup_arch(char **cmdline_p)
 	x86_init.hyper.guest_late_init();
 
 	e820__reserve_resources();
-	e820__register_nosave_regions(max_low_pfn);
+	e820__register_nosave_regions(max_pfn);
 
 	x86_init.resources.reserve_resources();
 

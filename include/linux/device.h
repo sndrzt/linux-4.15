@@ -377,6 +377,9 @@ int subsys_virtual_register(struct bus_type *subsys,
  * @shutdown_pre: Called at shut-down time before driver shutdown.
  * @ns_type:	Callbacks so sysfs can detemine namespaces.
  * @namespace:	Namespace of the device belongs to this class.
+ * @get_ownership: Allows class to specify uid/gid of the sysfs directories
+ *		for the devices belonging to the class. Usually tied to
+ *		device's namespace.
  * @pm:		The default device power management operations of this class.
  * @p:		The private data of the driver core, no one other than the
  *		driver core can touch this.
@@ -405,6 +408,8 @@ struct class {
 
 	const struct kobj_ns_type_operations *ns_type;
 	const void *(*namespace)(struct device *dev);
+
+	void (*get_ownership)(struct device *dev, kuid_t *uid, kgid_t *gid);
 
 	const struct dev_pm_ops *pm;
 
@@ -681,7 +686,8 @@ extern unsigned long devm_get_free_pages(struct device *dev,
 					 gfp_t gfp_mask, unsigned int order);
 extern void devm_free_pages(struct device *dev, unsigned long addr);
 
-void __iomem *devm_ioremap_resource(struct device *dev, struct resource *res);
+void __iomem *devm_ioremap_resource(struct device *dev,
+				    const struct resource *res);
 
 /* allows to add/remove a custom action to devres stack */
 int devm_add_action(struct device *dev, void (*action)(void *), void *data);
@@ -915,6 +921,7 @@ struct device {
 	struct dev_pin_info	*pins;
 #endif
 #ifdef CONFIG_GENERIC_MSI_IRQ
+	raw_spinlock_t		msi_lock;
 	struct list_head	msi_list;
 #endif
 
@@ -1255,6 +1262,7 @@ extern int (*platform_notify_remove)(struct device *dev);
  */
 extern struct device *get_device(struct device *dev);
 extern void put_device(struct device *dev);
+extern bool kill_device(struct device *dev);
 
 #ifdef CONFIG_DEVTMPFS
 extern int devtmpfs_create_node(struct device *dev);
@@ -1278,6 +1286,62 @@ struct device_link *device_link_add(struct device *consumer,
 void device_link_del(struct device_link *link);
 
 #ifdef CONFIG_PRINTK
+
+#if defined(__KMSG_CHECKER) && defined(KMSG_COMPONENT)
+
+/* generate magic string for scripts/kmsg-doc to parse */
+#define dev_emerg(dev, format, arg...)		\
+	__KMSG_DEV(KERN_EMERG _FMT_ format _ARGS_ dev, ## arg _END_)
+#define dev_alert(dev, format, arg...)		\
+	__KMSG_DEV(KERN_ALERT _FMT_ format _ARGS_ dev, ## arg _END_)
+#define dev_crit(dev, format, arg...)		\
+	__KMSG_DEV(KERN_CRIT _FMT_ format _ARGS_ dev, ## arg _END_)
+#define dev_err(dev, format, arg...)		\
+	__KMSG_DEV(KERN_ERR _FMT_ format _ARGS_ dev, ## arg _END_)
+#define dev_warn(dev, format, arg...)		\
+	__KMSG_DEV(KERN_WARNING _FMT_ format _ARGS_ dev, ## arg _END_)
+#define dev_notice(dev, format, arg...)		\
+	__KMSG_DEV(KERN_NOTICE _FMT_ format _ARGS_ dev, ## arg _END_)
+#define _dev_info(dev, format, arg...)		\
+	__KMSG_DEV(KERN_INFO _FMT_ format _ARGS_ dev, ## arg _END_)
+
+#elif defined(CONFIG_KMSG_IDS) && defined(KMSG_COMPONENT)
+
+extern int dev_printk_hash(const char *level, const struct device *dev,
+			   const char *fmt, ...);
+extern __printf(2,3)
+int dev_emerg_hash(const struct device *dev, const char *fmt, ...);
+extern __printf(2,3)
+int dev_alert_hash(const struct device *dev, const char *fmt, ...);
+extern __printf(2,3)
+int dev_crit_hash(const struct device *dev, const char *fmt, ...);
+extern __printf(2,3)
+int dev_err_hash(const struct device *dev, const char *fmt, ...);
+extern __printf(2,3)
+int dev_warn_hash(const struct device *dev, const char *fmt, ...);
+extern __printf(2,3)
+int dev_notice_hash(const struct device *dev, const char *fmt, ...);
+extern __printf(2,3)
+int _dev_info_hash(const struct device *dev, const char *fmt, ...);
+
+#define dev_printk(level, dev, format, arg...)				\
+	dev_printk_hash(level, dev, "%s: " format, dev_name(dev), ## arg)
+#define dev_emerg(dev, format, arg...) \
+	dev_emerg_hash(dev, "%s: " format, dev_name(dev), ## arg)
+#define dev_alert(dev, format, arg...) \
+	dev_alert_hash(dev, "%s: " format, dev_name(dev), ## arg)
+#define dev_crit(dev, format, arg...) \
+	dev_crit_hash(dev, "%s: " format, dev_name(dev), ## arg)
+#define dev_err(dev, format, arg...) \
+	dev_err_hash(dev, "%s: " format, dev_name(dev), ## arg)
+#define dev_warn(dev, format, arg...) \
+	dev_warn_hash(dev, "%s: " format, dev_name(dev), ## arg)
+#define dev_notice(dev, format, arg...) \
+	dev_notice_hash(dev, "%s: " format, dev_name(dev), ## arg)
+#define _dev_info(dev, format, arg...) \
+	_dev_info_hash(dev, "%s: " format, dev_name(dev), ## arg)
+
+#else /* !defined(CONFIG_KMSG_IDS) */
 
 extern __printf(3, 0)
 int dev_vprintk_emit(int level, const struct device *dev,
@@ -1303,7 +1367,9 @@ void dev_notice(const struct device *dev, const char *fmt, ...);
 extern __printf(2, 3)
 void _dev_info(const struct device *dev, const char *fmt, ...);
 
-#else
+#endif /* !defined(CONFIG_KMSG_IDS) */
+
+#else /* !defined(CONFIG_PRINTK) */
 
 static inline __printf(3, 0)
 int dev_vprintk_emit(int level, const struct device *dev,
@@ -1343,7 +1409,7 @@ static inline __printf(2, 3)
 void _dev_info(const struct device *dev, const char *fmt, ...)
 {}
 
-#endif
+#endif /* !defined(CONFIG_PRINTK) */
 
 /*
  * Stupid hackaround for existing uses of non-printk uses dev_info

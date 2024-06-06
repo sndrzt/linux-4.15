@@ -39,7 +39,7 @@
 #define IBMVNIC_RX_WEIGHT		16
 /* when changing this, update IBMVNIC_IO_ENTITLEMENT_DEFAULT */
 #define IBMVNIC_BUFFS_PER_POOL	100
-#define IBMVNIC_MAX_TX_QUEUES	5
+#define IBMVNIC_MAX_QUEUES	10
 
 #define IBMVNIC_TSO_BUF_SZ	65536
 #define IBMVNIC_TSO_BUFS	64
@@ -1097,7 +1097,8 @@ struct ibmvnic_adapter {
 	struct tasklet_struct tasklet;
 	enum vnic_state state;
 	enum ibmvnic_reset_reason reset_reason;
-	struct mutex reset_lock, rwi_lock;
+	struct mutex reset_lock;
+	spinlock_t rwi_lock;
 	struct list_head rwi_list;
 	struct work_struct ibmvnic_reset;
 	bool resetting;

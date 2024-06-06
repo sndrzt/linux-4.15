@@ -33,7 +33,7 @@
 #define DM_VERITY_OPT_RESTART		"restart_on_corruption"
 #define DM_VERITY_OPT_IGN_ZEROES	"ignore_zero_blocks"
 
-#define DM_VERITY_OPTS_MAX		(2 + DM_VERITY_OPTS_FEC)
+#define DM_VERITY_OPTS_MAX		(3 + DM_VERITY_OPTS_FEC)
 
 static unsigned dm_verity_prefetch_cluster = DM_VERITY_DEFAULT_PREFETCH_SIZE;
 
@@ -98,10 +98,26 @@ static int verity_hash_update(struct dm_verity *v, struct ahash_request *req,
 {
 	struct scatterlist sg;
 
-	sg_init_one(&sg, data, len);
-	ahash_request_set_crypt(req, &sg, NULL, len);
-
-	return crypto_wait_req(crypto_ahash_update(req), wait);
+	if (likely(!is_vmalloc_addr(data))) {
+		sg_init_one(&sg, data, len);
+		ahash_request_set_crypt(req, &sg, NULL, len);
+		return crypto_wait_req(crypto_ahash_update(req), wait);
+	} else {
+		do {
+			int r;
+			size_t this_step = min_t(size_t, len, PAGE_SIZE - offset_in_page(data));
+			flush_kernel_vmap_range((void *)data, this_step);
+			sg_init_table(&sg, 1);
+			sg_set_page(&sg, vmalloc_to_page(data), this_step, offset_in_page(data));
+			ahash_request_set_crypt(req, &sg, NULL, this_step);
+			r = crypto_wait_req(crypto_ahash_update(req), wait);
+			if (unlikely(r))
+				return r;
+			data += this_step;
+			len -= this_step;
+		} while (len);
+		return 0;
+	}
 }
 
 /*
@@ -219,8 +235,8 @@ static int verity_handle_err(struct dm_verity *v, enum verity_block_type type,
 		BUG();
 	}
 
-	DMERR("%s: %s block %llu is corrupted", v->data_dev->name, type_str,
-		block);
+	DMERR_LIMIT("%s: %s block %llu is corrupted", v->data_dev->name,
+		    type_str, block);
 
 	if (v->corrupted_errs == DM_VERITY_MAX_CORRUPTED_ERRS)
 		DMERR("%s: reached maximum errors", v->data_dev->name);
@@ -495,6 +511,15 @@ static int verity_verify_io(struct dm_verity_io *io)
 }
 
 /*
+ * Skip verity work in response to I/O error when system is shutting down.
+ */
+static inline bool verity_is_system_shutting_down(void)
+{
+	return system_state == SYSTEM_HALT || system_state == SYSTEM_POWER_OFF
+		|| system_state == SYSTEM_RESTART;
+}
+
+/*
  * End one "io" structure with a given error.
  */
 static void verity_finish_io(struct dm_verity_io *io, blk_status_t status)
@@ -521,7 +546,8 @@ static void verity_end_io(struct bio *bio)
 {
 	struct dm_verity_io *io = bio->bi_private;
 
-	if (bio->bi_status && !verity_fec_is_enabled(io->v)) {
+	if (bio->bi_status &&
+	    (!verity_fec_is_enabled(io->v) || verity_is_system_shutting_down())) {
 		verity_finish_io(io, bio->bi_status);
 		return;
 	}
@@ -1096,6 +1122,7 @@ bad:
 
 static struct target_type verity_target = {
 	.name		= "verity",
+	.features	= DM_TARGET_IMMUTABLE,
 	.version	= {1, 3, 0},
 	.module		= THIS_MODULE,
 	.ctr		= verity_ctr,

@@ -566,6 +566,7 @@ struct clock_source *dce100_clock_source_create(
 		return &clk_src->base;
 	}
 
+	kfree(clk_src);
 	BREAK_TO_DEBUGGER();
 	return NULL;
 }
@@ -647,9 +648,22 @@ bool dce100_validate_bandwidth(
 	struct dc  *dc,
 	struct dc_state *context)
 {
-	/* TODO implement when needed but for now hardcode max value*/
-	context->bw.dce.dispclk_khz = 681000;
-	context->bw.dce.yclk_khz = 250000 * MEMORY_TYPE_MULTIPLIER;
+	int i;
+	bool at_least_one_pipe = false;
+
+	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+		if (context->res_ctx.pipe_ctx[i].stream)
+			at_least_one_pipe = true;
+	}
+
+	if (at_least_one_pipe) {
+		/* TODO implement when needed but for now hardcode max value*/
+		context->bw.dce.dispclk_khz = 681000;
+		context->bw.dce.yclk_khz = 250000 * MEMORY_TYPE_MULTIPLIER;
+	} else {
+		context->bw.dce.dispclk_khz = 0;
+		context->bw.dce.yclk_khz = 0;
+	}
 
 	return true;
 }
@@ -852,7 +866,7 @@ static bool construct(
 	dc->caps.max_downscale_ratio = 200;
 	dc->caps.i2c_speed_in_khz = 40;
 	dc->caps.max_cursor_size = 128;
-
+	dc->caps.disable_dp_clk_share = true;
 	for (i = 0; i < pool->base.pipe_count; i++) {
 		pool->base.timing_generators[i] =
 			dce100_timing_generator_create(
@@ -927,6 +941,7 @@ struct resource_pool *dce100_create_resource_pool(
 	if (construct(num_virtual_links, dc, pool))
 		return &pool->base;
 
+	kfree(pool);
 	BREAK_TO_DEBUGGER();
 	return NULL;
 }

@@ -146,13 +146,13 @@ static int configure_filter_smac(struct adapter *adap, struct filter_entry *f)
 	int err;
 
 	/* do a set-tcb for smac-sel and CWR bit.. */
-	err = set_tcb_tflag(adap, f, f->tid, TF_CCTRL_CWR_S, 1, 1);
-	if (err)
-		goto smac_err;
-
 	err = set_tcb_field(adap, f, f->tid, TCB_SMAC_SEL_W,
 			    TCB_SMAC_SEL_V(TCB_SMAC_SEL_M),
 			    TCB_SMAC_SEL_V(f->smt->idx), 1);
+	if (err)
+		goto smac_err;
+
+	err = set_tcb_tflag(adap, f, f->tid, TF_CCTRL_CWR_S, 1, 1);
 	if (!err)
 		return 0;
 
@@ -578,6 +578,7 @@ int set_filter_wr(struct adapter *adapter, int fidx)
 		      FW_FILTER_WR_DIRSTEERHASH_V(f->fs.dirsteerhash) |
 		      FW_FILTER_WR_LPBK_V(f->fs.action == FILTER_SWITCH) |
 		      FW_FILTER_WR_DMAC_V(f->fs.newdmac) |
+		      FW_FILTER_WR_SMAC_V(f->fs.newsmac) |
 		      FW_FILTER_WR_INSVLAN_V(f->fs.newvlan == VLAN_INSERT ||
 					     f->fs.newvlan == VLAN_REWRITE) |
 		      FW_FILTER_WR_RMVLAN_V(f->fs.newvlan == VLAN_REMOVE ||
@@ -595,7 +596,8 @@ int set_filter_wr(struct adapter *adapter, int fidx)
 		 FW_FILTER_WR_OVLAN_VLD_V(f->fs.val.ovlan_vld) |
 		 FW_FILTER_WR_IVLAN_VLDM_V(f->fs.mask.ivlan_vld) |
 		 FW_FILTER_WR_OVLAN_VLDM_V(f->fs.mask.ovlan_vld));
-	fwr->smac_sel = 0;
+	if (f->fs.newsmac)
+		fwr->smac_sel = f->smt->idx;
 	fwr->rx_chan_rx_rpl_iq =
 		htons(FW_FILTER_WR_RX_CHAN_V(0) |
 		      FW_FILTER_WR_RX_RPL_IQ_V(adapter->sge.fw_evtq.abs_id));
@@ -772,16 +774,16 @@ static bool is_addr_all_mask(u8 *ipmask, int family)
 		struct in_addr *addr;
 
 		addr = (struct in_addr *)ipmask;
-		if (addr->s_addr == 0xffffffff)
+		if (addr->s_addr == htonl(0xffffffff))
 			return true;
 	} else if (family == AF_INET6) {
 		struct in6_addr *addr6;
 
 		addr6 = (struct in6_addr *)ipmask;
-		if (addr6->s6_addr32[0] == 0xffffffff &&
-		    addr6->s6_addr32[1] == 0xffffffff &&
-		    addr6->s6_addr32[2] == 0xffffffff &&
-		    addr6->s6_addr32[3] == 0xffffffff)
+		if (addr6->s6_addr32[0] == htonl(0xffffffff) &&
+		    addr6->s6_addr32[1] == htonl(0xffffffff) &&
+		    addr6->s6_addr32[2] == htonl(0xffffffff) &&
+		    addr6->s6_addr32[3] == htonl(0xffffffff))
 			return true;
 	}
 	return false;
@@ -814,7 +816,7 @@ bool is_filter_exact_match(struct adapter *adap,
 {
 	struct tp_params *tp = &adap->params.tp;
 	u64 hash_filter_mask = tp->hash_filter_mask;
-	u32 mask;
+	u64 ntuple_mask = 0;
 
 	if (!is_hashfilter(adap))
 		return false;
@@ -843,73 +845,45 @@ bool is_filter_exact_match(struct adapter *adap,
 	if (!fs->val.fport || fs->mask.fport != 0xffff)
 		return false;
 
-	if (tp->fcoe_shift >= 0) {
-		mask = (hash_filter_mask >> tp->fcoe_shift) & FT_FCOE_W;
-		if (mask && !fs->mask.fcoe)
-			return false;
-	}
+	/* calculate tuple mask and compare with mask configured in hw */
+	if (tp->fcoe_shift >= 0)
+		ntuple_mask |= (u64)fs->mask.fcoe << tp->fcoe_shift;
 
-	if (tp->port_shift >= 0) {
-		mask = (hash_filter_mask >> tp->port_shift) & FT_PORT_W;
-		if (mask && !fs->mask.iport)
-			return false;
-	}
+	if (tp->port_shift >= 0)
+		ntuple_mask |= (u64)fs->mask.iport << tp->port_shift;
 
 	if (tp->vnic_shift >= 0) {
-		mask = (hash_filter_mask >> tp->vnic_shift) & FT_VNIC_ID_W;
-
-		if ((adap->params.tp.ingress_config & VNIC_F)) {
-			if (mask && !fs->mask.pfvf_vld)
-				return false;
-		} else {
-			if (mask && !fs->mask.ovlan_vld)
-				return false;
-		}
+		if ((adap->params.tp.ingress_config & VNIC_F))
+			ntuple_mask |= (u64)fs->mask.pfvf_vld << tp->vnic_shift;
+		else
+			ntuple_mask |= (u64)fs->mask.ovlan_vld <<
+				tp->vnic_shift;
 	}
 
-	if (tp->vlan_shift >= 0) {
-		mask = (hash_filter_mask >> tp->vlan_shift) & FT_VLAN_W;
-		if (mask && !fs->mask.ivlan)
-			return false;
-	}
+	if (tp->vlan_shift >= 0)
+		ntuple_mask |= (u64)fs->mask.ivlan << tp->vlan_shift;
 
-	if (tp->tos_shift >= 0) {
-		mask = (hash_filter_mask >> tp->tos_shift) & FT_TOS_W;
-		if (mask && !fs->mask.tos)
-			return false;
-	}
+	if (tp->tos_shift >= 0)
+		ntuple_mask |= (u64)fs->mask.tos << tp->tos_shift;
 
-	if (tp->protocol_shift >= 0) {
-		mask = (hash_filter_mask >> tp->protocol_shift) & FT_PROTOCOL_W;
-		if (mask && !fs->mask.proto)
-			return false;
-	}
+	if (tp->protocol_shift >= 0)
+		ntuple_mask |= (u64)fs->mask.proto << tp->protocol_shift;
 
-	if (tp->ethertype_shift >= 0) {
-		mask = (hash_filter_mask >> tp->ethertype_shift) &
-			FT_ETHERTYPE_W;
-		if (mask && !fs->mask.ethtype)
-			return false;
-	}
+	if (tp->ethertype_shift >= 0)
+		ntuple_mask |= (u64)fs->mask.ethtype << tp->ethertype_shift;
 
-	if (tp->macmatch_shift >= 0) {
-		mask = (hash_filter_mask >> tp->macmatch_shift) & FT_MACMATCH_W;
-		if (mask && !fs->mask.macidx)
-			return false;
-	}
+	if (tp->macmatch_shift >= 0)
+		ntuple_mask |= (u64)fs->mask.macidx << tp->macmatch_shift;
 
-	if (tp->matchtype_shift >= 0) {
-		mask = (hash_filter_mask >> tp->matchtype_shift) &
-			FT_MPSHITTYPE_W;
-		if (mask && !fs->mask.matchtype)
-			return false;
-	}
-	if (tp->frag_shift >= 0) {
-		mask = (hash_filter_mask >> tp->frag_shift) &
-			FT_FRAGMENTATION_W;
-		if (mask && !fs->mask.frag)
-			return false;
-	}
+	if (tp->matchtype_shift >= 0)
+		ntuple_mask |= (u64)fs->mask.matchtype << tp->matchtype_shift;
+
+	if (tp->frag_shift >= 0)
+		ntuple_mask |= (u64)fs->mask.frag << tp->frag_shift;
+
+	if (ntuple_mask != hash_filter_mask)
+		return false;
+
 	return true;
 }
 
@@ -1001,11 +975,8 @@ static void mk_act_open_req6(struct filter_entry *f, struct sk_buff *skb,
 			    TX_QUEUE_V(f->fs.nat_mode) |
 			    T5_OPT_2_VALID_F |
 			    RX_CHANNEL_F |
-			    CONG_CNTRL_V((f->fs.action == FILTER_DROP) |
-					 (f->fs.dirsteer << 1)) |
 			    PACE_V((f->fs.maskhash) |
-				   ((f->fs.dirsteerhash) << 1)) |
-			    CCTRL_ECN_V(f->fs.action == FILTER_SWITCH));
+				   ((f->fs.dirsteerhash) << 1)));
 }
 
 static void mk_act_open_req(struct filter_entry *f, struct sk_buff *skb,
@@ -1043,11 +1014,8 @@ static void mk_act_open_req(struct filter_entry *f, struct sk_buff *skb,
 			    TX_QUEUE_V(f->fs.nat_mode) |
 			    T5_OPT_2_VALID_F |
 			    RX_CHANNEL_F |
-			    CONG_CNTRL_V((f->fs.action == FILTER_DROP) |
-					 (f->fs.dirsteer << 1)) |
 			    PACE_V((f->fs.maskhash) |
-				   ((f->fs.dirsteerhash) << 1)) |
-			    CCTRL_ECN_V(f->fs.action == FILTER_SWITCH));
+				   ((f->fs.dirsteerhash) << 1)));
 }
 
 static int cxgb4_set_hash_filter(struct net_device *dev,
@@ -1485,13 +1453,16 @@ out:
 static int configure_filter_tcb(struct adapter *adap, unsigned int tid,
 				struct filter_entry *f)
 {
-	if (f->fs.hitcnts)
+	if (f->fs.hitcnts) {
 		set_tcb_field(adap, f, tid, TCB_TIMESTAMP_W,
-			      TCB_TIMESTAMP_V(TCB_TIMESTAMP_M) |
+			      TCB_TIMESTAMP_V(TCB_TIMESTAMP_M),
+			      TCB_TIMESTAMP_V(0ULL),
+			      1);
+		set_tcb_field(adap, f, tid, TCB_RTT_TS_RECENT_AGE_W,
 			      TCB_RTT_TS_RECENT_AGE_V(TCB_RTT_TS_RECENT_AGE_M),
-			      TCB_TIMESTAMP_V(0ULL) |
 			      TCB_RTT_TS_RECENT_AGE_V(0ULL),
 			      1);
+	}
 
 	if (f->fs.newdmac)
 		set_tcb_tflag(adap, f, tid, TF_CCTRL_ECE_S, 1,
@@ -1613,6 +1584,20 @@ void hash_filter_rpl(struct adapter *adap, const struct cpl_act_open_rpl *rpl)
 			}
 			return;
 		}
+		switch (f->fs.action) {
+		case FILTER_PASS:
+			if (f->fs.dirsteer)
+				set_tcb_tflag(adap, f, tid,
+					      TF_DIRECT_STEER_S, 1, 1);
+			break;
+		case FILTER_DROP:
+			set_tcb_tflag(adap, f, tid, TF_DROP_S, 1, 1);
+			break;
+		case FILTER_SWITCH:
+			set_tcb_tflag(adap, f, tid, TF_LPBK_S, 1, 1);
+			break;
+		}
+
 		break;
 
 	default:
@@ -1672,22 +1657,11 @@ void filter_rpl(struct adapter *adap, const struct cpl_set_tcb_rpl *rpl)
 			if (ctx)
 				ctx->result = 0;
 		} else if (ret == FW_FILTER_WR_FLT_ADDED) {
-			int err = 0;
-
-			if (f->fs.newsmac)
-				err = configure_filter_smac(adap, f);
-
-			if (!err) {
-				f->pending = 0;  /* async setup completed */
-				f->valid = 1;
-				if (ctx) {
-					ctx->result = 0;
-					ctx->tid = idx;
-				}
-			} else {
-				clear_filter(adap, f);
-				if (ctx)
-					ctx->result = err;
+			f->pending = 0;  /* async setup completed */
+			f->valid = 1;
+			if (ctx) {
+				ctx->result = 0;
+				ctx->tid = idx;
 			}
 		} else {
 			/* Something went wrong.  Issue a warning about the

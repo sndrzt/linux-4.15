@@ -298,12 +298,7 @@ dm_dp_create_fake_mst_encoder(struct amdgpu_dm_connector *connector)
 	struct amdgpu_device *adev = dev->dev_private;
 	struct amdgpu_encoder *amdgpu_encoder;
 	struct drm_encoder *encoder;
-	const struct drm_connector_helper_funcs *connector_funcs =
-		connector->base.helper_private;
-	struct drm_encoder *enc_master =
-		connector_funcs->best_encoder(&connector->base);
 
-	DRM_DEBUG_KMS("enc master is %p\n", enc_master);
 	amdgpu_encoder = kzalloc(sizeof(*amdgpu_encoder), GFP_KERNEL);
 	if (!amdgpu_encoder)
 		return NULL;
@@ -380,9 +375,6 @@ dm_dp_add_mst_connector(struct drm_dp_mst_topology_mgr *mgr,
 
 	aconnector->mst_encoder = dm_dp_create_fake_mst_encoder(master);
 
-	/*
-	 * TODO: understand why this one is needed
-	 */
 	drm_object_attach_property(
 		&connector->base,
 		dev->mode_config.path_property,
@@ -424,6 +416,7 @@ static void dm_dp_destroy_mst_connector(struct drm_dp_mst_topology_mgr *mgr,
 		dc_link_remove_remote_sink(aconnector->dc_link, aconnector->dc_sink);
 		dc_sink_release(aconnector->dc_sink);
 		aconnector->dc_sink = NULL;
+		aconnector->dc_link->cur_link_settings.lane_count = 0;
 	}
 	if (aconnector->edid) {
 		kfree(aconnector->edid);

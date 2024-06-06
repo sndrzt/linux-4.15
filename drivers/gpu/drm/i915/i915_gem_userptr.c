@@ -640,6 +640,14 @@ static int i915_gem_userptr_get_pages(struct drm_i915_gem_object *obj)
 				      GFP_KERNEL |
 				      __GFP_NORETRY |
 				      __GFP_NOWARN);
+		/*
+		 * Using __get_user_pages_fast() with a read-only
+		 * access is questionable. A read-only page may be
+		 * COW-broken, and then this might end up giving
+		 * the wrong side of the COW..
+		 *
+		 * We may or may not care.
+		 */
 		if (pvec) /* defer to worker if malloc fails */
 			pinned = __get_user_pages_fast(obj->userptr.ptr,
 						       num_pages,
@@ -684,8 +692,28 @@ i915_gem_userptr_put_pages(struct drm_i915_gem_object *obj,
 	i915_gem_gtt_finish_pages(obj, pages);
 
 	for_each_sgt_page(page, sgt_iter, pages) {
-		if (obj->mm.dirty)
+		if (obj->mm.dirty && trylock_page(page)) {
+			/*
+			 * As this may not be anonymous memory (e.g. shmem)
+			 * but exist on a real mapping, we have to lock
+			 * the page in order to dirty it -- holding
+			 * the page reference is not sufficient to
+			 * prevent the inode from being truncated.
+			 * Play safe and take the lock.
+			 *
+			 * However...!
+			 *
+			 * The mmu-notifier can be invalidated for a
+			 * migrate_page, that is alreadying holding the lock
+			 * on the page. Such a try_to_unmap() will result
+			 * in us calling put_pages() and so recursively try
+			 * to lock the page. We avoid that deadlock with
+			 * a trylock_page() and in exchange we risk missing
+			 * some page dirtying.
+			 */
 			set_page_dirty(page);
+			unlock_page(page);
+		}
 
 		mark_page_accessed(page);
 		put_page(page);
@@ -774,6 +802,9 @@ i915_gem_userptr_ioctl(struct drm_device *dev, void *data, struct drm_file *file
 
 	if (args->flags & ~(I915_USERPTR_READ_ONLY |
 			    I915_USERPTR_UNSYNCHRONIZED))
+		return -EINVAL;
+
+	if (!args->user_size)
 		return -EINVAL;
 
 	if (offset_in_page(args->user_ptr | args->user_size))

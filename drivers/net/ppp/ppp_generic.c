@@ -73,6 +73,8 @@
 #define MPHDRLEN	6	/* multilink protocol header length */
 #define MPHDRLEN_SSN	4	/* ditto with short sequence numbers */
 
+#define PPP_PROTO_LEN	2
+
 /*
  * An instance of /dev/ppp can be associated with either a ppp
  * interface unit or a ppp channel.  In both cases, file->private_data
@@ -257,7 +259,7 @@ struct ppp_net {
 /* Prototypes. */
 static int ppp_unattached_ioctl(struct net *net, struct ppp_file *pf,
 			struct file *file, unsigned int cmd, unsigned long arg);
-static void ppp_xmit_process(struct ppp *ppp);
+static void ppp_xmit_process(struct ppp *ppp, struct sk_buff *skb);
 static void ppp_send_frame(struct ppp *ppp, struct sk_buff *skb);
 static void ppp_push(struct ppp *ppp);
 static void ppp_channel_push(struct channel *pch);
@@ -287,7 +289,7 @@ static struct channel *ppp_find_channel(struct ppp_net *pn, int unit);
 static int ppp_connect_channel(struct channel *pch, int unit);
 static int ppp_disconnect_channel(struct channel *pch);
 static void ppp_destroy_channel(struct channel *pch);
-static int unit_get(struct idr *p, void *ptr);
+static int unit_get(struct idr *p, void *ptr, int min);
 static int unit_set(struct idr *p, void *ptr, int n);
 static void unit_put(struct idr *p, int n);
 static void *unit_find(struct idr *p, int n);
@@ -502,6 +504,9 @@ static ssize_t ppp_write(struct file *file, const char __user *buf,
 
 	if (!pf)
 		return -ENXIO;
+	/* All PPP packets should start with the 2-byte protocol */
+	if (count < PPP_PROTO_LEN)
+		return -EINVAL;
 	ret = -ENOMEM;
 	skb = alloc_skb(count + pf->hdrlen, GFP_KERNEL);
 	if (!skb)
@@ -513,13 +518,12 @@ static ssize_t ppp_write(struct file *file, const char __user *buf,
 		goto out;
 	}
 
-	skb_queue_tail(&pf->xq, skb);
-
 	switch (pf->kind) {
 	case INTERFACE:
-		ppp_xmit_process(PF_TO_PPP(pf));
+		ppp_xmit_process(PF_TO_PPP(pf), skb);
 		break;
 	case CHANNEL:
+		skb_queue_tail(&pf->xq, skb);
 		ppp_channel_push(PF_TO_CHANNEL(pf));
 		break;
 	}
@@ -981,9 +985,20 @@ static int ppp_unit_register(struct ppp *ppp, int unit, bool ifname_is_set)
 	mutex_lock(&pn->all_ppp_mutex);
 
 	if (unit < 0) {
-		ret = unit_get(&pn->units_idr, ppp);
+		ret = unit_get(&pn->units_idr, ppp, 0);
 		if (ret < 0)
 			goto err;
+		if (!ifname_is_set) {
+			while (1) {
+				snprintf(ppp->dev->name, IFNAMSIZ, "ppp%i", ret);
+				if (!__dev_get_by_name(ppp->ppp_net, ppp->dev->name))
+					break;
+				unit_put(&pn->units_idr, ret);
+				ret = unit_get(&pn->units_idr, ppp, ret + 1);
+				if (ret < 0)
+					goto err;
+			}
+		}
 	} else {
 		/* Caller asked for a specific unit number. Fail with -EEXIST
 		 * if unavailable. For backward compatibility, return -EEXIST
@@ -1132,7 +1147,7 @@ static int ppp_nl_newlink(struct net *src_net, struct net_device *dev,
 	 * the PPP unit identifer as suffix (i.e. ppp<unit_id>). This allows
 	 * userspace to infer the device name using to the PPPIOCGUNIT ioctl.
 	 */
-	if (!tb[IFLA_IFNAME])
+	if (!tb[IFLA_IFNAME] || !nla_len(tb[IFLA_IFNAME]) || !*(char *)nla_data(tb[IFLA_IFNAME]))
 		conf.ifname_is_set = false;
 
 	err = ppp_dev_configure(src_net, dev, &conf);
@@ -1267,8 +1282,8 @@ ppp_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	put_unaligned_be16(proto, pp);
 
 	skb_scrub_packet(skb, !net_eq(ppp->ppp_net, dev_net(dev)));
-	skb_queue_tail(&ppp->file.xq, skb);
-	ppp_xmit_process(ppp);
+	ppp_xmit_process(ppp, skb);
+
 	return NETDEV_TX_OK;
 
  outf:
@@ -1420,13 +1435,14 @@ static void ppp_setup(struct net_device *dev)
  */
 
 /* Called to do any work queued up on the transmit side that can now be done */
-static void __ppp_xmit_process(struct ppp *ppp)
+static void __ppp_xmit_process(struct ppp *ppp, struct sk_buff *skb)
 {
-	struct sk_buff *skb;
-
 	ppp_xmit_lock(ppp);
 	if (!ppp->closing) {
 		ppp_push(ppp);
+
+		if (skb)
+			skb_queue_tail(&ppp->file.xq, skb);
 		while (!ppp->xmit_pending &&
 		       (skb = skb_dequeue(&ppp->file.xq)))
 			ppp_send_frame(ppp, skb);
@@ -1436,11 +1452,13 @@ static void __ppp_xmit_process(struct ppp *ppp)
 			netif_wake_queue(ppp->dev);
 		else
 			netif_stop_queue(ppp->dev);
+	} else {
+		kfree_skb(skb);
 	}
 	ppp_xmit_unlock(ppp);
 }
 
-static void ppp_xmit_process(struct ppp *ppp)
+static void ppp_xmit_process(struct ppp *ppp, struct sk_buff *skb)
 {
 	local_bh_disable();
 
@@ -1448,7 +1466,7 @@ static void ppp_xmit_process(struct ppp *ppp)
 		goto err;
 
 	(*this_cpu_ptr(ppp->xmit_recursion))++;
-	__ppp_xmit_process(ppp);
+	__ppp_xmit_process(ppp, skb);
 	(*this_cpu_ptr(ppp->xmit_recursion))--;
 
 	local_bh_enable();
@@ -1457,6 +1475,8 @@ static void ppp_xmit_process(struct ppp *ppp)
 
 err:
 	local_bh_enable();
+
+	kfree_skb(skb);
 
 	if (net_ratelimit())
 		netdev_err(ppp->dev, "recursion detected\n");
@@ -1525,6 +1545,8 @@ ppp_send_frame(struct ppp *ppp, struct sk_buff *skb)
 	int len;
 	unsigned char *cp;
 
+	skb->dev = ppp->dev;
+
 	if (proto < 0x8000) {
 #ifdef CONFIG_PPP_FILTER
 		/* check if we should pass this packet */
@@ -1552,7 +1574,7 @@ ppp_send_frame(struct ppp *ppp, struct sk_buff *skb)
 	}
 
 	++ppp->stats64.tx_packets;
-	ppp->stats64.tx_bytes += skb->len - 2;
+	ppp->stats64.tx_bytes += skb->len - PPP_PROTO_LEN;
 
 	switch (proto) {
 	case PPP_IP:
@@ -1942,7 +1964,7 @@ static void __ppp_channel_push(struct channel *pch)
 	if (skb_queue_empty(&pch->file.xq)) {
 		ppp = pch->ppp;
 		if (ppp)
-			__ppp_xmit_process(ppp);
+			__ppp_xmit_process(ppp, NULL);
 	}
 }
 
@@ -3161,6 +3183,15 @@ ppp_connect_channel(struct channel *pch, int unit)
 		goto outl;
 
 	ppp_lock(ppp);
+	spin_lock_bh(&pch->downl);
+	if (!pch->chan) {
+		/* Don't connect unregistered channels */
+		spin_unlock_bh(&pch->downl);
+		ppp_unlock(ppp);
+		ret = -ENOTCONN;
+		goto outl;
+	}
+	spin_unlock_bh(&pch->downl);
 	if (pch->file.hdrlen > ppp->file.hdrlen)
 		ppp->file.hdrlen = pch->file.hdrlen;
 	hdrlen = pch->file.hdrlen + 2;	/* for protocol bytes */
@@ -3256,9 +3287,9 @@ static int unit_set(struct idr *p, void *ptr, int n)
 }
 
 /* get new free unit number and associate pointer with it */
-static int unit_get(struct idr *p, void *ptr)
+static int unit_get(struct idr *p, void *ptr, int min)
 {
-	return idr_alloc(p, ptr, 0, 0, GFP_KERNEL);
+	return idr_alloc(p, ptr, min, 0, GFP_KERNEL);
 }
 
 /* put unit number back to a pool */

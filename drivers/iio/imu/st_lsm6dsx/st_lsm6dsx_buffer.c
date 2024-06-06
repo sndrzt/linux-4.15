@@ -160,12 +160,15 @@ static int st_lsm6dsx_set_fifo_odr(struct st_lsm6dsx_sensor *sensor,
 
 int st_lsm6dsx_update_watermark(struct st_lsm6dsx_sensor *sensor, u16 watermark)
 {
-	u16 fifo_watermark = ~0, cur_watermark, sip = 0, fifo_th_mask;
+	u16 fifo_watermark = ~0, cur_watermark, fifo_th_mask;
 	struct st_lsm6dsx_hw *hw = sensor->hw;
 	struct st_lsm6dsx_sensor *cur_sensor;
 	__le16 wdata;
 	int i, err;
 	u8 data;
+
+	if (!hw->sip)
+		return 0;
 
 	for (i = 0; i < ST_LSM6DSX_ID_MAX; i++) {
 		cur_sensor = iio_priv(hw->iio_devs[i]);
@@ -177,14 +180,10 @@ int st_lsm6dsx_update_watermark(struct st_lsm6dsx_sensor *sensor, u16 watermark)
 						       : cur_sensor->watermark;
 
 		fifo_watermark = min_t(u16, fifo_watermark, cur_watermark);
-		sip += cur_sensor->sip;
 	}
 
-	if (!sip)
-		return 0;
-
-	fifo_watermark = max_t(u16, fifo_watermark, sip);
-	fifo_watermark = (fifo_watermark / sip) * sip;
+	fifo_watermark = max_t(u16, fifo_watermark, hw->sip);
+	fifo_watermark = (fifo_watermark / hw->sip) * hw->sip;
 	fifo_watermark = fifo_watermark * hw->settings->fifo_ops.th_wl;
 
 	mutex_lock(&hw->lock);
@@ -325,38 +324,40 @@ static int st_lsm6dsx_update_fifo(struct iio_dev *iio_dev, bool enable)
 	struct st_lsm6dsx_hw *hw = sensor->hw;
 	int err;
 
+	mutex_lock(&hw->conf_lock);
+
 	if (hw->fifo_mode != ST_LSM6DSX_FIFO_BYPASS) {
 		err = st_lsm6dsx_flush_fifo(hw);
 		if (err < 0)
-			return err;
+			goto out;
 	}
 
 	if (enable) {
 		err = st_lsm6dsx_sensor_enable(sensor);
 		if (err < 0)
-			return err;
+			goto out;
 	} else {
 		err = st_lsm6dsx_sensor_disable(sensor);
 		if (err < 0)
-			return err;
+			goto out;
 	}
 
 	err = st_lsm6dsx_set_fifo_odr(sensor, enable);
 	if (err < 0)
-		return err;
+		goto out;
 
 	err = st_lsm6dsx_update_decimators(hw);
 	if (err < 0)
-		return err;
+		goto out;
 
 	err = st_lsm6dsx_update_watermark(sensor, sensor->watermark);
 	if (err < 0)
-		return err;
+		goto out;
 
 	if (hw->enable_mask) {
 		err = st_lsm6dsx_set_fifo_mode(hw, ST_LSM6DSX_FIFO_CONT);
 		if (err < 0)
-			return err;
+			goto out;
 
 		/*
 		 * store enable buffer timestamp as reference to compute
@@ -365,7 +366,10 @@ static int st_lsm6dsx_update_fifo(struct iio_dev *iio_dev, bool enable)
 		sensor->ts = iio_get_time_ns(iio_dev);
 	}
 
-	return 0;
+out:
+	mutex_unlock(&hw->conf_lock);
+
+	return err;
 }
 
 static irqreturn_t st_lsm6dsx_handler_irq(int irq, void *private)
@@ -395,13 +399,29 @@ static irqreturn_t st_lsm6dsx_handler_irq(int irq, void *private)
 static irqreturn_t st_lsm6dsx_handler_thread(int irq, void *private)
 {
 	struct st_lsm6dsx_hw *hw = private;
-	int count;
+	int fifo_len = 0, len;
 
-	mutex_lock(&hw->fifo_lock);
-	count = st_lsm6dsx_read_fifo(hw);
-	mutex_unlock(&hw->fifo_lock);
+	/*
+	 * If we are using edge IRQs, new samples can arrive while
+	 * processing current interrupt since there are no hw
+	 * guarantees the irq line stays "low" long enough to properly
+	 * detect the new interrupt. In this case the new sample will
+	 * be missed.
+	 * Polling FIFO status register allow us to read new
+	 * samples even if the interrupt arrives while processing
+	 * previous data and the timeslot where the line is "low" is
+	 * too short to be properly detected.
+	 */
+	do {
+		mutex_lock(&hw->fifo_lock);
+		len = st_lsm6dsx_read_fifo(hw);
+		mutex_unlock(&hw->fifo_lock);
 
-	return !count ? IRQ_NONE : IRQ_HANDLED;
+		if (len > 0)
+			fifo_len += len;
+	} while (len > 0);
+
+	return fifo_len ? IRQ_HANDLED : IRQ_NONE;
 }
 
 static int st_lsm6dsx_buffer_preenable(struct iio_dev *iio_dev)

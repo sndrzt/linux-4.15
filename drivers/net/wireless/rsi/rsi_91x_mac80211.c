@@ -188,27 +188,27 @@ bool rsi_is_cipher_wep(struct rsi_common *common)
  * @adapter: Pointer to the adapter structure.
  * @band: Operating band to be set.
  *
- * Return: None.
+ * Return: int - 0 on success, negative error on failure.
  */
-static void rsi_register_rates_channels(struct rsi_hw *adapter, int band)
+static int rsi_register_rates_channels(struct rsi_hw *adapter, int band)
 {
 	struct ieee80211_supported_band *sbands = &adapter->sbands[band];
 	void *channels = NULL;
 
 	if (band == NL80211_BAND_2GHZ) {
-		channels = kmalloc(sizeof(rsi_2ghz_channels), GFP_KERNEL);
-		memcpy(channels,
-		       rsi_2ghz_channels,
-		       sizeof(rsi_2ghz_channels));
+		channels = kmemdup(rsi_2ghz_channels, sizeof(rsi_2ghz_channels),
+				   GFP_KERNEL);
+		if (!channels)
+			return -ENOMEM;
 		sbands->band = NL80211_BAND_2GHZ;
 		sbands->n_channels = ARRAY_SIZE(rsi_2ghz_channels);
 		sbands->bitrates = rsi_rates;
 		sbands->n_bitrates = ARRAY_SIZE(rsi_rates);
 	} else {
-		channels = kmalloc(sizeof(rsi_5ghz_channels), GFP_KERNEL);
-		memcpy(channels,
-		       rsi_5ghz_channels,
-		       sizeof(rsi_5ghz_channels));
+		channels = kmemdup(rsi_5ghz_channels, sizeof(rsi_5ghz_channels),
+				   GFP_KERNEL);
+		if (!channels)
+			return -ENOMEM;
 		sbands->band = NL80211_BAND_5GHZ;
 		sbands->n_channels = ARRAY_SIZE(rsi_5ghz_channels);
 		sbands->bitrates = &rsi_rates[4];
@@ -227,6 +227,7 @@ static void rsi_register_rates_channels(struct rsi_hw *adapter, int band)
 	sbands->ht_cap.mcs.rx_mask[0] = 0xff;
 	sbands->ht_cap.mcs.tx_params = IEEE80211_HT_MCS_TX_DEFINED;
 	/* sbands->ht_cap.mcs.rx_highest = 0x82; */
+	return 0;
 }
 
 /**
@@ -245,6 +246,7 @@ void rsi_mac80211_detach(struct rsi_hw *adapter)
 		ieee80211_stop_queues(hw);
 		ieee80211_unregister_hw(hw);
 		ieee80211_free_hw(hw);
+		adapter->hw = NULL;
 	}
 
 	for (band = 0; band < NUM_NL80211_BANDS; band++) {
@@ -440,7 +442,6 @@ static int rsi_mac80211_add_interface(struct ieee80211_hw *hw,
 	if ((vif->type == NL80211_IFTYPE_AP) ||
 	    (vif->type == NL80211_IFTYPE_P2P_GO)) {
 		rsi_send_rx_filter_frame(common, DISALLOW_BEACONS);
-		common->min_rate = RSI_RATE_AUTO;
 		for (i = 0; i < common->max_stations; i++)
 			common->stations[i].sta = NULL;
 	}
@@ -940,7 +941,6 @@ static int rsi_mac80211_set_key(struct ieee80211_hw *hw,
 	mutex_lock(&common->mutex);
 	switch (cmd) {
 	case SET_KEY:
-		secinfo->security_enable = true;
 		status = rsi_hal_key_config(hw, vif, key, sta);
 		if (status) {
 			mutex_unlock(&common->mutex);
@@ -959,8 +959,6 @@ static int rsi_mac80211_set_key(struct ieee80211_hw *hw,
 		break;
 
 	case DISABLE_KEY:
-		if (vif->type == NL80211_IFTYPE_STATION)
-			secinfo->security_enable = false;
 		rsi_dbg(ERR_ZONE, "%s: RSI del key\n", __func__);
 		memset(key, 0, sizeof(struct ieee80211_key_conf));
 		status = rsi_hal_key_config(hw, vif, key, sta);
@@ -1127,20 +1125,32 @@ static int rsi_mac80211_set_rate_mask(struct ieee80211_hw *hw,
 				      struct ieee80211_vif *vif,
 				      const struct cfg80211_bitrate_mask *mask)
 {
+	const unsigned int mcs_offset = ARRAY_SIZE(rsi_rates);
 	struct rsi_hw *adapter = hw->priv;
 	struct rsi_common *common = adapter->priv;
-	enum nl80211_band band = hw->conf.chandef.chan->band;
+	int i;
 
 	mutex_lock(&common->mutex);
-	common->fixedrate_mask[band] = 0;
 
-	if (mask->control[band].legacy == 0xfff) {
-		common->fixedrate_mask[band] =
-			(mask->control[band].ht_mcs[0] << 12);
-	} else {
-		common->fixedrate_mask[band] =
-			mask->control[band].legacy;
+	for (i = 0; i < ARRAY_SIZE(common->rate_config); i++) {
+		struct rsi_rate_config *cfg = &common->rate_config[i];
+		u32 bm;
+
+		bm = mask->control[i].legacy | (mask->control[i].ht_mcs[0] << mcs_offset);
+		if (hweight32(bm) == 1) { /* single rate */
+			int rate_index = ffs(bm) - 1;
+
+			if (rate_index < mcs_offset)
+				cfg->fixed_hw_rate = rsi_rates[rate_index].hw_value;
+			else
+				cfg->fixed_hw_rate = rsi_mcsrates[rate_index - mcs_offset];
+			cfg->fixed_enabled = true;
+		} else {
+			cfg->configured_mask = bm;
+			cfg->fixed_enabled = false;
+		}
 	}
+
 	mutex_unlock(&common->mutex);
 
 	return 0;
@@ -1276,46 +1286,6 @@ void rsi_indicate_pkt_to_os(struct rsi_common *common,
 	ieee80211_rx_irqsafe(hw, skb);
 }
 
-static void rsi_set_min_rate(struct ieee80211_hw *hw,
-			     struct ieee80211_sta *sta,
-			     struct rsi_common *common)
-{
-	u8 band = hw->conf.chandef.chan->band;
-	u8 ii;
-	u32 rate_bitmap;
-	bool matched = false;
-
-	common->bitrate_mask[band] = sta->supp_rates[band];
-
-	rate_bitmap = (common->fixedrate_mask[band] & sta->supp_rates[band]);
-
-	if (rate_bitmap & 0xfff) {
-		/* Find out the min rate */
-		for (ii = 0; ii < ARRAY_SIZE(rsi_rates); ii++) {
-			if (rate_bitmap & BIT(ii)) {
-				common->min_rate = rsi_rates[ii].hw_value;
-				matched = true;
-				break;
-			}
-		}
-	}
-
-	common->vif_info[0].is_ht = sta->ht_cap.ht_supported;
-
-	if ((common->vif_info[0].is_ht) && (rate_bitmap >> 12)) {
-		for (ii = 0; ii < ARRAY_SIZE(rsi_mcsrates); ii++) {
-			if ((rate_bitmap >> 12) & BIT(ii)) {
-				common->min_rate = rsi_mcsrates[ii];
-				matched = true;
-				break;
-			}
-		}
-	}
-
-	if (!matched)
-		common->min_rate = 0xffff;
-}
-
 /**
  * rsi_mac80211_sta_add() - This function notifies driver about a peer getting
  *			    connected.
@@ -1414,9 +1384,9 @@ static int rsi_mac80211_sta_add(struct ieee80211_hw *hw,
 
 	if ((vif->type == NL80211_IFTYPE_STATION) ||
 	    (vif->type == NL80211_IFTYPE_P2P_CLIENT)) {
-		rsi_set_min_rate(hw, sta, common);
+		common->bitrate_mask[common->band] = sta->supp_rates[common->band];
+		common->vif_info[0].is_ht = sta->ht_cap.ht_supported;
 		if (sta->ht_cap.ht_supported) {
-			common->vif_info[0].is_ht = true;
 			common->bitrate_mask[NL80211_BAND_2GHZ] =
 					sta->supp_rates[NL80211_BAND_2GHZ];
 			if ((sta->ht_cap.cap & IEEE80211_HT_CAP_SGI_20) ||
@@ -1490,7 +1460,6 @@ static int rsi_mac80211_sta_remove(struct ieee80211_hw *hw,
 		bss->qos = sta->wme;
 		common->bitrate_mask[NL80211_BAND_2GHZ] = 0;
 		common->bitrate_mask[NL80211_BAND_5GHZ] = 0;
-		common->min_rate = 0xffff;
 		common->vif_info[0].is_ht = false;
 		common->vif_info[0].sgi = false;
 		common->vif_info[0].seq_start = 0;
@@ -1788,9 +1757,14 @@ int rsi_config_wowlan(struct rsi_hw *adapter, struct cfg80211_wowlan *wowlan)
 	struct rsi_common *common = adapter->priv;
 	u16 triggers = 0;
 	u16 rx_filter_word = 0;
-	struct ieee80211_bss_conf *bss = &adapter->vifs[0]->bss_conf;
+	struct ieee80211_bss_conf *bss = NULL;
 
 	rsi_dbg(INFO_ZONE, "Config WoWLAN to device\n");
+
+	if (!adapter->vifs[0])
+		return -EINVAL;
+
+	bss = &adapter->vifs[0]->bss_conf;
 
 	if (WARN_ON(!wowlan)) {
 		rsi_dbg(ERR_ZONE, "WoW triggers not enabled\n");
@@ -1940,8 +1914,12 @@ int rsi_mac80211_attach(struct rsi_common *common)
 	hw->uapsd_max_sp_len = IEEE80211_WMM_IE_STA_QOSINFO_SP_ALL;
 
 	hw->max_tx_aggregation_subframes = 6;
-	rsi_register_rates_channels(adapter, NL80211_BAND_2GHZ);
-	rsi_register_rates_channels(adapter, NL80211_BAND_5GHZ);
+	status = rsi_register_rates_channels(adapter, NL80211_BAND_2GHZ);
+	if (status)
+		return status;
+	status = rsi_register_rates_channels(adapter, NL80211_BAND_5GHZ);
+	if (status)
+		return status;
 	hw->rate_control_algorithm = "AARF";
 
 	SET_IEEE80211_PERM_ADDR(hw, common->mac_addr);

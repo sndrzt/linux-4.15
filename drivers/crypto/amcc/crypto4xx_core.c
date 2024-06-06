@@ -367,12 +367,8 @@ static u32 crypto4xx_build_sdr(struct crypto4xx_device *dev)
 		dma_alloc_coherent(dev->core_dev->device,
 			PPC4XX_SD_BUFFER_SIZE * PPC4XX_NUM_SD,
 			&dev->scatter_buffer_pa, GFP_ATOMIC);
-	if (!dev->scatter_buffer_va) {
-		dma_free_coherent(dev->core_dev->device,
-				  sizeof(struct ce_sd) * PPC4XX_NUM_SD,
-				  dev->sdr, dev->sdr_pa);
+	if (!dev->scatter_buffer_va)
 		return -ENOMEM;
-	}
 
 	for (i = 0; i < PPC4XX_NUM_SD; i++) {
 		dev->sdr[i].ptr = dev->scatter_buffer_pa +
@@ -541,6 +537,15 @@ static void crypto4xx_ablkcipher_done(struct crypto4xx_device *dev,
 		addr = dma_map_page(dev->core_dev->device, sg_page(dst),
 				    dst->offset, dst->length, DMA_FROM_DEVICE);
 	}
+
+	if (pd_uinfo->sa_va->sa_command_0.bf.save_iv == SA_SAVE_IV) {
+		struct crypto_skcipher *skcipher = crypto_skcipher_reqtfm(req);
+
+		crypto4xx_memcpy_from_le32((u32 *)req->iv,
+			pd_uinfo->sr_va->save_iv,
+			crypto_skcipher_ivsize(skcipher));
+	}
+
 	crypto4xx_ret_sg_desc(dev, pd_uinfo);
 
 	if (pd_uinfo->state & PD_ENTRY_BUSY)
@@ -570,14 +575,13 @@ static void crypto4xx_aead_done(struct crypto4xx_device *dev,
 				struct pd_uinfo *pd_uinfo,
 				struct ce_pd *pd)
 {
-	struct aead_request *aead_req;
-	struct crypto4xx_ctx *ctx;
+	struct aead_request *aead_req = container_of(pd_uinfo->async_req,
+		struct aead_request, base);
 	struct scatterlist *dst = pd_uinfo->dest_va;
+	size_t cp_len = crypto_aead_authsize(
+		crypto_aead_reqtfm(aead_req));
+	u32 icv[cp_len];
 	int err = 0;
-
-	aead_req = container_of(pd_uinfo->async_req, struct aead_request,
-				base);
-	ctx  = crypto_tfm_ctx(aead_req->base.tfm);
 
 	if (pd_uinfo->using_sd) {
 		crypto4xx_copy_pkt_to_dst(dev, pd, pd_uinfo,
@@ -590,38 +594,39 @@ static void crypto4xx_aead_done(struct crypto4xx_device *dev,
 
 	if (pd_uinfo->sa_va->sa_command_0.bf.dir == DIR_OUTBOUND) {
 		/* append icv at the end */
-		size_t cp_len = crypto_aead_authsize(
-			crypto_aead_reqtfm(aead_req));
-		u32 icv[cp_len];
-
 		crypto4xx_memcpy_from_le32(icv, pd_uinfo->sr_va->save_digest,
 					   cp_len);
 
 		scatterwalk_map_and_copy(icv, dst, aead_req->cryptlen,
 					 cp_len, 1);
+	} else {
+		/* check icv at the end */
+		scatterwalk_map_and_copy(icv, aead_req->src,
+			aead_req->assoclen + aead_req->cryptlen -
+			cp_len, cp_len, 0);
+
+		crypto4xx_memcpy_from_le32(icv, icv, cp_len);
+
+		if (crypto_memneq(icv, pd_uinfo->sr_va->save_digest, cp_len))
+			err = -EBADMSG;
 	}
 
 	crypto4xx_ret_sg_desc(dev, pd_uinfo);
 
 	if (pd->pd_ctl.bf.status & 0xff) {
-		if (pd->pd_ctl.bf.status & 0x1) {
-			/* authentication error */
-			err = -EBADMSG;
-		} else {
-			if (!__ratelimit(&dev->aead_ratelimit)) {
-				if (pd->pd_ctl.bf.status & 2)
-					pr_err("pad fail error\n");
-				if (pd->pd_ctl.bf.status & 4)
-					pr_err("seqnum fail\n");
-				if (pd->pd_ctl.bf.status & 8)
-					pr_err("error _notify\n");
-				pr_err("aead return err status = 0x%02x\n",
-					pd->pd_ctl.bf.status & 0xff);
-				pr_err("pd pad_ctl = 0x%08x\n",
-					pd->pd_ctl.bf.pd_pad_ctl);
-			}
-			err = -EINVAL;
+		if (!__ratelimit(&dev->aead_ratelimit)) {
+			if (pd->pd_ctl.bf.status & 2)
+				pr_err("pad fail error\n");
+			if (pd->pd_ctl.bf.status & 4)
+				pr_err("seqnum fail\n");
+			if (pd->pd_ctl.bf.status & 8)
+				pr_err("error _notify\n");
+			pr_err("aead return err status = 0x%02x\n",
+				pd->pd_ctl.bf.status & 0xff);
+			pr_err("pd pad_ctl = 0x%08x\n",
+				pd->pd_ctl.bf.pd_pad_ctl);
 		}
+		err = -EINVAL;
 	}
 
 	if (pd_uinfo->state & PD_ENTRY_BUSY)
@@ -699,7 +704,23 @@ int crypto4xx_build_pd(struct crypto_async_request *req,
 	size_t offset_to_sr_ptr;
 	u32 gd_idx = 0;
 	int tmp;
-	bool is_busy;
+	bool is_busy, force_sd;
+
+	/*
+	 * There's a very subtile/disguised "bug" in the hardware that
+	 * gets indirectly mentioned in 18.1.3.5 Encryption/Decryption
+	 * of the hardware spec:
+	 * *drum roll* the AES/(T)DES OFB and CFB modes are listed as
+	 * operation modes for >>> "Block ciphers" <<<.
+	 *
+	 * To workaround this issue and stop the hardware from causing
+	 * "overran dst buffer" on crypttexts that are not a multiple
+	 * of 16 (AES_BLOCK_SIZE), we force the driver to use the
+	 * scatter buffers.
+	 */
+	force_sd = (req_sa->sa_command_1.bf.crypto_mode9_8 == CRYPTO_MODE_CFB
+		|| req_sa->sa_command_1.bf.crypto_mode9_8 == CRYPTO_MODE_OFB)
+		&& (datalen % AES_BLOCK_SIZE);
 
 	/* figure how many gd are needed */
 	tmp = sg_nents_for_len(src, assoclen + datalen);
@@ -717,7 +738,7 @@ int crypto4xx_build_pd(struct crypto_async_request *req,
 	}
 
 	/* figure how many sd are needed */
-	if (sg_is_last(dst)) {
+	if (sg_is_last(dst) && force_sd == false) {
 		num_sd = 0;
 	} else {
 		if (datalen > PPC4XX_SD_BUFFER_SIZE) {
@@ -792,9 +813,10 @@ int crypto4xx_build_pd(struct crypto_async_request *req,
 	pd->sa_len = sa_len;
 
 	pd_uinfo = &dev->pdr_uinfo[pd_entry];
-	pd_uinfo->async_req = req;
 	pd_uinfo->num_gd = num_gd;
 	pd_uinfo->num_sd = num_sd;
+	pd_uinfo->dest_va = dst;
+	pd_uinfo->async_req = req;
 
 	if (iv_len)
 		memcpy(pd_uinfo->sr_va->save_iv, iv, iv_len);
@@ -813,7 +835,6 @@ int crypto4xx_build_pd(struct crypto_async_request *req,
 		/* get first gd we are going to use */
 		gd_idx = fst_gd;
 		pd_uinfo->first_gd = fst_gd;
-		pd_uinfo->num_gd = num_gd;
 		gd = crypto4xx_get_gdp(dev, &gd_dma, gd_idx);
 		pd->src = gd_dma;
 		/* enable gather */
@@ -850,17 +871,14 @@ int crypto4xx_build_pd(struct crypto_async_request *req,
 		 * Indicate gather array is not used
 		 */
 		pd_uinfo->first_gd = 0xffffffff;
-		pd_uinfo->num_gd = 0;
 	}
-	if (sg_is_last(dst)) {
+	if (!num_sd) {
 		/*
 		 * we know application give us dst a whole piece of memory
 		 * no need to use scatter ring.
 		 */
 		pd_uinfo->using_sd = 0;
 		pd_uinfo->first_sd = 0xffffffff;
-		pd_uinfo->num_sd = 0;
-		pd_uinfo->dest_va = dst;
 		sa->sa_command_0.bf.scatter = 0;
 		pd->dest = (u32)dma_map_page(dev->core_dev->device,
 					     sg_page(dst), dst->offset,
@@ -874,9 +892,7 @@ int crypto4xx_build_pd(struct crypto_async_request *req,
 		nbytes = datalen;
 		sa->sa_command_0.bf.scatter = 1;
 		pd_uinfo->using_sd = 1;
-		pd_uinfo->dest_va = dst;
 		pd_uinfo->first_sd = fst_sd;
-		pd_uinfo->num_sd = num_sd;
 		sd = crypto4xx_get_sdp(dev, &sd_dma, sd_idx);
 		pd->dest = sd_dma;
 		/* setup scatter descriptor */
@@ -906,7 +922,7 @@ int crypto4xx_build_pd(struct crypto_async_request *req,
 	}
 
 	pd->pd_ctl.w = PD_CTL_HOST_READY |
-		((crypto_tfm_alg_type(req->tfm) == CRYPTO_ALG_TYPE_AHASH) |
+		((crypto_tfm_alg_type(req->tfm) == CRYPTO_ALG_TYPE_AHASH) ||
 		 (crypto_tfm_alg_type(req->tfm) == CRYPTO_ALG_TYPE_AEAD) ?
 			PD_CTL_HASH_FINAL : 0);
 	pd->pd_ctl_len.w = 0x00400000 | (assoclen + datalen);

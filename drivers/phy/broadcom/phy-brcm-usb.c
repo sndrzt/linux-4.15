@@ -338,9 +338,9 @@ static int brcm_usb_phy_probe(struct platform_device *pdev)
 			      ARRAY_SIZE(brcm_dr_mode_to_name),
 			mode, &priv->ini.mode);
 	}
-	if (of_property_read_bool(dn, "brcm,has_xhci"))
+	if (of_property_read_bool(dn, "brcm,has-xhci"))
 		priv->has_xhci = true;
-	if (of_property_read_bool(dn, "brcm,has_eohci"))
+	if (of_property_read_bool(dn, "brcm,has-eohci"))
 		priv->has_eohci = true;
 
 	err = brcm_usb_phy_dvr_init(dev, priv, dn);
@@ -374,6 +374,13 @@ static int brcm_usb_phy_probe(struct platform_device *pdev)
 	phy_provider = devm_of_phy_provider_register(dev, brcm_usb_phy_xlate);
 	if (IS_ERR(phy_provider))
 		return PTR_ERR(phy_provider);
+
+	return 0;
+}
+
+static int brcm_usb_phy_remove(struct platform_device *pdev)
+{
+	sysfs_remove_group(&pdev->dev.kobj, &brcm_usb_phy_group);
 
 	return 0;
 }
@@ -443,6 +450,7 @@ MODULE_DEVICE_TABLE(of, brcm_usb_dt_ids);
 
 static struct platform_driver brcm_usb_driver = {
 	.probe		= brcm_usb_phy_probe,
+	.remove		= brcm_usb_phy_remove,
 	.driver		= {
 		.name	= "brcmstb-usb-phy",
 		.owner	= THIS_MODULE,

@@ -372,6 +372,9 @@ struct bufdesc_ex {
 #define FEC_ENET_WAKEUP	((uint)0x00020000)	/* Wakeup request */
 #define FEC_ENET_TXF	(FEC_ENET_TXF_0 | FEC_ENET_TXF_1 | FEC_ENET_TXF_2)
 #define FEC_ENET_RXF	(FEC_ENET_RXF_0 | FEC_ENET_RXF_1 | FEC_ENET_RXF_2)
+#define FEC_ENET_RXF_GET(X)	(((X) == 0) ? FEC_ENET_RXF_0 :	\
+				(((X) == 1) ? FEC_ENET_RXF_1 :	\
+				FEC_ENET_RXF_2))
 #define FEC_ENET_TS_AVAIL       ((uint)0x00010000)
 #define FEC_ENET_TS_TIMER       ((uint)0x00008000)
 
@@ -451,6 +454,10 @@ struct bufdesc_ex {
  * initialisation.
  */
 #define FEC_QUIRK_MIB_CLEAR		(1 << 15)
+/* Only i.MX25/i.MX27/i.MX28 controller supports FRBR,FRSR registers,
+ * those FIFO receive registers are resolved in other platforms.
+ */
+#define FEC_QUIRK_HAS_FRREG		(1 << 16)
 
 struct bufdesc_prop {
 	int qid;
@@ -481,6 +488,12 @@ struct fec_enet_priv_tx_q {
 struct fec_enet_priv_rx_q {
 	struct bufdesc_prop bd;
 	struct  sk_buff *rx_skbuff[RX_RING_SIZE];
+};
+
+struct fec_stop_mode_gpr {
+	struct regmap *gpr;
+	u8 reg;
+	u8 bit;
 };
 
 /* The FEC buffer descriptors track the ring buffers.  The rx_bd_base and
@@ -558,6 +571,7 @@ struct fec_enet_private {
 	int hwts_tx_en;
 	struct delayed_work time_keep;
 	struct regulator *reg_phy;
+	struct fec_stop_mode_gpr stop_gpr;
 
 	unsigned int tx_align;
 	unsigned int rx_align;

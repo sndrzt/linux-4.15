@@ -202,9 +202,18 @@ xfs_generic_create(
 
 	xfs_setup_iops(ip);
 
-	if (tmpfile)
+	if (tmpfile) {
+		/*
+		 * The VFS requires that any inode fed to d_tmpfile must have
+		 * nlink == 1 so that it can decrement the nlink in d_tmpfile.
+		 * However, we created the temp file with nlink == 0 because
+		 * we're not allowed to put an inode with nlink > 0 on the
+		 * unlinked list.  Therefore we have to set nlink to 1 so that
+		 * d_tmpfile can immediately set it back to zero.
+		 */
+		set_nlink(inode, 1);
 		d_tmpfile(dentry, inode);
-	else
+	} else
 		d_instantiate(dentry, inode);
 
 	xfs_finish_inode_setup(ip);
@@ -523,12 +532,20 @@ xfs_vn_getattr(
 		}
 	}
 
+	/*
+	 * Note: If you add another clause to set an attribute flag, please
+	 * update attributes_mask below.
+	 */
 	if (ip->i_d.di_flags & XFS_DIFLAG_IMMUTABLE)
 		stat->attributes |= STATX_ATTR_IMMUTABLE;
 	if (ip->i_d.di_flags & XFS_DIFLAG_APPEND)
 		stat->attributes |= STATX_ATTR_APPEND;
 	if (ip->i_d.di_flags & XFS_DIFLAG_NODUMP)
 		stat->attributes |= STATX_ATTR_NODUMP;
+
+	stat->attributes_mask |= (STATX_ATTR_IMMUTABLE |
+				  STATX_ATTR_APPEND |
+				  STATX_ATTR_NODUMP);
 
 	switch (inode->i_mode & S_IFMT) {
 	case S_IFBLK:
@@ -656,9 +673,7 @@ xfs_setattr_nonsize(
 		 */
 		ASSERT(udqp == NULL);
 		ASSERT(gdqp == NULL);
-		error = xfs_qm_vop_dqalloc(ip, xfs_kuid_to_uid(uid),
-					   xfs_kgid_to_gid(gid),
-					   xfs_get_projid(ip),
+		error = xfs_qm_vop_dqalloc(ip, uid, gid, ip->i_d.di_projid,
 					   qflags, &udqp, &gdqp, NULL);
 		if (error)
 			return error;
@@ -727,7 +742,6 @@ xfs_setattr_nonsize(
 				olddquot1 = xfs_qm_vop_chown(tp, ip,
 							&ip->i_udquot, udqp);
 			}
-			ip->i_d.di_uid = xfs_kuid_to_uid(uid);
 			inode->i_uid = uid;
 		}
 		if (!gid_eq(igid, gid)) {
@@ -739,7 +753,6 @@ xfs_setattr_nonsize(
 				olddquot2 = xfs_qm_vop_chown(tp, ip,
 							&ip->i_gdquot, gdqp);
 			}
-			ip->i_d.di_gid = xfs_kgid_to_gid(gid);
 			inode->i_gid = gid;
 		}
 	}
@@ -787,6 +800,7 @@ xfs_setattr_nonsize(
 
 out_cancel:
 	xfs_trans_cancel(tp);
+	xfs_iunlock(ip, XFS_ILOCK_EXCL);
 out_dqrele:
 	xfs_qm_dqrele(udqp);
 	xfs_qm_dqrele(gdqp);
@@ -832,7 +846,7 @@ xfs_setattr_size(
 	ASSERT(xfs_isilocked(ip, XFS_MMAPLOCK_EXCL));
 	ASSERT(S_ISREG(inode->i_mode));
 	ASSERT((iattr->ia_valid & (ATTR_UID|ATTR_GID|ATTR_ATIME|ATTR_ATIME_SET|
-		ATTR_MTIME_SET|ATTR_KILL_PRIV|ATTR_TIMES_SET)) == 0);
+		ATTR_MTIME_SET|ATTR_TIMES_SET)) == 0);
 
 	oldsize = inode->i_size;
 	newsize = iattr->ia_size;
@@ -876,6 +890,16 @@ xfs_setattr_size(
 	if (newsize > oldsize) {
 		error = xfs_zero_eof(ip, newsize, oldsize, &did_zeroing);
 	} else {
+		/*
+		 * iomap won't detect a dirty page over an unwritten block (or a
+		 * cow block over a hole) and subsequently skips zeroing the
+		 * newly post-EOF portion of the page. Flush the new EOF to
+		 * convert the block before the pagecache truncate.
+		 */
+		error = filemap_write_and_wait_range(inode->i_mapping, newsize,
+						     newsize);
+		if (error)
+			return error;
 		error = iomap_truncate_page(inode, newsize, &did_zeroing,
 				&xfs_iomap_ops);
 	}
@@ -1182,6 +1206,30 @@ static const struct inode_operations xfs_inline_symlink_inode_operations = {
 	.update_time		= xfs_vn_update_time,
 };
 
+/* Figure out if this file actually supports DAX. */
+static bool
+xfs_inode_supports_dax(
+	struct xfs_inode	*ip)
+{
+	struct xfs_mount	*mp = ip->i_mount;
+
+	/* Only supported on non-reflinked files. */
+	if (!S_ISREG(VFS_I(ip)->i_mode) || xfs_is_reflink_inode(ip))
+		return false;
+
+	/* DAX mount option or DAX iflag must be set. */
+	if (!(mp->m_flags & XFS_MOUNT_DAX) &&
+	    !(ip->i_d.di_flags2 & XFS_DIFLAG2_DAX))
+		return false;
+
+	/* Block size must match page size */
+	if (mp->m_sb.sb_blocksize != PAGE_SIZE)
+		return false;
+
+	/* Device has to support DAX too. */
+	return xfs_find_daxdev_for_inode(VFS_I(ip)) != NULL;
+}
+
 STATIC void
 xfs_diflags_to_iflags(
 	struct inode		*inode,
@@ -1200,11 +1248,7 @@ xfs_diflags_to_iflags(
 		inode->i_flags |= S_SYNC;
 	if (flags & XFS_DIFLAG_NOATIME)
 		inode->i_flags |= S_NOATIME;
-	if (S_ISREG(inode->i_mode) &&
-	    ip->i_mount->m_sb.sb_blocksize == PAGE_SIZE &&
-	    !xfs_is_reflink_inode(ip) &&
-	    (ip->i_mount->m_flags & XFS_MOUNT_DAX ||
-	     ip->i_d.di_flags2 & XFS_DIFLAG2_DAX))
+	if (xfs_inode_supports_dax(ip))
 		inode->i_flags |= S_DAX;
 }
 
@@ -1229,9 +1273,6 @@ xfs_setup_inode(
 	inode_sb_list_add(inode);
 	/* make the inode look hashed for the writeback code */
 	hlist_add_fake(&inode->i_hash);
-
-	inode->i_uid    = xfs_uid_to_kuid(ip->i_d.di_uid);
-	inode->i_gid    = xfs_gid_to_kgid(ip->i_d.di_gid);
 
 	i_size_write(inode, ip->i_d.di_size);
 	xfs_diflags_to_iflags(inode, ip);

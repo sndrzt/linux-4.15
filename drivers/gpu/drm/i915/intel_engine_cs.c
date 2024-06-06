@@ -50,6 +50,8 @@ struct engine_class_info {
 	const char *name;
 	int (*init_legacy)(struct intel_engine_cs *engine);
 	int (*init_execlists)(struct intel_engine_cs *engine);
+
+	u8 uabi_class;
 };
 
 static const struct engine_class_info intel_engine_classes[] = {
@@ -57,21 +59,25 @@ static const struct engine_class_info intel_engine_classes[] = {
 		.name = "rcs",
 		.init_execlists = logical_render_ring_init,
 		.init_legacy = intel_init_render_ring_buffer,
+		.uabi_class = I915_ENGINE_CLASS_RENDER,
 	},
 	[COPY_ENGINE_CLASS] = {
 		.name = "bcs",
 		.init_execlists = logical_xcs_ring_init,
 		.init_legacy = intel_init_blt_ring_buffer,
+		.uabi_class = I915_ENGINE_CLASS_COPY,
 	},
 	[VIDEO_DECODE_CLASS] = {
 		.name = "vcs",
 		.init_execlists = logical_xcs_ring_init,
 		.init_legacy = intel_init_bsd_ring_buffer,
+		.uabi_class = I915_ENGINE_CLASS_VIDEO,
 	},
 	[VIDEO_ENHANCEMENT_CLASS] = {
 		.name = "vecs",
 		.init_execlists = logical_xcs_ring_init,
 		.init_legacy = intel_init_vebox_ring_buffer,
+		.uabi_class = I915_ENGINE_CLASS_VIDEO_ENHANCE,
 	},
 };
 
@@ -213,12 +219,14 @@ intel_engine_setup(struct drm_i915_private *dev_priv,
 	WARN_ON(snprintf(engine->name, sizeof(engine->name), "%s%u",
 			 class_info->name, info->instance) >=
 		sizeof(engine->name));
-	engine->uabi_id = info->uabi_id;
 	engine->hw_id = engine->guc_id = info->hw_id;
 	engine->mmio_base = info->mmio_base;
 	engine->irq_shift = info->irq_shift;
 	engine->class = info->class;
 	engine->instance = info->instance;
+
+	engine->uabi_id = info->uabi_id;
+	engine->uabi_class = class_info->uabi_class;
 
 	engine->context_size = __intel_engine_context_size(dev_priv,
 							   engine->class);
@@ -679,6 +687,9 @@ void intel_engine_cleanup_common(struct intel_engine_cs *engine)
 	intel_engine_cleanup_cmd_parser(engine);
 	i915_gem_batch_pool_fini(&engine->batch_pool);
 
+	if (engine->default_state)
+		i915_gem_object_put(engine->default_state);
+
 	if (INTEL_INFO(engine->i915)->has_logical_ring_preemption)
 		engine->context_unpin(engine, engine->i915->preempt_context);
 	engine->context_unpin(engine, engine->i915->kernel_context);
@@ -1108,6 +1119,10 @@ static int gen9_init_workarounds(struct intel_engine_cs *engine)
 	/* WaDisableGPGPUMidCmdPreemption:skl,bxt,blk,cfl,[cnl] */
 	WA_SET_FIELD_MASKED(GEN8_CS_CHICKEN1, GEN9_PREEMPT_GPGPU_LEVEL_MASK,
 			    GEN9_PREEMPT_GPGPU_COMMAND_LEVEL);
+
+	/* WaClearHIZ_WM_CHICKEN3:bxt,glk */
+	if (IS_GEN9_LP(dev_priv))
+		WA_SET_BIT_MASKED(GEN9_WM_CHICKEN3, GEN9_FACTOR_IN_CLR_VAL_HIZ);
 
 	/* WaVFEStateAfterPipeControlwithMediaStateClear:skl,bxt,glk,cfl */
 	ret = wa_ring_whitelist_reg(engine, GEN9_CTX_PREEMPT_REG);
@@ -1590,6 +1605,34 @@ bool intel_engines_are_idle(struct drm_i915_private *dev_priv)
 	return true;
 }
 
+/**
+ * intel_engine_has_kernel_context:
+ * @engine: the engine
+ *
+ * Returns true if the last context to be executed on this engine, or has been
+ * executed if the engine is already idle, is the kernel context
+ * (#i915.kernel_context).
+ */
+bool intel_engine_has_kernel_context(const struct intel_engine_cs *engine)
+{
+	const struct i915_gem_context * const kernel_context =
+		engine->i915->kernel_context;
+	struct drm_i915_gem_request *rq;
+
+	lockdep_assert_held(&engine->i915->drm.struct_mutex);
+
+	/*
+	 * Check the last context seen by the engine. If active, it will be
+	 * the last request that remains in the timeline. When idle, it is
+	 * the last executed context as tracked by retirement.
+	 */
+	rq = __i915_gem_active_peek(&engine->timeline->last_request);
+	if (rq)
+		return rq->ctx == kernel_context;
+	else
+		return engine->last_retired_context == kernel_context;
+}
+
 void intel_engines_reset_default_submission(struct drm_i915_private *i915)
 {
 	struct intel_engine_cs *engine;
@@ -1625,6 +1668,20 @@ bool intel_engine_can_store_dword(struct intel_engine_cs *engine)
 	default:
 		return true;
 	}
+}
+
+unsigned int intel_engines_has_context_isolation(struct drm_i915_private *i915)
+{
+	struct intel_engine_cs *engine;
+	enum intel_engine_id id;
+	unsigned int which;
+
+	which = 0;
+	for_each_engine(engine, i915, id)
+		if (engine->default_state)
+			which |= BIT(engine->uabi_class);
+
+	return which;
 }
 
 static void print_request(struct drm_printer *m,

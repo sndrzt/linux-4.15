@@ -119,15 +119,24 @@ DEFINE_STATIC_KEY_FALSE(nft_counters_enabled);
 static noinline void nft_update_chain_stats(const struct nft_chain *chain,
 					    const struct nft_pktinfo *pkt)
 {
+	struct nft_base_chain *base_chain;
+	struct nft_stats __percpu *pstats;
 	struct nft_stats *stats;
 
-	local_bh_disable();
-	stats = this_cpu_ptr(rcu_dereference(nft_base_chain(chain)->stats));
-	u64_stats_update_begin(&stats->syncp);
-	stats->pkts++;
-	stats->bytes += pkt->skb->len;
-	u64_stats_update_end(&stats->syncp);
-	local_bh_enable();
+	base_chain = nft_base_chain(chain);
+
+	rcu_read_lock();
+	pstats = READ_ONCE(base_chain->stats);
+	if (pstats) {
+		local_bh_disable();
+		stats = this_cpu_ptr(pstats);
+		u64_stats_update_begin(&stats->syncp);
+		stats->pkts++;
+		stats->bytes += pkt->skb->len;
+		u64_stats_update_end(&stats->syncp);
+		local_bh_enable();
+	}
+	rcu_read_unlock();
 }
 
 struct nft_jumpstack {
@@ -143,7 +152,7 @@ nft_do_chain(struct nft_pktinfo *pkt, void *priv)
 	const struct net *net = nft_net(pkt);
 	const struct nft_rule *rule;
 	const struct nft_expr *expr, *last;
-	struct nft_regs regs;
+	struct nft_regs regs = {};
 	unsigned int stackptr = 0;
 	struct nft_jumpstack jumpstack[NFT_JUMP_STACK_SIZE];
 	int rulenum;
@@ -201,7 +210,8 @@ next_rule:
 
 	switch (regs.verdict.code) {
 	case NFT_JUMP:
-		BUG_ON(stackptr >= NFT_JUMP_STACK_SIZE);
+		if (WARN_ON_ONCE(stackptr >= NFT_JUMP_STACK_SIZE))
+			return NF_DROP;
 		jumpstack[stackptr].chain = chain;
 		jumpstack[stackptr].rule  = rule;
 		jumpstack[stackptr].rulenum = rulenum;

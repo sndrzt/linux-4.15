@@ -112,11 +112,11 @@ static const int mlxsw_sp_sfgc_bc_packet_types[MLXSW_REG_SFGC_TYPE_MAX] = {
 	[MLXSW_REG_SFGC_TYPE_UNREGISTERED_MULTICAST_NON_IP]	= 1,
 	[MLXSW_REG_SFGC_TYPE_IPV4_LINK_LOCAL]			= 1,
 	[MLXSW_REG_SFGC_TYPE_IPV6_ALL_HOST]			= 1,
+	[MLXSW_REG_SFGC_TYPE_UNREGISTERED_MULTICAST_IPV6]	= 1,
 };
 
 static const int mlxsw_sp_sfgc_mc_packet_types[MLXSW_REG_SFGC_TYPE_MAX] = {
 	[MLXSW_REG_SFGC_TYPE_UNREGISTERED_MULTICAST_IPV4]	= 1,
-	[MLXSW_REG_SFGC_TYPE_UNREGISTERED_MULTICAST_IPV6]	= 1,
 };
 
 static const int *mlxsw_sp_packet_type_sfgc_types[] = {
@@ -727,8 +727,8 @@ static const struct mlxsw_sp_fid_ops mlxsw_sp_fid_dummy_ops = {
 static const struct mlxsw_sp_fid_family mlxsw_sp_fid_dummy_family = {
 	.type			= MLXSW_SP_FID_TYPE_DUMMY,
 	.fid_size		= sizeof(struct mlxsw_sp_fid),
-	.start_index		= MLXSW_SP_RFID_BASE - 1,
-	.end_index		= MLXSW_SP_RFID_BASE - 1,
+	.start_index		= VLAN_N_VID - 1,
+	.end_index		= VLAN_N_VID - 1,
 	.ops			= &mlxsw_sp_fid_dummy_ops,
 };
 

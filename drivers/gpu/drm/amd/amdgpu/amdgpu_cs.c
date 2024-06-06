@@ -38,6 +38,7 @@ static int amdgpu_cs_user_fence_chunk(struct amdgpu_cs_parser *p,
 {
 	struct drm_gem_object *gobj;
 	unsigned long size;
+	int r;
 
 	gobj = drm_gem_object_lookup(p->filp, data->handle);
 	if (gobj == NULL)
@@ -49,20 +50,26 @@ static int amdgpu_cs_user_fence_chunk(struct amdgpu_cs_parser *p,
 	p->uf_entry.tv.shared = true;
 	p->uf_entry.user_pages = NULL;
 
+	drm_gem_object_put_unlocked(gobj);
+
 	size = amdgpu_bo_size(p->uf_entry.robj);
-	if (size != PAGE_SIZE || (data->offset + 8) > size)
-		return -EINVAL;
+	if (size != PAGE_SIZE || (data->offset + 8) > size) {
+		r = -EINVAL;
+		goto error_unref;
+	}
+
+	if (amdgpu_ttm_tt_get_usermm(p->uf_entry.robj->tbo.ttm)) {
+		r = -EINVAL;
+		goto error_unref;
+	}
 
 	*offset = data->offset;
 
-	drm_gem_object_put_unlocked(gobj);
-
-	if (amdgpu_ttm_tt_get_usermm(p->uf_entry.robj->tbo.ttm)) {
-		amdgpu_bo_unref(&p->uf_entry.robj);
-		return -EINVAL;
-	}
-
 	return 0;
+
+error_unref:
+	amdgpu_bo_unref(&p->uf_entry.robj);
+	return r;
 }
 
 static int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data)
@@ -78,7 +85,7 @@ static int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p, void *data)
 	int ret;
 
 	if (cs->in.num_chunks == 0)
-		return 0;
+		return -EINVAL;
 
 	chunk_array = kmalloc_array(cs->in.num_chunks, sizeof(uint64_t), GFP_KERNEL);
 	if (!chunk_array)
@@ -532,7 +539,7 @@ static int amdgpu_cs_parser_bos(struct amdgpu_cs_parser *p,
 	INIT_LIST_HEAD(&duplicates);
 	amdgpu_vm_get_pd_bo(&fpriv->vm, &p->validated, &p->vm_pd);
 
-	if (p->uf_entry.robj)
+	if (p->uf_entry.robj && !p->uf_entry.robj->parent)
 		list_add(&p->uf_entry.tv.head, &p->validated);
 
 	while (1) {
@@ -865,8 +872,8 @@ static int amdgpu_cs_ib_vm_chunk(struct amdgpu_device *adev,
 			struct amdgpu_bo_va_mapping *m;
 			struct amdgpu_bo *aobj = NULL;
 			struct amdgpu_cs_chunk *chunk;
+			uint64_t offset, va_start;
 			struct amdgpu_ib *ib;
-			uint64_t offset;
 			uint8_t *kptr;
 
 			chunk = &p->chunks[i];
@@ -876,14 +883,14 @@ static int amdgpu_cs_ib_vm_chunk(struct amdgpu_device *adev,
 			if (chunk->chunk_id != AMDGPU_CHUNK_ID_IB)
 				continue;
 
-			r = amdgpu_cs_find_mapping(p, chunk_ib->va_start,
-						   &aobj, &m);
+			va_start = chunk_ib->va_start & AMDGPU_VA_HOLE_MASK;
+			r = amdgpu_cs_find_mapping(p, va_start, &aobj, &m);
 			if (r) {
 				DRM_ERROR("IB va_start is invalid\n");
 				return r;
 			}
 
-			if ((chunk_ib->va_start + chunk_ib->ib_bytes) >
+			if ((va_start + chunk_ib->ib_bytes) >
 			    (m->last + 1) * AMDGPU_GPU_PAGE_SIZE) {
 				DRM_ERROR("IB va_start+ib_bytes is invalid\n");
 				return -EINVAL;
@@ -896,7 +903,7 @@ static int amdgpu_cs_ib_vm_chunk(struct amdgpu_device *adev,
 			}
 
 			offset = m->start * AMDGPU_GPU_PAGE_SIZE;
-			kptr += chunk_ib->va_start - offset;
+			kptr += va_start - offset;
 
 			memcpy(ib->ptr, kptr, chunk_ib->ib_bytes);
 			amdgpu_bo_kunmap(aobj);
@@ -913,6 +920,10 @@ static int amdgpu_cs_ib_vm_chunk(struct amdgpu_device *adev,
 		p->job->vm_pd_addr = amdgpu_bo_gpu_offset(vm->root.base.bo);
 
 		r = amdgpu_bo_vm_update_pte(p);
+		if (r)
+			return r;
+
+		r = reservation_object_reserve_shared(vm->root.base.bo->tbo.resv);
 		if (r)
 			return r;
 	}
@@ -959,13 +970,9 @@ static int amdgpu_cs_ib_fill(struct amdgpu_device *adev,
 		if (r)
 			return r;
 
-		if (chunk_ib->flags & AMDGPU_IB_FLAG_PREAMBLE) {
-			parser->job->preamble_status |= AMDGPU_PREAMBLE_IB_PRESENT;
-			if (!parser->ctx->preamble_presented) {
-				parser->job->preamble_status |= AMDGPU_PREAMBLE_IB_PRESENT_FIRST;
-				parser->ctx->preamble_presented = true;
-			}
-		}
+		if (chunk_ib->flags & AMDGPU_IB_FLAG_PREAMBLE)
+			parser->job->preamble_status |=
+				AMDGPU_PREAMBLE_IB_PRESENT;
 
 		if (parser->job->ring && parser->job->ring != ring)
 			return -EINVAL;
@@ -1189,6 +1196,12 @@ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
 	}
 
 	amdgpu_cs_post_dependencies(p);
+
+	if ((job->preamble_status & AMDGPU_PREAMBLE_IB_PRESENT) &&
+	    !p->ctx->preamble_presented) {
+		job->preamble_status |= AMDGPU_PREAMBLE_IB_PRESENT_FIRST;
+		p->ctx->preamble_presented = true;
+	}
 
 	cs->out.handle = seq;
 	job->uf_sequence = seq;

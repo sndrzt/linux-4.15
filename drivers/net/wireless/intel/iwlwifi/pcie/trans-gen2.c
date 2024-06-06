@@ -280,6 +280,15 @@ void iwl_trans_pcie_gen2_fw_alive(struct iwl_trans *trans, u32 scd_addr)
 	 * paging memory cannot be freed included since FW will still use it
 	 */
 	iwl_pcie_ctxt_info_free(trans);
+
+	/*
+	 * Re-enable all the interrupts, including the RF-Kill one, now that
+	 * the firmware is alive.
+	 */
+	iwl_enable_interrupts(trans);
+	mutex_lock(&trans_pcie->mutex);
+	iwl_pcie_check_hw_rf_kill(trans);
+	mutex_unlock(&trans_pcie->mutex);
 }
 
 int iwl_trans_pcie_gen2_start_fw(struct iwl_trans *trans,
@@ -292,8 +301,7 @@ int iwl_trans_pcie_gen2_start_fw(struct iwl_trans *trans,
 	/* This may fail if AMT took ownership of the device */
 	if (iwl_pcie_prepare_card_hw(trans)) {
 		IWL_WARN(trans, "Exit HW not ready\n");
-		ret = -EIO;
-		goto out;
+		return -EIO;
 	}
 
 	iwl_enable_rfkill_int(trans);

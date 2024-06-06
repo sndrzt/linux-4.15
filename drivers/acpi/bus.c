@@ -66,10 +66,37 @@ static int set_copy_dsdt(const struct dmi_system_id *id)
 	return 0;
 }
 #endif
+static int set_gbl_term_list(const struct dmi_system_id *id)
+{
+	acpi_gbl_parse_table_as_term_list = 1;
+	return 0;
+}
 
-static const struct dmi_system_id dsdt_dmi_table[] __initconst = {
+static const struct dmi_system_id acpi_quirks_dmi_table[] __initconst = {
+	/*
+	 * Touchpad on Dell XPS 9570/Precision M5530 doesn't work under I2C
+	 * mode.
+	 * https://bugzilla.kernel.org/show_bug.cgi?id=198515
+	 */
+	{
+		.callback = set_gbl_term_list,
+		.ident = "Dell Precision M5530",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_MATCH(DMI_PRODUCT_NAME, "Precision M5530"),
+		},
+	},
+	{
+		.callback = set_gbl_term_list,
+		.ident = "Dell XPS 15 9570",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_MATCH(DMI_PRODUCT_NAME, "XPS 15 9570"),
+		},
+	},
 	/*
 	 * Invoke DSDT corruption work-around on all Toshiba Satellite.
+	 * DSDT will be copied to memory.
 	 * https://bugzilla.kernel.org/show_bug.cgi?id=14679
 	 */
 	{
@@ -82,10 +109,46 @@ static const struct dmi_system_id dsdt_dmi_table[] __initconst = {
 	},
 	{}
 };
+
+static const char * const acpi_quirk_lenovo_bios_ids[] = {
+	"N2H", /* first 3 bytes of Lenovo BIOS version */
+	NULL
+};
+
+bool acpi_quirk_matches_bios_ids(const char * const ids[])
+{
+	const char *bios_vendor = dmi_get_system_info(DMI_BIOS_VENDOR);
+	const char *bios_ver = dmi_get_system_info(DMI_BIOS_VERSION);
+	int i;
+
+	if (!bios_vendor || !bios_ver)
+		return false;
+
+	if (strncmp(bios_vendor, "LENOVO", 6))
+		return false;
+
+	for (i = 0; ids[i]; i++)
+		if (!strncmp(bios_ver, ids[i], 3)) {
+			acpi_gbl_parse_table_as_term_list = 1;
+			return true;
+		}
+
+	return false;
+}
+
 #else
-static const struct dmi_system_id dsdt_dmi_table[] __initconst = {
+static const struct dmi_system_id acpi_quirks_dmi_table[] __initconst = {
 	{}
 };
+
+static const char * const acpi_quirk_lenovo_bios_ids[] = {
+	NULL
+};
+
+bool acpi_quirk_matches_bios_ids(const char * const ids[])
+{
+	return false;
+}
 #endif
 
 /* --------------------------------------------------------------------------
@@ -116,6 +179,12 @@ int acpi_bus_get_status(struct acpi_device *device)
 
 	if (acpi_device_always_present(device)) {
 		acpi_set_device_status(device, ACPI_STA_DEFAULT);
+		return 0;
+	}
+
+	/* Battery devices must have their deps met before calling _STA */
+	if (acpi_device_is_battery(device) && device->dep_unmet) {
+		acpi_set_device_status(device, 0);
 		return 0;
 	}
 
@@ -163,7 +232,7 @@ int acpi_bus_get_private_data(acpi_handle handle, void **data)
 {
 	acpi_status status;
 
-	if (!*data)
+	if (!data)
 		return -EINVAL;
 
 	status = acpi_get_data(handle, acpi_bus_private_data_handler, data);
@@ -1001,11 +1070,9 @@ void __init acpi_early_init(void)
 
 	acpi_permanent_mmap = true;
 
-	/*
-	 * If the machine falls into the DMI check table,
-	 * DSDT will be copied to memory
-	 */
-	dmi_check_system(dsdt_dmi_table);
+	/* Check machine-specific quirks */
+	dmi_check_system(acpi_quirks_dmi_table);
+	acpi_quirk_matches_bios_ids(acpi_quirk_lenovo_bios_ids);
 
 	status = acpi_reallocate_root_table();
 	if (ACPI_FAILURE(status)) {
@@ -1219,6 +1286,7 @@ static int __init acpi_init(void)
 	init_acpi_device_notify();
 	result = acpi_bus_init();
 	if (result) {
+		kobject_put(acpi_kobj);
 		disable_acpi();
 		return result;
 	}

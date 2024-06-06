@@ -190,6 +190,7 @@ static struct tegra_emc *emc_ensure_emc_driver(struct tegra_clk_emc *tegra)
 
 	tegra->emc = platform_get_drvdata(pdev);
 	if (!tegra->emc) {
+		put_device(&pdev->dev);
 		pr_err("%s: cannot find EMC driver\n", __func__);
 		return NULL;
 	}
@@ -515,7 +516,7 @@ struct clk *tegra_clk_register_emc(void __iomem *base, struct device_node *np,
 
 	init.name = "emc";
 	init.ops = &tegra_clk_emc_ops;
-	init.flags = 0;
+	init.flags = CLK_IS_CRITICAL;
 	init.parent_names = emc_parent_clk_names;
 	init.num_parents = ARRAY_SIZE(emc_parent_clk_names);
 

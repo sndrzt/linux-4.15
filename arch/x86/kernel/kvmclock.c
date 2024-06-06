@@ -103,12 +103,8 @@ static u64 kvm_sched_clock_read(void)
 
 static inline void kvm_sched_clock_init(bool stable)
 {
-	if (!stable) {
-		pv_time_ops.sched_clock = kvm_clock_read;
+	if (!stable)
 		clear_sched_clock_stable();
-		return;
-	}
-
 	kvm_sched_clock_offset = kvm_clock_read();
 	pv_time_ops.sched_clock = kvm_sched_clock_read;
 
@@ -138,6 +134,7 @@ static unsigned long kvm_get_tsc_khz(void)
 	src = &hv_clock[cpu].pvti;
 	tsc_khz = pvclock_tsc_khz(src);
 	put_cpu();
+	setup_force_cpu_cap(X86_FEATURE_TSC_KNOWN_FREQ);
 	return tsc_khz;
 }
 
@@ -319,6 +316,8 @@ void __init kvmclock_init(void)
 	printk(KERN_INFO "kvm-clock: Using msrs %x and %x",
 		msr_kvm_system_time, msr_kvm_wall_clock);
 
+	pvclock_set_pvti_cpu0_va(hv_clock);
+
 	if (kvm_para_has_feature(KVM_FEATURE_CLOCKSOURCE_STABLE_BIT))
 		pvclock_set_flags(PVCLOCK_TSC_STABLE_BIT);
 
@@ -366,13 +365,10 @@ int __init kvm_setup_vsyscall_timeinfo(void)
 	vcpu_time = &hv_clock[cpu].pvti;
 	flags = pvclock_read_flags(vcpu_time);
 
-	if (!(flags & PVCLOCK_TSC_STABLE_BIT)) {
-		put_cpu();
-		return 1;
-	}
-
-	pvclock_set_pvti_cpu0_va(hv_clock);
 	put_cpu();
+
+	if (!(flags & PVCLOCK_TSC_STABLE_BIT))
+		return 1;
 
 	kvm_clock.archdata.vclock_mode = VCLOCK_PVCLOCK;
 #endif

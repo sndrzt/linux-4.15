@@ -4,6 +4,7 @@
  *
  * Copyright 2007-2009	Johannes Berg <johannes@sipsolutions.net>
  * Copyright 2013-2014  Intel Mobile Communications GmbH
+ * Copyright (C) 2018-2019 Intel Corporation
  */
 #include <linux/export.h>
 #include <linux/bitops.h>
@@ -15,6 +16,7 @@
 #include <linux/if_vlan.h>
 #include <linux/mpls.h>
 #include <linux/gcd.h>
+#include <linux/nospec.h>
 #include "core.h"
 #include "rdev-ops.h"
 
@@ -213,11 +215,48 @@ bool cfg80211_supported_cipher_suite(struct wiphy *wiphy, u32 cipher)
 	return false;
 }
 
+static bool
+cfg80211_igtk_cipher_supported(struct cfg80211_registered_device *rdev)
+{
+	struct wiphy *wiphy = &rdev->wiphy;
+	int i;
+
+	for (i = 0; i < wiphy->n_cipher_suites; i++) {
+		switch (wiphy->cipher_suites[i]) {
+		case WLAN_CIPHER_SUITE_AES_CMAC:
+		case WLAN_CIPHER_SUITE_BIP_CMAC_256:
+		case WLAN_CIPHER_SUITE_BIP_GMAC_128:
+		case WLAN_CIPHER_SUITE_BIP_GMAC_256:
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool cfg80211_valid_key_idx(struct cfg80211_registered_device *rdev,
+			    int key_idx, bool pairwise)
+{
+	int max_key_idx;
+
+	if (pairwise)
+		max_key_idx = 3;
+	else if (cfg80211_igtk_cipher_supported(rdev))
+		max_key_idx = 5;
+	else
+		max_key_idx = 3;
+
+	if (key_idx < 0 || key_idx > max_key_idx)
+		return false;
+
+	return true;
+}
+
 int cfg80211_validate_key_settings(struct cfg80211_registered_device *rdev,
 				   struct key_params *params, int key_idx,
 				   bool pairwise, const u8 *mac_addr)
 {
-	if (key_idx < 0 || key_idx > 5)
+	if (!cfg80211_valid_key_idx(rdev, key_idx, pairwise))
 		return -EINVAL;
 
 	if (!pairwise && mac_addr && !(rdev->wiphy.flags & WIPHY_FLAG_IBSS_RSN))
@@ -420,7 +459,8 @@ unsigned int ieee80211_get_mesh_hdrlen(struct ieee80211s_hdr *meshhdr)
 EXPORT_SYMBOL(ieee80211_get_mesh_hdrlen);
 
 int ieee80211_data_to_8023_exthdr(struct sk_buff *skb, struct ethhdr *ehdr,
-				  const u8 *addr, enum nl80211_iftype iftype)
+				  const u8 *addr, enum nl80211_iftype iftype,
+				  bool is_amsdu)
 {
 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *) skb->data;
 	struct {
@@ -508,7 +548,7 @@ int ieee80211_data_to_8023_exthdr(struct sk_buff *skb, struct ethhdr *ehdr,
 	skb_copy_bits(skb, hdrlen, &payload, sizeof(payload));
 	tmp.h_proto = payload.proto;
 
-	if (likely((ether_addr_equal(payload.hdr, rfc1042_header) &&
+	if (likely((!is_amsdu && ether_addr_equal(payload.hdr, rfc1042_header) &&
 		    tmp.h_proto != htons(ETH_P_AARP) &&
 		    tmp.h_proto != htons(ETH_P_IPX)) ||
 		   ether_addr_equal(payload.hdr, bridge_tunnel_header)))
@@ -535,7 +575,7 @@ __frame_add_frag(struct sk_buff *skb, struct page *page,
 	struct skb_shared_info *sh = skb_shinfo(skb);
 	int page_offset;
 
-	page_ref_inc(page);
+	get_page(page);
 	page_offset = ptr - page_address(page);
 	skb_add_rx_frag(skb, sh->nr_frags, page, page_offset, len, size);
 }
@@ -650,6 +690,9 @@ void ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
 		remaining = skb->len - offset;
 		if (subframe_len > remaining)
 			goto purge;
+		/* mitigate A-MSDU aggregation injection attacks */
+		if (ether_addr_equal(eth.h_dest, rfc1042_header))
+			goto purge;
 
 		offset += sizeof(struct ethhdr);
 		last = remaining <= subframe_len + padding;
@@ -710,20 +753,25 @@ unsigned int cfg80211_classify8021d(struct sk_buff *skb,
 {
 	unsigned int dscp;
 	unsigned char vlan_priority;
+	unsigned int ret;
 
 	/* skb->priority values from 256->263 are magic values to
 	 * directly indicate a specific 802.1d priority.  This is used
 	 * to allow 802.1d priority to be passed directly in from VLAN
 	 * tags, etc.
 	 */
-	if (skb->priority >= 256 && skb->priority <= 263)
-		return skb->priority - 256;
+	if (skb->priority >= 256 && skb->priority <= 263) {
+		ret = skb->priority - 256;
+		goto out;
+	}
 
 	if (skb_vlan_tag_present(skb)) {
 		vlan_priority = (skb_vlan_tag_get(skb) & VLAN_PRIO_MASK)
 			>> VLAN_PRIO_SHIFT;
-		if (vlan_priority > 0)
-			return vlan_priority;
+		if (vlan_priority > 0) {
+			ret = vlan_priority;
+			goto out;
+		}
 	}
 
 	switch (skb->protocol) {
@@ -742,8 +790,9 @@ unsigned int cfg80211_classify8021d(struct sk_buff *skb,
 		if (!mpls)
 			return 0;
 
-		return (ntohl(mpls->entry) & MPLS_LS_TC_MASK)
+		ret = (ntohl(mpls->entry) & MPLS_LS_TC_MASK)
 			>> MPLS_LS_TC_SHIFT;
+		goto out;
 	}
 	case htons(ETH_P_80221):
 		/* 802.21 is always network control traffic */
@@ -756,18 +805,24 @@ unsigned int cfg80211_classify8021d(struct sk_buff *skb,
 		unsigned int i, tmp_dscp = dscp >> 2;
 
 		for (i = 0; i < qos_map->num_des; i++) {
-			if (tmp_dscp == qos_map->dscp_exception[i].dscp)
-				return qos_map->dscp_exception[i].up;
+			if (tmp_dscp == qos_map->dscp_exception[i].dscp) {
+				ret = qos_map->dscp_exception[i].up;
+				goto out;
+			}
 		}
 
 		for (i = 0; i < 8; i++) {
 			if (tmp_dscp >= qos_map->up[i].low &&
-			    tmp_dscp <= qos_map->up[i].high)
-				return i;
+			    tmp_dscp <= qos_map->up[i].high) {
+				ret = i;
+				goto out;
+			}
 		}
 	}
 
-	return dscp >> 5;
+	ret = dscp >> 5;
+out:
+	return array_index_nospec(ret, IEEE80211_NUM_TIDS);
 }
 EXPORT_SYMBOL(cfg80211_classify8021d);
 
@@ -908,6 +963,7 @@ int cfg80211_change_iface(struct cfg80211_registered_device *rdev,
 
 		switch (otype) {
 		case NL80211_IFTYPE_AP:
+		case NL80211_IFTYPE_P2P_GO:
 			cfg80211_stop_ap(rdev, dev, true);
 			break;
 		case NL80211_IFTYPE_ADHOC:
@@ -923,11 +979,15 @@ int cfg80211_change_iface(struct cfg80211_registered_device *rdev,
 		case NL80211_IFTYPE_MESH_POINT:
 			/* mesh should be handled? */
 			break;
+		case NL80211_IFTYPE_OCB:
+			cfg80211_leave_ocb(rdev, dev);
+			break;
 		default:
 			break;
 		}
 
 		cfg80211_process_rdev_events(rdev);
+		cfg80211_mlme_purge_registrations(dev->ieee80211_ptr);
 	}
 
 	err = rdev_change_virtual_intf(rdev, dev, ntype, params);
@@ -1335,6 +1395,8 @@ size_t ieee80211_ie_split_ric(const u8 *ies, size_t ielen,
 							  ies[pos + ext],
 							  ext == 2))
 					pos = skip_ie(ies, ielen, pos);
+				else
+					break;
 			}
 		} else {
 			pos = skip_ie(ies, ielen, pos);
@@ -1373,7 +1435,7 @@ bool ieee80211_chandef_to_operating_class(struct cfg80211_chan_def *chandef,
 					  u8 *op_class)
 {
 	u8 vht_opclass;
-	u16 freq = chandef->center_freq1;
+	u32 freq = chandef->center_freq1;
 
 	if (freq >= 2412 && freq <= 2472) {
 		if (chandef->width > NL80211_CHAN_WIDTH_40)
@@ -1585,7 +1647,7 @@ int cfg80211_iter_combinations(struct wiphy *wiphy,
 	for (iftype = 0; iftype < NUM_NL80211_IFTYPES; iftype++) {
 		num_interfaces += params->iftype_num[iftype];
 		if (params->iftype_num[iftype] > 0 &&
-		    !(wiphy->software_iftypes & BIT(iftype)))
+		    !cfg80211_iftype_allowed(wiphy, iftype, 0, 1))
 			used_iftypes |= BIT(iftype);
 	}
 
@@ -1607,7 +1669,7 @@ int cfg80211_iter_combinations(struct wiphy *wiphy,
 			return -ENOMEM;
 
 		for (iftype = 0; iftype < NUM_NL80211_IFTYPES; iftype++) {
-			if (wiphy->software_iftypes & BIT(iftype))
+			if (cfg80211_iftype_allowed(wiphy, iftype, 0, 1))
 				continue;
 			for (j = 0; j < c->n_limits; j++) {
 				all_iftypes |= limits[j].types;
@@ -1796,3 +1858,71 @@ EXPORT_SYMBOL(rfc1042_header);
 const unsigned char bridge_tunnel_header[] __aligned(2) =
 	{ 0xaa, 0xaa, 0x03, 0x00, 0x00, 0xf8 };
 EXPORT_SYMBOL(bridge_tunnel_header);
+
+/* Layer 2 Update frame (802.2 Type 1 LLC XID Update response) */
+struct iapp_layer2_update {
+	u8 da[ETH_ALEN];	/* broadcast */
+	u8 sa[ETH_ALEN];	/* STA addr */
+	__be16 len;		/* 6 */
+	u8 dsap;		/* 0 */
+	u8 ssap;		/* 0 */
+	u8 control;
+	u8 xid_info[3];
+} __packed;
+
+void cfg80211_send_layer2_update(struct net_device *dev, const u8 *addr)
+{
+	struct iapp_layer2_update *msg;
+	struct sk_buff *skb;
+
+	/* Send Level 2 Update Frame to update forwarding tables in layer 2
+	 * bridge devices */
+
+	skb = dev_alloc_skb(sizeof(*msg));
+	if (!skb)
+		return;
+	msg = skb_put(skb, sizeof(*msg));
+
+	/* 802.2 Type 1 Logical Link Control (LLC) Exchange Identifier (XID)
+	 * Update response frame; IEEE Std 802.2-1998, 5.4.1.2.1 */
+
+	eth_broadcast_addr(msg->da);
+	ether_addr_copy(msg->sa, addr);
+	msg->len = htons(6);
+	msg->dsap = 0;
+	msg->ssap = 0x01;	/* NULL LSAP, CR Bit: Response */
+	msg->control = 0xaf;	/* XID response lsb.1111F101.
+				 * F=0 (no poll command; unsolicited frame) */
+	msg->xid_info[0] = 0x81;	/* XID format identifier */
+	msg->xid_info[1] = 1;	/* LLC types/classes: Type 1 LLC */
+	msg->xid_info[2] = 0;	/* XID sender's receive window size (RW) */
+
+	skb->dev = dev;
+	skb->protocol = eth_type_trans(skb, dev);
+	memset(skb->cb, 0, sizeof(skb->cb));
+	netif_rx_ni(skb);
+}
+EXPORT_SYMBOL(cfg80211_send_layer2_update);
+
+bool cfg80211_iftype_allowed(struct wiphy *wiphy, enum nl80211_iftype iftype,
+			     bool is_4addr, u8 check_swif)
+
+{
+	bool is_vlan = iftype == NL80211_IFTYPE_AP_VLAN;
+
+	switch (check_swif) {
+	case 0:
+		if (is_vlan && is_4addr)
+			return wiphy->flags & WIPHY_FLAG_4ADDR_AP;
+		return wiphy->interface_modes & BIT(iftype);
+	case 1:
+		if (!(wiphy->software_iftypes & BIT(iftype)) && is_vlan)
+			return wiphy->flags & WIPHY_FLAG_4ADDR_AP;
+		return wiphy->software_iftypes & BIT(iftype);
+	default:
+		break;
+	}
+
+	return false;
+}
+EXPORT_SYMBOL(cfg80211_iftype_allowed);

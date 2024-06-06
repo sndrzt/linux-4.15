@@ -641,7 +641,7 @@ store_link_ksettings_for_user(void __user *to,
 {
 	struct ethtool_link_usettings link_usettings;
 
-	memcpy(&link_usettings.base, &from->base, sizeof(link_usettings));
+	memcpy(&link_usettings, from, sizeof(link_usettings));
 	bitmap_to_u32array(link_usettings.link_modes.supported,
 			   __ETHTOOL_LINK_MODE_MASK_NU32,
 			   from->link_modes.supported,
@@ -906,8 +906,13 @@ static noinline_for_stack int ethtool_get_drvinfo(struct net_device *dev,
 		if (rc >= 0)
 			info.n_priv_flags = rc;
 	}
-	if (ops->get_regs_len)
-		info.regdump_len = ops->get_regs_len(dev);
+	if (ops->get_regs_len) {
+		int ret = ops->get_regs_len(dev);
+
+		if (ret > 0)
+			info.regdump_len = ret;
+	}
+
 	if (ops->get_eeprom_len)
 		info.eedump_len = ops->get_eeprom_len(dev);
 
@@ -1408,6 +1413,9 @@ static int ethtool_get_regs(struct net_device *dev, char __user *useraddr)
 		return -EFAULT;
 
 	reglen = ops->get_regs_len(dev);
+	if (reglen <= 0)
+		return reglen;
+
 	if (regs.len > reglen)
 		regs.len = reglen;
 
@@ -1418,13 +1426,16 @@ static int ethtool_get_regs(struct net_device *dev, char __user *useraddr)
 			return -ENOMEM;
 	}
 
+	if (regs.len < reglen)
+		reglen = regs.len;
+
 	ops->get_regs(dev, &regs, regbuf);
 
 	ret = -EFAULT;
 	if (copy_to_user(useraddr, &regs, sizeof(regs)))
 		goto out;
 	useraddr += offsetof(struct ethtool_regs, data);
-	if (regbuf && copy_to_user(useraddr, regbuf, regs.len))
+	if (copy_to_user(useraddr, regbuf, reglen))
 		goto out;
 	ret = 0;
 
@@ -1455,11 +1466,13 @@ static int ethtool_reset(struct net_device *dev, char __user *useraddr)
 
 static int ethtool_get_wol(struct net_device *dev, char __user *useraddr)
 {
-	struct ethtool_wolinfo wol = { .cmd = ETHTOOL_GWOL };
+	struct ethtool_wolinfo wol;
 
 	if (!dev->ethtool_ops->get_wol)
 		return -EOPNOTSUPP;
 
+	memset(&wol, 0, sizeof(struct ethtool_wolinfo));
+	wol.cmd = ETHTOOL_GWOL;
 	dev->ethtool_ops->get_wol(dev, &wol);
 
 	if (copy_to_user(useraddr, &wol, sizeof(wol)))
@@ -1558,7 +1571,7 @@ static int ethtool_get_any_eeprom(struct net_device *dev, void __user *useraddr,
 	if (eeprom.offset + eeprom.len > total_len)
 		return -EINVAL;
 
-	data = kmalloc(PAGE_SIZE, GFP_USER);
+	data = kzalloc(PAGE_SIZE, GFP_USER);
 	if (!data)
 		return -ENOMEM;
 
@@ -1623,7 +1636,7 @@ static int ethtool_set_eeprom(struct net_device *dev, void __user *useraddr)
 	if (eeprom.offset + eeprom.len > ops->get_eeprom_len(dev))
 		return -EINVAL;
 
-	data = kmalloc(PAGE_SIZE, GFP_USER);
+	data = kzalloc(PAGE_SIZE, GFP_USER);
 	if (!data)
 		return -ENOMEM;
 
@@ -1692,13 +1705,22 @@ static int ethtool_get_ringparam(struct net_device *dev, void __user *useraddr)
 
 static int ethtool_set_ringparam(struct net_device *dev, void __user *useraddr)
 {
-	struct ethtool_ringparam ringparam;
+	struct ethtool_ringparam ringparam, max = { .cmd = ETHTOOL_GRINGPARAM };
 
-	if (!dev->ethtool_ops->set_ringparam)
+	if (!dev->ethtool_ops->set_ringparam || !dev->ethtool_ops->get_ringparam)
 		return -EOPNOTSUPP;
 
 	if (copy_from_user(&ringparam, useraddr, sizeof(ringparam)))
 		return -EFAULT;
+
+	dev->ethtool_ops->get_ringparam(dev, &max);
+
+	/* ensure new ring parameters are within the maximums */
+	if (ringparam.rx_pending > max.rx_max_pending ||
+	    ringparam.rx_mini_pending > max.rx_mini_max_pending ||
+	    ringparam.rx_jumbo_pending > max.rx_jumbo_max_pending ||
+	    ringparam.tx_pending > max.tx_max_pending)
+		return -EINVAL;
 
 	return dev->ethtool_ops->set_ringparam(dev, &ringparam);
 }
@@ -1795,7 +1817,7 @@ static int ethtool_self_test(struct net_device *dev, char __user *useraddr)
 		return -EFAULT;
 
 	test.len = test_len;
-	data = kmalloc(test_len * sizeof(u64), GFP_USER);
+	data = kcalloc(test_len, sizeof(u64), GFP_USER);
 	if (!data)
 		return -ENOMEM;
 
@@ -1831,11 +1853,15 @@ static int ethtool_get_strings(struct net_device *dev, void __user *useraddr)
 	WARN_ON_ONCE(!ret);
 
 	gstrings.len = ret;
-	data = vzalloc(gstrings.len * ETH_GSTRING_LEN);
-	if (gstrings.len && !data)
-		return -ENOMEM;
+	if (gstrings.len) {
+		data = vzalloc(gstrings.len * ETH_GSTRING_LEN);
+		if (!data)
+			return -ENOMEM;
 
-	__ethtool_get_strings(dev, gstrings.string_set, data);
+		__ethtool_get_strings(dev, gstrings.string_set, data);
+	} else {
+		data = NULL;
+	}
 
 	ret = -EFAULT;
 	if (copy_to_user(useraddr, &gstrings, sizeof(gstrings)))
@@ -1931,11 +1957,14 @@ static int ethtool_get_stats(struct net_device *dev, void __user *useraddr)
 		return -EFAULT;
 
 	stats.n_stats = n_stats;
-	data = vzalloc(n_stats * sizeof(u64));
-	if (n_stats && !data)
-		return -ENOMEM;
-
-	ops->get_ethtool_stats(dev, &stats, data);
+	if (n_stats) {
+		data = vzalloc(n_stats * sizeof(u64));
+		if (!data)
+			return -ENOMEM;
+		ops->get_ethtool_stats(dev, &stats, data);
+	} else {
+		data = NULL;
+	}
 
 	ret = -EFAULT;
 	if (copy_to_user(useraddr, &stats, sizeof(stats)))
@@ -1965,19 +1994,24 @@ static int ethtool_get_phy_stats(struct net_device *dev, void __user *useraddr)
 		return n_stats;
 	if (n_stats > S32_MAX / sizeof(u64))
 		return -ENOMEM;
-	WARN_ON_ONCE(!n_stats);
+	if (WARN_ON_ONCE(!n_stats))
+		return -EOPNOTSUPP;
 
 	if (copy_from_user(&stats, useraddr, sizeof(stats)))
 		return -EFAULT;
 
 	stats.n_stats = n_stats;
-	data = vzalloc(n_stats * sizeof(u64));
-	if (n_stats && !data)
-		return -ENOMEM;
+	if (n_stats) {
+		data = vzalloc(n_stats * sizeof(u64));
+		if (!data)
+			return -ENOMEM;
 
-	mutex_lock(&phydev->lock);
-	phydev->drv->get_stats(phydev, &stats, data);
-	mutex_unlock(&phydev->lock);
+		mutex_lock(&phydev->lock);
+		phydev->drv->get_stats(phydev, &stats, data);
+		mutex_unlock(&phydev->lock);
+	} else {
+		data = NULL;
+	}
 
 	ret = -EFAULT;
 	if (copy_to_user(useraddr, &stats, sizeof(stats)))
@@ -2294,7 +2328,7 @@ static int ethtool_get_tunable(struct net_device *dev, void __user *useraddr)
 	ret = ethtool_tunable_valid(&tuna);
 	if (ret)
 		return ret;
-	data = kmalloc(tuna.len, GFP_USER);
+	data = kzalloc(tuna.len, GFP_USER);
 	if (!data)
 		return -ENOMEM;
 	ret = ops->get_tunable(dev, &tuna, data);
@@ -2335,9 +2369,10 @@ static int ethtool_set_tunable(struct net_device *dev, void __user *useraddr)
 	return ret;
 }
 
-static int ethtool_get_per_queue_coalesce(struct net_device *dev,
-					  void __user *useraddr,
-					  struct ethtool_per_queue_op *per_queue_opt)
+static noinline_for_stack int
+ethtool_get_per_queue_coalesce(struct net_device *dev,
+			       void __user *useraddr,
+			       struct ethtool_per_queue_op *per_queue_opt)
 {
 	u32 bit;
 	int ret;
@@ -2367,9 +2402,10 @@ static int ethtool_get_per_queue_coalesce(struct net_device *dev,
 	return 0;
 }
 
-static int ethtool_set_per_queue_coalesce(struct net_device *dev,
-					  void __user *useraddr,
-					  struct ethtool_per_queue_op *per_queue_opt)
+static noinline_for_stack int
+ethtool_set_per_queue_coalesce(struct net_device *dev,
+			       void __user *useraddr,
+			       struct ethtool_per_queue_op *per_queue_opt)
 {
 	u32 bit;
 	int i, ret = 0;
@@ -2426,12 +2462,16 @@ roll_back:
 	return ret;
 }
 
-static int ethtool_set_per_queue(struct net_device *dev, void __user *useraddr)
+static int noinline_for_stack ethtool_set_per_queue(struct net_device *dev,
+				 void __user *useraddr, u32 sub_cmd)
 {
 	struct ethtool_per_queue_op per_queue_opt;
 
 	if (copy_from_user(&per_queue_opt, useraddr, sizeof(per_queue_opt)))
 		return -EFAULT;
+
+	if (per_queue_opt.sub_command != sub_cmd)
+		return -EINVAL;
 
 	switch (per_queue_opt.sub_command) {
 	case ETHTOOL_GCOALESCE:
@@ -2473,7 +2513,7 @@ static int get_phy_tunable(struct net_device *dev, void __user *useraddr)
 	ret = ethtool_phy_tunable_valid(&tuna);
 	if (ret)
 		return ret;
-	data = kmalloc(tuna.len, GFP_USER);
+	data = kzalloc(tuna.len, GFP_USER);
 	if (!data)
 		return -ENOMEM;
 	mutex_lock(&phydev->lock);
@@ -2521,11 +2561,14 @@ static int set_phy_tunable(struct net_device *dev, void __user *useraddr)
 static int ethtool_get_fecparam(struct net_device *dev, void __user *useraddr)
 {
 	struct ethtool_fecparam fecparam = { ETHTOOL_GFECPARAM };
+	int rc;
 
 	if (!dev->ethtool_ops->get_fecparam)
 		return -EOPNOTSUPP;
 
-	dev->ethtool_ops->get_fecparam(dev, &fecparam);
+	rc = dev->ethtool_ops->get_fecparam(dev, &fecparam);
+	if (rc)
+		return rc;
 
 	if (copy_to_user(useraddr, &fecparam, sizeof(fecparam)))
 		return -EFAULT;
@@ -2585,6 +2628,7 @@ int dev_ethtool(struct net *net, struct ifreq *ifr)
 	case ETHTOOL_GPHYSTATS:
 	case ETHTOOL_GTSO:
 	case ETHTOOL_GPERMADDR:
+	case ETHTOOL_GUFO:
 	case ETHTOOL_GGSO:
 	case ETHTOOL_GGRO:
 	case ETHTOOL_GFLAGS:
@@ -2799,7 +2843,7 @@ int dev_ethtool(struct net *net, struct ifreq *ifr)
 		rc = ethtool_get_phy_stats(dev, useraddr);
 		break;
 	case ETHTOOL_PERQUEUE:
-		rc = ethtool_set_per_queue(dev, useraddr);
+		rc = ethtool_set_per_queue(dev, useraddr, sub_cmd);
 		break;
 	case ETHTOOL_GLINKSETTINGS:
 		rc = ethtool_get_link_ksettings(dev, useraddr);

@@ -126,4 +126,25 @@ extern int __ucmpdi2(u64, u64);
 void _mcount(void);
 unsigned long prepare_ftrace_return(unsigned long parent, unsigned long ip);
 
+void pnv_power9_force_smt4_catch(void);
+void pnv_power9_force_smt4_release(void);
+
+/* Transaction memory related */
+void tm_enable(void);
+void tm_disable(void);
+void tm_abort(uint8_t cause);
+
+struct kvm_vcpu;
+void _kvmppc_restore_tm_pr(struct kvm_vcpu *vcpu, u64 guest_msr);
+void _kvmppc_save_tm_pr(struct kvm_vcpu *vcpu, u64 guest_msr);
+
+/* Patch sites */
+extern s32 patch__call_flush_count_cache;
+extern s32 patch__flush_count_cache_return;
+extern s32 patch__flush_link_stack_return;
+extern s32 patch__call_kvm_flush_link_stack;
+
+extern long flush_count_cache;
+extern long kvm_flush_link_stack;
+
 #endif /* _ASM_POWERPC_ASM_PROTOTYPES_H */

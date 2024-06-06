@@ -188,6 +188,7 @@
 #include <linux/refcount.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
+#include <linux/kthread.h>
 
 #include "bset.h"
 #include "util.h"
@@ -258,10 +259,11 @@ struct bcache_device {
 	struct gendisk		*disk;
 
 	unsigned long		flags;
-#define BCACHE_DEV_CLOSING	0
-#define BCACHE_DEV_DETACHING	1
-#define BCACHE_DEV_UNLINK_DONE	2
-
+#define BCACHE_DEV_CLOSING		0
+#define BCACHE_DEV_DETACHING		1
+#define BCACHE_DEV_UNLINK_DONE		2
+#define BCACHE_DEV_WB_RUNNING		3
+#define BCACHE_DEV_RATE_DW_RUNNING	4
 	unsigned		nr_stripes;
 	unsigned		stripe_size;
 	atomic_t		*stripe_sectors_dirty;
@@ -284,6 +286,12 @@ struct io {
 	unsigned long		jiffies;
 	unsigned		sequential;
 	sector_t		last;
+};
+
+enum stop_on_failure {
+	BCH_CACHED_DEV_STOP_AUTO = 0,
+	BCH_CACHED_DEV_STOP_ALWAYS,
+	BCH_CACHED_DEV_STOP_MODE_MAX,
 };
 
 struct cached_dev {
@@ -320,6 +328,9 @@ struct cached_dev {
 	 */
 	atomic_t		has_dirty;
 
+#define BCH_CACHE_READA_ALL		0
+#define BCH_CACHE_READA_META_ONLY	1
+	unsigned int		cache_readahead_policy;
 	struct bch_ratelimit	writeback_rate;
 	struct delayed_work	writeback_rate_update;
 
@@ -336,6 +347,7 @@ struct cached_dev {
 
 	struct keybuf		writeback_keys;
 
+	struct task_struct	*status_update_thread;
 	/* For tracking sequential IO */
 #define RECENT_IO_BITS	7
 #define RECENT_IO	(1 << RECENT_IO_BITS)
@@ -350,12 +362,14 @@ struct cached_dev {
 	unsigned		sequential_cutoff;
 	unsigned		readahead;
 
+	unsigned		io_disable:1;
 	unsigned		verify:1;
 	unsigned		bypass_torture_test:1;
 
 	unsigned		partial_stripes_expensive:1;
 	unsigned		writeback_metadata:1;
 	unsigned		writeback_running:1;
+	unsigned		writeback_consider_fragment:1;
 	unsigned char		writeback_percent;
 	unsigned		writeback_delay;
 
@@ -369,6 +383,17 @@ struct cached_dev {
 	unsigned		writeback_rate_i_term_inverse;
 	unsigned		writeback_rate_p_term_inverse;
 	unsigned		writeback_rate_minimum;
+	unsigned 		writeback_rate_fp_term_low;
+	unsigned 		writeback_rate_fp_term_mid;
+	unsigned 		writeback_rate_fp_term_high;
+
+	enum stop_on_failure	stop_when_cache_set_failed;
+#define DEFAULT_CACHED_DEV_ERROR_LIMIT	64
+	atomic_t		io_errors;
+	unsigned		error_limit;
+	unsigned		offline_seconds;
+
+	char			backing_dev_name[BDEVNAME_SIZE];
 };
 
 enum alloc_reserve {
@@ -441,6 +466,8 @@ struct cache {
 	atomic_long_t		meta_sectors_written;
 	atomic_long_t		btree_sectors_written;
 	atomic_long_t		sectors_written;
+
+	char			cache_dev_name[BDEVNAME_SIZE];
 };
 
 struct gc_stat {
@@ -465,10 +492,15 @@ struct gc_stat {
  *
  * CACHE_SET_RUNNING means all cache devices have been registered and journal
  * replay is complete.
+ *
+ * CACHE_SET_IO_DISABLE is set when bcache is stopping the whold cache set, all
+ * external and internal I/O should be denied when this flag is set.
+ *
  */
 #define CACHE_SET_UNREGISTERING		0
 #define	CACHE_SET_STOPPING		1
 #define	CACHE_SET_RUNNING		2
+#define CACHE_SET_IO_DISABLE		3
 
 struct cache_set {
 	struct closure		cl;
@@ -548,6 +580,7 @@ struct cache_set {
 	 */
 	wait_queue_head_t	btree_cache_wait;
 	struct task_struct	*btree_cache_alloc_lock;
+	spinlock_t		btree_cannibalize_lock;
 
 	/*
 	 * When we free a btree node, we increment the gen of the bucket the
@@ -648,6 +681,10 @@ struct cache_set {
 	atomic_long_t		writeback_keys_done;
 	atomic_long_t		writeback_keys_failed;
 
+	atomic_long_t		reclaim;
+	atomic_long_t		flush_write;
+	atomic_long_t		retry_flush_write;
+
 	enum			{
 		ON_ERROR_UNREGISTER,
 		ON_ERROR_PANIC,
@@ -665,6 +702,8 @@ struct cache_set {
 
 #define BUCKET_HASH_BITS	12
 	struct hlist_head	bucket_hash[1 << BUCKET_HASH_BITS];
+
+	DECLARE_HEAP(struct btree *, flush_btree);
 };
 
 struct bbio {
@@ -850,8 +889,36 @@ static inline void wake_up_allocators(struct cache_set *c)
 		wake_up_process(ca->alloc_thread);
 }
 
+static inline void closure_bio_submit(struct cache_set *c,
+				      struct bio *bio,
+				      struct closure *cl)
+{
+	closure_get(cl);
+	if (unlikely(test_bit(CACHE_SET_IO_DISABLE, &c->flags))) {
+		bio->bi_status = BLK_STS_IOERR;
+		bio_endio(bio);
+		return;
+	}
+	generic_make_request(bio);
+}
+
+/*
+ * Prevent the kthread exits directly, and make sure when kthread_stop()
+ * is called to stop a kthread, it is still alive. If a kthread might be
+ * stopped by CACHE_SET_IO_DISABLE bit set, wait_for_kthread_stop() is
+ * necessary before the kthread returns.
+ */
+static inline void wait_for_kthread_stop(void)
+{
+	while (!kthread_should_stop()) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule();
+	}
+}
+
 /* Forward declarations */
 
+void bch_count_backing_io_errors(struct cached_dev *dc, struct bio *bio);
 void bch_count_io_errors(struct cache *, blk_status_t, const char *);
 void bch_bbio_count_io_errors(struct cache_set *, struct bio *,
 			      blk_status_t, const char *);
@@ -879,15 +946,15 @@ int bch_bucket_alloc_set(struct cache_set *, unsigned,
 			 struct bkey *, int, bool);
 bool bch_alloc_sectors(struct cache_set *, struct bkey *, unsigned,
 		       unsigned, unsigned, bool);
+bool bch_cached_dev_error(struct cached_dev *dc);
 
 __printf(2, 3)
 bool bch_cache_set_error(struct cache_set *, const char *, ...);
 
-void bch_prio_write(struct cache *);
+int bch_prio_write(struct cache *ca, bool wait);
 void bch_write_bdev_super(struct cached_dev *, struct closure *);
 
 extern struct workqueue_struct *bcache_wq;
-extern const char * const bch_cache_modes[];
 extern struct mutex bch_register_lock;
 extern struct list_head bch_cache_sets;
 
@@ -907,8 +974,9 @@ void bcache_write_super(struct cache_set *);
 
 int bch_flash_dev_create(struct cache_set *c, uint64_t size);
 
-int bch_cached_dev_attach(struct cached_dev *, struct cache_set *);
+int bch_cached_dev_attach(struct cached_dev *, struct cache_set *, uint8_t *);
 void bch_cached_dev_detach(struct cached_dev *);
+void bch_cached_dev_emit_change(struct cached_dev *);
 void bch_cached_dev_run(struct cached_dev *);
 void bcache_device_stop(struct bcache_device *);
 

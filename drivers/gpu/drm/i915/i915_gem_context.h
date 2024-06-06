@@ -157,7 +157,6 @@ struct i915_gem_context {
 		u32 *lrc_reg_state;
 		u64 lrc_desc;
 		int pin_count;
-		bool initialised;
 	} engine[I915_NUM_ENGINES];
 
 	/** ring_size: size for allocating the per-engine ring buffer */
@@ -180,6 +179,12 @@ struct i915_gem_context {
 
 	/** remap_slice: Bitmask of cache lines that need remapping */
 	u8 remap_slice;
+
+	/** jump_whitelist: Bit array for tracking cmds during cmdparsing */
+	unsigned long *jump_whitelist;
+
+	/** jump_whitelist_cmds: No of cmd slots available */
+	u32 jump_whitelist_cmds;
 
 	/** handles_vma: rbtree to look up our context specific obj/vma for
 	 * the user handle. (user handles are per fd, but the binding is
@@ -291,6 +296,9 @@ int i915_gem_context_setparam_ioctl(struct drm_device *dev, void *data,
 				    struct drm_file *file_priv);
 int i915_gem_context_reset_stats_ioctl(struct drm_device *dev, void *data,
 				       struct drm_file *file);
+
+struct i915_gem_context *
+i915_gem_context_create_kernel(struct drm_i915_private *i915, int prio);
 
 static inline struct i915_gem_context *
 i915_gem_context_get(struct i915_gem_context *ctx)

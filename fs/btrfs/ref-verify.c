@@ -310,6 +310,8 @@ static struct block_entry *add_block_entry(struct btrfs_fs_info *fs_info,
 			exist_re = insert_root_entry(&exist->roots, re);
 			if (exist_re)
 				kfree(re);
+		} else {
+			kfree(re);
 		}
 		kfree(be);
 		return exist;
@@ -524,7 +526,7 @@ static int process_leaf(struct btrfs_root *root,
 	struct btrfs_extent_data_ref *dref;
 	struct btrfs_shared_data_ref *sref;
 	u32 count;
-	int i = 0, tree_block_level = 0, ret;
+	int i = 0, tree_block_level = 0, ret = 0;
 	struct btrfs_key key;
 	int nritems = btrfs_header_nritems(leaf);
 
@@ -579,11 +581,16 @@ static int walk_down_tree(struct btrfs_root *root, struct btrfs_path *path,
 
 	while (level >= 0) {
 		if (level) {
+			struct btrfs_key first_key;
+
 			block_bytenr = btrfs_node_blockptr(path->nodes[level],
 							   path->slots[level]);
 			gen = btrfs_node_ptr_generation(path->nodes[level],
 							path->slots[level]);
-			eb = read_tree_block(fs_info, block_bytenr, gen);
+			btrfs_node_key_to_cpu(path->nodes[level], &first_key,
+					      path->slots[level]);
+			eb = read_tree_block(fs_info, block_bytenr, gen,
+					     level - 1, &first_key);
 			if (IS_ERR(eb))
 				return PTR_ERR(eb);
 			if (!extent_buffer_uptodate(eb)) {
@@ -756,6 +763,7 @@ int btrfs_ref_tree_mod(struct btrfs_root *root, u64 bytenr, u64 num_bytes,
 		 */
 		be = add_block_entry(root->fs_info, bytenr, num_bytes, ref_root);
 		if (IS_ERR(be)) {
+			kfree(ref);
 			kfree(ra);
 			ret = PTR_ERR(be);
 			goto out;
@@ -769,6 +777,8 @@ int btrfs_ref_tree_mod(struct btrfs_root *root, u64 bytenr, u64 num_bytes,
 			"re-allocated a block that still has references to it!");
 			dump_block_entry(fs_info, be);
 			dump_ref_action(fs_info, ra);
+			kfree(ref);
+			kfree(ra);
 			goto out_unlock;
 		}
 
@@ -831,6 +841,7 @@ int btrfs_ref_tree_mod(struct btrfs_root *root, u64 bytenr, u64 num_bytes,
 "dropping a ref for a existing root that doesn't have a ref on the block");
 				dump_block_entry(fs_info, be);
 				dump_ref_action(fs_info, ra);
+				kfree(ref);
 				kfree(ra);
 				goto out_unlock;
 			}
@@ -846,6 +857,7 @@ int btrfs_ref_tree_mod(struct btrfs_root *root, u64 bytenr, u64 num_bytes,
 "attempting to add another ref for an existing ref on a tree block");
 			dump_block_entry(fs_info, be);
 			dump_ref_action(fs_info, ra);
+			kfree(ref);
 			kfree(ra);
 			goto out_unlock;
 		}
@@ -856,6 +868,7 @@ int btrfs_ref_tree_mod(struct btrfs_root *root, u64 bytenr, u64 num_bytes,
 "dropping a ref for a root that doesn't have a ref on the block");
 			dump_block_entry(fs_info, be);
 			dump_ref_action(fs_info, ra);
+			kfree(ref);
 			kfree(ra);
 			goto out_unlock;
 		}

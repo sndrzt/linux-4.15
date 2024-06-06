@@ -60,6 +60,7 @@ enum rxrpc_client_trace {
 	rxrpc_client_chan_disconnect,
 	rxrpc_client_chan_pass,
 	rxrpc_client_chan_unstarted,
+	rxrpc_client_chan_wait_failed,
 	rxrpc_client_cleanup,
 	rxrpc_client_count,
 	rxrpc_client_discard,
@@ -232,6 +233,7 @@ enum rxrpc_congest_change {
 	EM(rxrpc_client_chan_disconnect,	"ChDisc") \
 	EM(rxrpc_client_chan_pass,		"ChPass") \
 	EM(rxrpc_client_chan_unstarted,		"ChUnst") \
+	EM(rxrpc_client_chan_wait_failed,	"ChWtFl") \
 	EM(rxrpc_client_cleanup,		"Clean ") \
 	EM(rxrpc_client_count,			"Count ") \
 	EM(rxrpc_client_discard,		"Discar") \
@@ -363,7 +365,7 @@ enum rxrpc_congest_change {
 	EM(rxrpc_cong_begin_retransmission,	" Retrans") \
 	EM(rxrpc_cong_cleared_nacks,		" Cleared") \
 	EM(rxrpc_cong_new_low_nack,		" NewLowN") \
-	EM(rxrpc_cong_no_change,		"") \
+	EM(rxrpc_cong_no_change,		" -") \
 	EM(rxrpc_cong_progress,			" Progres") \
 	EM(rxrpc_cong_retransmit_again,		" ReTxAgn") \
 	EM(rxrpc_cong_rtt_window_end,		" RttWinE") \

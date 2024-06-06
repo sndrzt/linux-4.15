@@ -816,6 +816,7 @@ struct ath_hw {
 	struct ath9k_pacal_info pacal_info;
 	struct ar5416Stats stats;
 	struct ath9k_tx_queue_info txq[ATH9K_NUM_TX_QUEUES];
+	DECLARE_BITMAP(pending_del_keymap, ATH_KEYMAX);
 
 	enum ath9k_int imask;
 	u32 imrs2_reg;
@@ -977,6 +978,9 @@ struct ath_hw {
 	bool tpc_enabled;
 	u8 tx_power[Ar5416RateSize];
 	u8 tx_power_stbc[Ar5416RateSize];
+	bool msi_enabled;
+	u32 msi_mask;
+	u32 msi_reg;
 };
 
 struct ath_bus_ops {

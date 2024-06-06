@@ -57,9 +57,12 @@ struct xattr;
 struct xfrm_sec_ctx;
 struct mm_struct;
 
+/* Default (no) options for the capable function */
+#define CAP_OPT_NONE 0x0
 /* If capable should audit the security request */
-#define SECURITY_CAP_NOAUDIT 0
-#define SECURITY_CAP_AUDIT 1
+#define CAP_OPT_NOAUDIT BIT(1)
+/* If capable is being called by a setid function */
+#define CAP_OPT_INSETID BIT(2)
 
 /* LSM Agnostic defines for sb_set_mnt_opts */
 #define SECURITY_LSM_NATIVE_LABELS	1
@@ -75,7 +78,7 @@ enum lsm_event {
 
 /* These functions are in security/commoncap.c */
 extern int cap_capable(const struct cred *cred, struct user_namespace *ns,
-		       int cap, int audit);
+		       int cap, unsigned int opts);
 extern int cap_settime(const struct timespec64 *ts, const struct timezone *tz);
 extern int cap_ptrace_access_check(struct task_struct *child, unsigned int mode);
 extern int cap_ptrace_traceme(struct task_struct *parent);
@@ -214,10 +217,10 @@ int security_capset(struct cred *new, const struct cred *old,
 		    const kernel_cap_t *effective,
 		    const kernel_cap_t *inheritable,
 		    const kernel_cap_t *permitted);
-int security_capable(const struct cred *cred, struct user_namespace *ns,
-			int cap);
-int security_capable_noaudit(const struct cred *cred, struct user_namespace *ns,
-			     int cap);
+int security_capable(const struct cred *cred,
+		       struct user_namespace *ns,
+		       int cap,
+		       unsigned int opts);
 int security_quotactl(int cmds, int type, int id, struct super_block *sb);
 int security_quota_on(struct dentry *dentry);
 int security_syslog(int type);
@@ -375,8 +378,10 @@ int security_sem_semctl(struct sem_array *sma, int cmd);
 int security_sem_semop(struct sem_array *sma, struct sembuf *sops,
 			unsigned nsops, int alter);
 void security_d_instantiate(struct dentry *dentry, struct inode *inode);
-int security_getprocattr(struct task_struct *p, char *name, char **value);
-int security_setprocattr(const char *name, void *value, size_t size);
+int security_getprocattr(struct task_struct *p, const char *lsm, char *name,
+			 char **value);
+int security_setprocattr(const char *lsm, const char *name, void *value,
+			 size_t size);
 int security_netlink_send(struct sock *sk, struct sk_buff *skb);
 int security_ismaclabel(const char *name);
 int security_secid_to_secctx(u32 secid, char **secdata, u32 *seclen);
@@ -477,14 +482,11 @@ static inline int security_capset(struct cred *new,
 }
 
 static inline int security_capable(const struct cred *cred,
-				   struct user_namespace *ns, int cap)
+				   struct user_namespace *ns,
+				   int cap,
+				   unsigned int opts)
 {
-	return cap_capable(cred, ns, cap, SECURITY_CAP_AUDIT);
-}
-
-static inline int security_capable_noaudit(const struct cred *cred,
-					   struct user_namespace *ns, int cap) {
-	return cap_capable(cred, ns, cap, SECURITY_CAP_NOAUDIT);
+	return cap_capable(cred, ns, cap, opts);
 }
 
 static inline int security_quotactl(int cmds, int type, int id,
@@ -780,7 +782,7 @@ static inline int security_inode_killpriv(struct dentry *dentry)
 
 static inline int security_inode_getsecurity(struct inode *inode, const char *name, void **buffer, bool alloc)
 {
-	return -EOPNOTSUPP;
+	return cap_inode_getsecurity(inode, name, buffer, alloc);
 }
 
 static inline int security_inode_setsecurity(struct inode *inode, const char *name, const void *value, size_t size, int flags)
@@ -1128,15 +1130,18 @@ static inline int security_sem_semop(struct sem_array *sma,
 	return 0;
 }
 
-static inline void security_d_instantiate(struct dentry *dentry, struct inode *inode)
+static inline void security_d_instantiate(struct dentry *dentry,
+					  struct inode *inode)
 { }
 
-static inline int security_getprocattr(struct task_struct *p, char *name, char **value)
+static inline int security_getprocattr(struct task_struct *p, const char *lsm,
+				       char *name, char **value)
 {
 	return -EINVAL;
 }
 
-static inline int security_setprocattr(char *name, void *value, size_t size)
+static inline int security_setprocattr(const char *lsm, char *name,
+				       void *value, size_t size)
 {
 	return -EINVAL;
 }
@@ -1800,6 +1805,14 @@ static inline char *alloc_secdata(void)
 static inline void free_secdata(void *secdata)
 { }
 #endif /* CONFIG_SECURITY */
+
+#ifdef CONFIG_LOCK_DOWN_KERNEL
+extern void __init init_lockdown(void);
+#else
+static inline void __init init_lockdown(void)
+{
+}
+#endif
 
 #endif /* ! __LINUX_SECURITY_H */
 

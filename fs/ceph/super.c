@@ -45,7 +45,7 @@ static void ceph_put_super(struct super_block *s)
 static int ceph_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	struct ceph_fs_client *fsc = ceph_inode_to_client(d_inode(dentry));
-	struct ceph_monmap *monmap = fsc->client->monc.monmap;
+	struct ceph_mon_client *monc = &fsc->client->monc;
 	struct ceph_statfs st;
 	u64 fsid;
 	int err;
@@ -58,7 +58,7 @@ static int ceph_statfs(struct dentry *dentry, struct kstatfs *buf)
 	}
 
 	dout("statfs\n");
-	err = ceph_monc_do_statfs(&fsc->client->monc, data_pool, &st);
+	err = ceph_monc_do_statfs(monc, data_pool, &st);
 	if (err < 0)
 		return err;
 
@@ -85,14 +85,16 @@ static int ceph_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_namelen = NAME_MAX;
 
 	/* Must convert the fsid, for consistent values across arches */
-	fsid = le64_to_cpu(*(__le64 *)(&monmap->fsid)) ^
-	       le64_to_cpu(*((__le64 *)&monmap->fsid + 1));
+	mutex_lock(&monc->mutex);
+	fsid = le64_to_cpu(*(__le64 *)(&monc->monmap->fsid)) ^
+	       le64_to_cpu(*((__le64 *)&monc->monmap->fsid + 1));
+	mutex_unlock(&monc->mutex);
+
 	buf->f_fsid.val[0] = fsid & 0xffffffff;
 	buf->f_fsid.val[1] = fsid >> 32;
 
 	return 0;
 }
-
 
 static int ceph_sync_fs(struct super_block *sb, int wait)
 {
@@ -190,6 +192,26 @@ static match_table_t fsopt_tokens = {
 	{-1, NULL}
 };
 
+/*
+ * Remove adjacent slashes and then the trailing slash, unless it is
+ * the only remaining character.
+ *
+ * E.g. "//dir1////dir2///" --> "/dir1/dir2", "///" --> "/".
+ */
+static void canonicalize_path(char *path)
+{
+	int i, j = 0;
+
+	for (i = 0; path[i] != '\0'; i++) {
+		if (path[i] != '/' || j < 1 || path[j - 1] != '/')
+			path[j++] = path[i];
+	}
+
+	if (j > 1 && path[j - 1] == '/')
+		j--;
+	path[j] = '\0';
+}
+
 static int parse_fsopt_token(char *c, void *private)
 {
 	struct ceph_mount_options *fsopt = private;
@@ -225,6 +247,7 @@ static int parse_fsopt_token(char *c, void *private)
 			return -ENOMEM;
 		break;
 	case Opt_mds_namespace:
+		kfree(fsopt->mds_namespace);
 		fsopt->mds_namespace = kstrndup(argstr[0].from,
 						argstr[0].to-argstr[0].from,
 						GFP_KERNEL);
@@ -232,6 +255,8 @@ static int parse_fsopt_token(char *c, void *private)
 			return -ENOMEM;
 		break;
 	case Opt_fscache_uniq:
+#ifdef CONFIG_CEPH_FSCACHE
+		kfree(fsopt->fscache_uniq);
 		fsopt->fscache_uniq = kstrndup(argstr[0].from,
 					       argstr[0].to-argstr[0].from,
 					       GFP_KERNEL);
@@ -239,7 +264,10 @@ static int parse_fsopt_token(char *c, void *private)
 			return -ENOMEM;
 		fsopt->flags |= CEPH_MOUNT_OPT_FSCACHE;
 		break;
-		/* misc */
+#else
+		pr_err("fscache support is disabled\n");
+		return -EINVAL;
+#endif
 	case Opt_wsize:
 		if (intval < PAGE_SIZE || intval > CEPH_MAX_WRITE_SIZE)
 			return -EINVAL;
@@ -253,7 +281,7 @@ static int parse_fsopt_token(char *c, void *private)
 	case Opt_rasize:
 		if (intval < 0)
 			return -EINVAL;
-		fsopt->rasize = ALIGN(intval + PAGE_SIZE - 1, PAGE_SIZE);
+		fsopt->rasize = ALIGN(intval, PAGE_SIZE);
 		break;
 	case Opt_caps_wanted_delay_min:
 		if (intval < 1)
@@ -311,8 +339,13 @@ static int parse_fsopt_token(char *c, void *private)
 		fsopt->flags &= ~CEPH_MOUNT_OPT_INO32;
 		break;
 	case Opt_fscache:
+#ifdef CONFIG_CEPH_FSCACHE
 		fsopt->flags |= CEPH_MOUNT_OPT_FSCACHE;
 		break;
+#else
+		pr_err("fscache support is disabled\n");
+		return -EINVAL;
+#endif
 	case Opt_nofscache:
 		fsopt->flags &= ~CEPH_MOUNT_OPT_FSCACHE;
 		break;
@@ -380,12 +413,15 @@ static int compare_mount_options(struct ceph_mount_options *new_fsopt,
 	ret = strcmp_null(fsopt1->snapdir_name, fsopt2->snapdir_name);
 	if (ret)
 		return ret;
+
 	ret = strcmp_null(fsopt1->mds_namespace, fsopt2->mds_namespace);
 	if (ret)
 		return ret;
+
 	ret = strcmp_null(fsopt1->server_path, fsopt2->server_path);
 	if (ret)
 		return ret;
+
 	ret = strcmp_null(fsopt1->fscache_uniq, fsopt2->fscache_uniq);
 	if (ret)
 		return ret;
@@ -441,13 +477,17 @@ static int parse_mount_options(struct ceph_mount_options **pfsopt,
 	 */
 	dev_name_end = strchr(dev_name, '/');
 	if (dev_name_end) {
-		if (strlen(dev_name_end) > 1) {
-			fsopt->server_path = kstrdup(dev_name_end, GFP_KERNEL);
-			if (!fsopt->server_path) {
-				err = -ENOMEM;
-				goto out;
-			}
+		/*
+		 * The server_path will include the whole chars from userland
+		 * including the leading '/'.
+		 */
+		fsopt->server_path = kstrdup(dev_name_end, GFP_KERNEL);
+		if (!fsopt->server_path) {
+			err = -ENOMEM;
+			goto out;
 		}
+
+		canonicalize_path(fsopt->server_path);
 	} else {
 		dev_name_end = dev_name + strlen(dev_name);
 	}
@@ -575,6 +615,8 @@ static int extra_mon_dispatch(struct ceph_client *client, struct ceph_msg *msg)
 
 /*
  * create a new fs client
+ *
+ * Success or not, this function consumes @fsopt and @opt.
  */
 static struct ceph_fs_client *create_fs_client(struct ceph_mount_options *fsopt,
 					struct ceph_options *opt)
@@ -582,17 +624,21 @@ static struct ceph_fs_client *create_fs_client(struct ceph_mount_options *fsopt,
 	struct ceph_fs_client *fsc;
 	int page_count;
 	size_t size;
-	int err = -ENOMEM;
+	int err;
 
 	fsc = kzalloc(sizeof(*fsc), GFP_KERNEL);
-	if (!fsc)
-		return ERR_PTR(-ENOMEM);
+	if (!fsc) {
+		err = -ENOMEM;
+		goto fail;
+	}
 
 	fsc->client = ceph_create_client(opt, fsc);
 	if (IS_ERR(fsc->client)) {
 		err = PTR_ERR(fsc->client);
 		goto fail;
 	}
+	opt = NULL; /* fsc->client now owns this */
+
 	fsc->client->extra_mon_dispatch = extra_mon_dispatch;
 
 	if (!fsopt->mds_namespace) {
@@ -615,15 +661,12 @@ static struct ceph_fs_client *create_fs_client(struct ceph_mount_options *fsopt,
 	 * The number of concurrent works can be high but they don't need
 	 * to be processed in parallel, limit concurrency.
 	 */
-	fsc->wb_wq = alloc_workqueue("ceph-writeback", 0, 1);
-	if (!fsc->wb_wq)
+	fsc->inode_wq = alloc_workqueue("ceph-inode", WQ_UNBOUND, 0);
+	if (!fsc->inode_wq)
 		goto fail_client;
-	fsc->pg_inv_wq = alloc_workqueue("ceph-pg-invalid", 0, 1);
-	if (!fsc->pg_inv_wq)
-		goto fail_wb_wq;
-	fsc->trunc_wq = alloc_workqueue("ceph-trunc", 0, 1);
-	if (!fsc->trunc_wq)
-		goto fail_pg_inv_wq;
+	fsc->cap_wq = alloc_workqueue("ceph-cap", 0, 1);
+	if (!fsc->cap_wq)
+		goto fail_inode_wq;
 
 	/* set up mempools */
 	err = -ENOMEM;
@@ -631,33 +674,39 @@ static struct ceph_fs_client *create_fs_client(struct ceph_mount_options *fsopt,
 	size = sizeof (struct page *) * (page_count ? page_count : 1);
 	fsc->wb_pagevec_pool = mempool_create_kmalloc_pool(10, size);
 	if (!fsc->wb_pagevec_pool)
-		goto fail_trunc_wq;
+		goto fail_cap_wq;
 
 	/* caps */
 	fsc->min_caps = fsopt->max_readdir;
 
 	return fsc;
 
-fail_trunc_wq:
-	destroy_workqueue(fsc->trunc_wq);
-fail_pg_inv_wq:
-	destroy_workqueue(fsc->pg_inv_wq);
-fail_wb_wq:
-	destroy_workqueue(fsc->wb_wq);
+fail_cap_wq:
+	destroy_workqueue(fsc->cap_wq);
+fail_inode_wq:
+	destroy_workqueue(fsc->inode_wq);
 fail_client:
 	ceph_destroy_client(fsc->client);
 fail:
 	kfree(fsc);
+	if (opt)
+		ceph_destroy_options(opt);
+	destroy_mount_options(fsopt);
 	return ERR_PTR(err);
+}
+
+static void flush_fs_workqueues(struct ceph_fs_client *fsc)
+{
+	flush_workqueue(fsc->inode_wq);
+	flush_workqueue(fsc->cap_wq);
 }
 
 static void destroy_fs_client(struct ceph_fs_client *fsc)
 {
 	dout("destroy_fs_client %p\n", fsc);
 
-	destroy_workqueue(fsc->wb_wq);
-	destroy_workqueue(fsc->pg_inv_wq);
-	destroy_workqueue(fsc->trunc_wq);
+	destroy_workqueue(fsc->inode_wq);
+	destroy_workqueue(fsc->cap_wq);
 
 	mempool_destroy(fsc->wb_pagevec_pool);
 
@@ -711,14 +760,17 @@ static int __init init_caches(void)
 		goto bad_dentry;
 
 	ceph_file_cachep = KMEM_CACHE(ceph_file_info, SLAB_MEM_SPREAD);
-
 	if (!ceph_file_cachep)
 		goto bad_file;
 
-	if ((error = ceph_fscache_register()))
-		goto bad_file;
+	error = ceph_fscache_register();
+	if (error)
+		goto bad_fscache;
 
 	return 0;
+
+bad_fscache:
+	kmem_cache_destroy(ceph_file_cachep);
 bad_file:
 	kmem_cache_destroy(ceph_dentry_cachep);
 bad_dentry:
@@ -747,7 +799,6 @@ static void destroy_caches(void)
 	ceph_fscache_unregister();
 }
 
-
 /*
  * ceph_umount_begin - initiate forced umount.  Tear down down the
  * mount, skipping steps that may hang while waiting for server(s).
@@ -764,13 +815,21 @@ static void ceph_umount_begin(struct super_block *sb)
 	return;
 }
 
+static int ceph_remount(struct super_block *sb, int *flags, char *data)
+{
+	sync_filesystem(sb);
+	return 0;
+}
+
 static const struct super_operations ceph_super_ops = {
 	.alloc_inode	= ceph_alloc_inode,
 	.destroy_inode	= ceph_destroy_inode,
 	.write_inode    = ceph_write_inode,
 	.drop_inode	= ceph_drop_inode,
+	.evict_inode	= ceph_evict_inode,
 	.sync_fs        = ceph_sync_fs,
 	.put_super	= ceph_put_super,
+	.remount_fs	= ceph_remount,
 	.show_options   = ceph_show_options,
 	.statfs		= ceph_statfs,
 	.umount_begin   = ceph_umount_begin,
@@ -825,9 +884,6 @@ out:
 	return root;
 }
 
-
-
-
 /*
  * mount: join the ceph cluster, and open root directory.
  */
@@ -836,13 +892,14 @@ static struct dentry *ceph_real_mount(struct ceph_fs_client *fsc)
 	int err;
 	unsigned long started = jiffies;  /* note the start time */
 	struct dentry *root;
-	int first = 0;   /* first vfsmount for this super_block */
 
 	dout("mount start %p\n", fsc);
 	mutex_lock(&fsc->client->mount_mutex);
 
 	if (!fsc->sb->s_root) {
-		const char *path;
+		const char *path = fsc->mount_options->server_path ?
+				     fsc->mount_options->server_path + 1 : "";
+
 		err = __ceph_open_session(fsc->client, started);
 		if (err < 0)
 			goto out;
@@ -854,24 +911,18 @@ static struct dentry *ceph_real_mount(struct ceph_fs_client *fsc)
 				goto out;
 		}
 
-		if (!fsc->mount_options->server_path) {
-			path = "";
-			dout("mount opening path \\t\n");
-		} else {
-			path = fsc->mount_options->server_path + 1;
-			dout("mount opening path %s\n", path);
-		}
+		dout("mount opening path '%s'\n", path);
+
+		err = ceph_fs_debugfs_init(fsc);
+		if (err < 0)
+			goto out;
+
 		root = open_root_dentry(fsc, path, started);
 		if (IS_ERR(root)) {
 			err = PTR_ERR(root);
 			goto out;
 		}
 		fsc->sb->s_root = dget(root);
-		first = 1;
-
-		err = ceph_fs_debugfs_init(fsc);
-		if (err < 0)
-			goto fail;
 	} else {
 		root = dget(fsc->sb->s_root);
 	}
@@ -881,11 +932,6 @@ static struct dentry *ceph_real_mount(struct ceph_fs_client *fsc)
 	mutex_unlock(&fsc->client->mount_mutex);
 	return root;
 
-fail:
-	if (first) {
-		dput(fsc->sb->s_root);
-		fsc->sb->s_root = NULL;
-	}
 out:
 	mutex_unlock(&fsc->client->mount_mutex);
 	return ERR_PTR(err);
@@ -1000,8 +1046,6 @@ static struct dentry *ceph_mount(struct file_system_type *fs_type,
 	fsc = create_fs_client(fsopt, opt);
 	if (IS_ERR(fsc)) {
 		res = ERR_CAST(fsc);
-		destroy_mount_options(fsopt);
-		ceph_destroy_options(opt);
 		goto out_final;
 	}
 
@@ -1041,6 +1085,11 @@ static struct dentry *ceph_mount(struct file_system_type *fs_type,
 	return res;
 
 out_splat:
+	if (!ceph_mdsmap_is_cluster_available(fsc->mdsc->mdsmap)) {
+		pr_info("No mds server is up or the cluster is laggy\n");
+		err = -EHOSTUNREACH;
+	}
+
 	ceph_mdsc_close_sessions(fsc->mdsc);
 	deactivate_locked_super(sb);
 	goto out_final;
@@ -1061,6 +1110,8 @@ static void ceph_kill_sb(struct super_block *s)
 	dout("kill_sb %p\n", s);
 
 	ceph_mdsc_pre_umount(fsc->mdsc);
+	flush_fs_workqueues(fsc);
+
 	generic_shutdown_super(s);
 
 	fsc->client->extra_mon_dispatch = NULL;

@@ -85,6 +85,18 @@ struct qeth_dbf_info {
 #define SENSE_RESETTING_EVENT_BYTE 1
 #define SENSE_RESETTING_EVENT_FLAG 0x80
 
+static inline u32 qeth_get_device_id(struct ccw_device *cdev)
+{
+	struct ccw_dev_id dev_id;
+	u32 id;
+
+	ccw_device_get_id(cdev, &dev_id);
+	id = dev_id.devno;
+	id |= (u32) (dev_id.ssid << 16);
+
+	return id;
+}
+
 /*
  * Common IO related definitions
  */
@@ -95,7 +107,8 @@ struct qeth_dbf_info {
 #define CARD_RDEV_ID(card) dev_name(&card->read.ccwdev->dev)
 #define CARD_WDEV_ID(card) dev_name(&card->write.ccwdev->dev)
 #define CARD_DDEV_ID(card) dev_name(&card->data.ccwdev->dev)
-#define CHANNEL_ID(channel) dev_name(&channel->ccwdev->dev)
+#define CCW_DEVID(cdev)		(qeth_get_device_id(cdev))
+#define CARD_DEVID(card)	(CCW_DEVID(CARD_RDEV(card)))
 
 /**
  * card stuff
@@ -198,6 +211,12 @@ struct qeth_vnicc_info {
 	bool rx_bcast_enabled;
 };
 
+static inline int qeth_is_adp_supported(struct qeth_ipa_info *ipa,
+		enum qeth_ipa_setadp_cmd func)
+{
+	return (ipa->supported_funcs & func);
+}
+
 static inline int qeth_is_ipa_supported(struct qeth_ipa_info *ipa,
 		enum qeth_ipa_funcs func)
 {
@@ -211,9 +230,7 @@ static inline int qeth_is_ipa_enabled(struct qeth_ipa_info *ipa,
 }
 
 #define qeth_adp_supported(c, f) \
-	qeth_is_ipa_supported(&c->options.adp, f)
-#define qeth_adp_enabled(c, f) \
-	qeth_is_ipa_enabled(&c->options.adp, f)
+	qeth_is_adp_supported(&c->options.adp, f)
 #define qeth_is_supported(c, f) \
 	qeth_is_ipa_supported(&c->options.ipa4, f)
 #define qeth_is_enabled(c, f) \
@@ -555,7 +572,6 @@ enum qeth_ip_types {
 enum qeth_cmd_buffer_state {
 	BUF_STATE_FREE,
 	BUF_STATE_LOCKED,
-	BUF_STATE_PROCESSED,
 };
 
 enum qeth_cq {
@@ -581,6 +597,11 @@ struct qeth_cmd_buffer {
 	void (*callback) (struct qeth_channel *, struct qeth_cmd_buffer *);
 };
 
+static inline struct qeth_ipa_cmd *__ipa_cmd(struct qeth_cmd_buffer *iob)
+{
+	return (struct qeth_ipa_cmd *)(iob->data + IPA_PDU_HEADER_SIZE);
+}
+
 /**
  * definition of a qeth channel, used for read and write
  */
@@ -594,7 +615,6 @@ struct qeth_channel {
 	struct qeth_cmd_buffer iob[QETH_CMD_BUFFER_NO];
 	atomic_t irq_pending;
 	int io_buf_no;
-	int buf_no;
 };
 
 /**
@@ -643,7 +663,6 @@ struct qeth_card_blkt {
 
 #define QETH_BROADCAST_WITH_ECHO    0x01
 #define QETH_BROADCAST_WITHOUT_ECHO 0x02
-#define QETH_LAYER2_MAC_READ	    0x01
 #define QETH_LAYER2_MAC_REGISTERED  0x02
 struct qeth_card_info {
 	unsigned short unit_addr2;
@@ -686,6 +705,8 @@ struct qeth_card_options {
 	enum qeth_cq cq;
 	char hsuid[9];
 };
+
+#define	IS_LAYER2(card)	((card)->options.layer2 == QETH_DISCIPLINE_LAYER2)
 
 /*
  * thread bits for qeth_card thread masks
@@ -826,6 +847,17 @@ struct qeth_trap_id {
 /*some helper functions*/
 #define QETH_CARD_IFNAME(card) (((card)->dev)? (card)->dev->name : "")
 
+static inline void qeth_scrub_qdio_buffer(struct qdio_buffer *buf,
+					  unsigned int elements)
+{
+	unsigned int i;
+
+	for (i = 0; i < elements; i++)
+		memset(&buf->element[i], 0, sizeof(struct qdio_buffer_element));
+	buf->element[14].sflags = 0;
+	buf->element[15].sflags = 0;
+}
+
 /**
  * qeth_get_elements_for_range() -	find number of SBALEs to cover range.
  * @start:				Start of the address range.
@@ -836,7 +868,7 @@ struct qeth_trap_id {
  */
 static inline int qeth_get_elements_for_range(addr_t start, addr_t end)
 {
-	return PFN_UP(end - 1) - PFN_DOWN(start);
+	return PFN_UP(end) - PFN_DOWN(start);
 }
 
 static inline int qeth_get_micros(void)
@@ -985,7 +1017,7 @@ struct qeth_cmd_buffer *qeth_get_setassparms_cmd(struct qeth_card *,
 						 __u16, __u16,
 						 enum qeth_prot_versions);
 int qeth_set_features(struct net_device *, netdev_features_t);
-void qeth_recover_features(struct net_device *dev);
+void qeth_enable_hw_features(struct net_device *dev);
 netdev_features_t qeth_fix_features(struct net_device *, netdev_features_t);
 netdev_features_t qeth_features_check(struct sk_buff *skb,
 				      struct net_device *dev,

@@ -54,6 +54,11 @@ static int serdev_uevent(struct device *dev, struct kobj_uevent_env *env)
 	int rc;
 
 	/* TODO: platform modalias */
+
+	/* ACPI enumerated controllers do not have a modalias */
+	if (!dev->of_node && dev->type == &serdev_ctrl_type)
+		return 0;
+
 	rc = acpi_device_uevent_modalias(dev, env);
 	if (rc != -ENODEV)
 		return rc;
@@ -442,6 +447,12 @@ static acpi_status acpi_serdev_register_device(struct serdev_controller *ctrl,
 	return AE_OK;
 }
 
+static const struct acpi_device_id serdev_acpi_devices_blacklist[] = {
+	{ "INT3511", 0 },
+	{ "INT3512", 0 },
+	{ },
+};
+
 static acpi_status acpi_serdev_add_device(acpi_handle handle, u32 level,
 				       void *data, void **return_value)
 {
@@ -449,6 +460,10 @@ static acpi_status acpi_serdev_add_device(acpi_handle handle, u32 level,
 	struct acpi_device *adev;
 
 	if (acpi_bus_get_device(handle, &adev))
+		return AE_OK;
+
+	/* Skip if black listed */
+	if (!acpi_match_device_ids(adev, serdev_acpi_devices_blacklist))
 		return AE_OK;
 
 	return acpi_serdev_register_device(ctrl, adev);
@@ -569,6 +584,7 @@ EXPORT_SYMBOL_GPL(__serdev_device_driver_register);
 static void __exit serdev_exit(void)
 {
 	bus_unregister(&serdev_bus_type);
+	ida_destroy(&ctrl_ida);
 }
 module_exit(serdev_exit);
 

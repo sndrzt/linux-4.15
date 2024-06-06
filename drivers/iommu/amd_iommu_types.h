@@ -159,6 +159,7 @@
 #define CONTROL_GAM_EN          0x19ULL
 #define CONTROL_GALOG_EN        0x1CULL
 #define CONTROL_GAINT_EN        0x1DULL
+#define CONTROL_XT_EN           0x32ULL
 
 #define CTRL_INV_TO_MASK	(7 << CONTROL_INV_TIMEOUT)
 #define CTRL_INV_TO_NONE	0
@@ -255,7 +256,7 @@
 #define DTE_IRQ_REMAP_INTCTL_MASK	(0x3ULL << 60)
 #define DTE_IRQ_TABLE_LEN_MASK	(0xfULL << 1)
 #define DTE_IRQ_REMAP_INTCTL    (2ULL << 60)
-#define DTE_IRQ_TABLE_LEN       (8ULL << 1)
+#define DTE_IRQ_TABLE_LEN       (9ULL << 1)
 #define DTE_IRQ_REMAP_ENABLE    1ULL
 
 #define PAGE_MODE_NONE    0x00
@@ -348,7 +349,7 @@
 
 #define DTE_GCR3_VAL_A(x)	(((x) >> 12) & 0x00007ULL)
 #define DTE_GCR3_VAL_B(x)	(((x) >> 15) & 0x0ffffULL)
-#define DTE_GCR3_VAL_C(x)	(((x) >> 31) & 0xfffffULL)
+#define DTE_GCR3_VAL_C(x)	(((x) >> 31) & 0x1fffffULL)
 
 #define DTE_GCR3_INDEX_A	0
 #define DTE_GCR3_INDEX_B	1
@@ -369,15 +370,19 @@
 #define IOMMU_PROT_IR 0x01
 #define IOMMU_PROT_IW 0x02
 
+#define IOMMU_UNITY_MAP_FLAG_EXCL_RANGE	(1 << 2)
+
 /* IOMMU capabilities */
 #define IOMMU_CAP_IOTLB   24
 #define IOMMU_CAP_NPCACHE 26
 #define IOMMU_CAP_EFR     27
 
 /* IOMMU Feature Reporting Field (for IVHD type 10h */
+#define IOMMU_FEAT_XTSUP_SHIFT	0
 #define IOMMU_FEAT_GASUP_SHIFT	6
 
 /* IOMMU Extended Feature Register (EFR) */
+#define IOMMU_EFR_XTSUP_SHIFT	2
 #define IOMMU_EFR_GASUP_SHIFT	7
 
 #define MAX_DOMAIN_ID 65536
@@ -402,7 +407,11 @@ extern bool amd_iommu_np_cache;
 /* Only true if all IOMMUs support device IOTLBs */
 extern bool amd_iommu_iotlb_sup;
 
-#define MAX_IRQS_PER_TABLE	256
+/*
+ * AMD IOMMU hardware only support 512 IRTEs despite
+ * the architectural limitation of 2048 entries.
+ */
+#define MAX_IRQS_PER_TABLE	512
 #define IRQ_TABLE_ALIGNMENT	128
 
 struct irq_remap_table {
@@ -433,7 +442,6 @@ extern struct kmem_cache *amd_iommu_irq_cache;
 #define APERTURE_MAX_RANGES	32	/* allows 4GB of DMA address space */
 #define APERTURE_RANGE_INDEX(a)	((a) >> APERTURE_RANGE_SHIFT)
 #define APERTURE_PAGE_INDEX(a)	(((a) >> 21) & 0x3fULL)
-
 
 /*
  * This struct is used to pass information about
@@ -807,6 +815,9 @@ union irte {
 	} fields;
 };
 
+#define APICID_TO_IRTE_DEST_LO(x)    (x & 0xffffff)
+#define APICID_TO_IRTE_DEST_HI(x)    ((x >> 24) & 0xff)
+
 union irte_ga_lo {
 	u64 val;
 
@@ -820,8 +831,8 @@ union irte_ga_lo {
 		    dm		: 1,
 		    /* ------ */
 		    guest_mode	: 1,
-		    destination	: 8,
-		    rsvd	: 48;
+		    destination	: 24,
+		    ga_tag	: 32;
 	} fields_remap;
 
 	/* For guest vAPIC */
@@ -834,8 +845,7 @@ union irte_ga_lo {
 		    is_run	: 1,
 		    /* ------ */
 		    guest_mode	: 1,
-		    destination	: 8,
-		    rsvd2	: 16,
+		    destination	: 24,
 		    ga_tag	: 32;
 	} fields_vapic;
 };
@@ -846,7 +856,8 @@ union irte_ga_hi {
 		u64 vector	: 8,
 		    rsvd_1	: 4,
 		    ga_root_ptr	: 40,
-		    rsvd_2	: 12;
+		    rsvd_2	: 4,
+		    destination : 8;
 	} fields;
 };
 

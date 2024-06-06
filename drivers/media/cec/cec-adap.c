@@ -346,7 +346,8 @@ static void cec_data_cancel(struct cec_data *data)
 	} else {
 		list_del_init(&data->list);
 		if (!(data->msg.tx_status & CEC_TX_STATUS_OK))
-			data->adap->transmit_queue_sz--;
+			if (!WARN_ON(!data->adap->transmit_queue_sz))
+				data->adap->transmit_queue_sz--;
 	}
 
 	/* Mark it as an error */
@@ -393,6 +394,14 @@ static void cec_flush(struct cec_adapter *adap)
 		 * need to do anything special in that case.
 		 */
 	}
+	/*
+	 * If something went wrong and this counter isn't what it should
+	 * be, then this will reset it back to 0. Warn if it is not 0,
+	 * since it indicates a bug, either in this framework or in a
+	 * CEC driver.
+	 */
+	if (WARN_ON(adap->transmit_queue_sz))
+		adap->transmit_queue_sz = 0;
 }
 
 /*
@@ -417,7 +426,7 @@ int cec_thread_func(void *_adap)
 		bool timeout = false;
 		u8 attempts;
 
-		if (adap->transmitting) {
+		if (adap->transmit_in_progress) {
 			int err;
 
 			/*
@@ -431,7 +440,7 @@ int cec_thread_func(void *_adap)
 				(adap->needs_hpd &&
 				 (!adap->is_configured && !adap->is_configuring)) ||
 				kthread_should_stop() ||
-				(!adap->transmitting &&
+				(!adap->transmit_in_progress &&
 				 !list_empty(&adap->transmit_queue)),
 				msecs_to_jiffies(CEC_XFER_TIMEOUT_MS));
 			timeout = err == 0;
@@ -439,7 +448,7 @@ int cec_thread_func(void *_adap)
 			/* Otherwise we just wait for something to happen. */
 			wait_event_interruptible(adap->kthread_waitq,
 				kthread_should_stop() ||
-				(!adap->transmitting &&
+				(!adap->transmit_in_progress &&
 				 !list_empty(&adap->transmit_queue)));
 		}
 
@@ -452,7 +461,7 @@ int cec_thread_func(void *_adap)
 			goto unlock;
 		}
 
-		if (adap->transmitting && timeout) {
+		if (adap->transmit_in_progress && timeout) {
 			/*
 			 * If we timeout, then log that. Normally this does
 			 * not happen and it is an indication of a faulty CEC
@@ -461,12 +470,17 @@ int cec_thread_func(void *_adap)
 			 * so much traffic on the bus that the adapter was
 			 * unable to transmit for CEC_XFER_TIMEOUT_MS (2.1s).
 			 */
-			dprintk(1, "%s: message %*ph timed out\n", __func__,
-				adap->transmitting->msg.len,
-				adap->transmitting->msg.msg);
+			if (adap->transmitting) {
+				pr_warn("cec-%s: message %*ph timed out\n", adap->name,
+					adap->transmitting->msg.len,
+					adap->transmitting->msg.msg);
+				/* Just give up on this. */
+				cec_data_cancel(adap->transmitting);
+			} else {
+				pr_warn("cec-%s: transmit timed out\n", adap->name);
+			}
+			adap->transmit_in_progress = false;
 			adap->tx_timeouts++;
-			/* Just give up on this. */
-			cec_data_cancel(adap->transmitting);
 			goto unlock;
 		}
 
@@ -474,14 +488,15 @@ int cec_thread_func(void *_adap)
 		 * If we are still transmitting, or there is nothing new to
 		 * transmit, then just continue waiting.
 		 */
-		if (adap->transmitting || list_empty(&adap->transmit_queue))
+		if (adap->transmit_in_progress || list_empty(&adap->transmit_queue))
 			goto unlock;
 
 		/* Get a new message to transmit */
 		data = list_first_entry(&adap->transmit_queue,
 					struct cec_data, list);
 		list_del_init(&data->list);
-		adap->transmit_queue_sz--;
+		if (!WARN_ON(!data->adap->transmit_queue_sz))
+			adap->transmit_queue_sz--;
 
 		/* Make this the current transmitting message */
 		adap->transmitting = data;
@@ -518,6 +533,8 @@ int cec_thread_func(void *_adap)
 		if (adap->ops->adap_transmit(adap, data->attempts,
 					     signal_free_time, &data->msg))
 			cec_data_cancel(data);
+		else
+			adap->transmit_in_progress = true;
 
 unlock:
 		mutex_unlock(&adap->lock);
@@ -548,14 +565,17 @@ void cec_transmit_done_ts(struct cec_adapter *adap, u8 status,
 	data = adap->transmitting;
 	if (!data) {
 		/*
-		 * This can happen if a transmit was issued and the cable is
+		 * This might happen if a transmit was issued and the cable is
 		 * unplugged while the transmit is ongoing. Ignore this
 		 * transmit in that case.
 		 */
-		dprintk(1, "%s was called without an ongoing transmit!\n",
-			__func__);
-		goto unlock;
+		if (!adap->transmit_in_progress)
+			dprintk(1, "%s was called without an ongoing transmit!\n",
+				__func__);
+		adap->transmit_in_progress = false;
+		goto wake_thread;
 	}
+	adap->transmit_in_progress = false;
 
 	msg = &data->msg;
 
@@ -621,7 +641,6 @@ wake_thread:
 	 * for transmitting or to retry the current message.
 	 */
 	wake_up_interruptible(&adap->kthread_waitq);
-unlock:
 	mutex_unlock(&adap->lock);
 }
 EXPORT_SYMBOL_GPL(cec_transmit_done_ts);
@@ -1047,11 +1066,11 @@ void cec_received_msg_ts(struct cec_adapter *adap,
 			valid_la = false;
 		else if (!cec_msg_is_broadcast(msg) && !(dir_fl & DIRECTED))
 			valid_la = false;
-		else if (cec_msg_is_broadcast(msg) && !(dir_fl & BCAST1_4))
+		else if (cec_msg_is_broadcast(msg) && !(dir_fl & BCAST))
 			valid_la = false;
 		else if (cec_msg_is_broadcast(msg) &&
-			 adap->log_addrs.cec_version >= CEC_OP_CEC_VERSION_2_0 &&
-			 !(dir_fl & BCAST2_0))
+			 adap->log_addrs.cec_version < CEC_OP_CEC_VERSION_2_0 &&
+			 !(dir_fl & BCAST1_4))
 			valid_la = false;
 	}
 	if (valid_la && min_len) {
@@ -1141,6 +1160,7 @@ void cec_received_msg_ts(struct cec_adapter *adap,
 			if (abort)
 				dst->rx_status |= CEC_RX_STATUS_FEATURE_ABORT;
 			msg->flags = dst->flags;
+			msg->sequence = dst->sequence;
 			/* Remove it from the wait_queue */
 			list_del_init(&data->list);
 
@@ -1419,6 +1439,13 @@ configured:
 			las->log_addr[i],
 			cec_phys_addr_exp(adap->phys_addr));
 		cec_transmit_msg_fh(adap, &msg, NULL, false);
+
+		/* Report Vendor ID */
+		if (adap->log_addrs.vendor_id != CEC_VENDOR_ID_NONE) {
+			cec_msg_device_vendor_id(&msg,
+						 adap->log_addrs.vendor_id);
+			cec_transmit_msg_fh(adap, &msg, NULL, false);
+		}
 	}
 	adap->kthread_config = NULL;
 	complete(&adap->config_completion);
@@ -1483,14 +1510,18 @@ void __cec_s_phys_addr(struct cec_adapter *adap, u16 phys_addr, bool block)
 		if (adap->monitor_all_cnt)
 			WARN_ON(call_op(adap, adap_monitor_all_enable, false));
 		mutex_lock(&adap->devnode.lock);
-		if (adap->needs_hpd || list_empty(&adap->devnode.fhs))
+		if (adap->needs_hpd || list_empty(&adap->devnode.fhs)) {
 			WARN_ON(adap->ops->adap_enable(adap, false));
+			adap->transmit_in_progress = false;
+			wake_up_interruptible(&adap->kthread_waitq);
+		}
 		mutex_unlock(&adap->devnode.lock);
 		if (phys_addr == CEC_PHYS_ADDR_INVALID)
 			return;
 	}
 
 	mutex_lock(&adap->devnode.lock);
+	adap->transmit_in_progress = false;
 	if ((adap->needs_hpd || list_empty(&adap->devnode.fhs)) &&
 	    adap->ops->adap_enable(adap, true)) {
 		mutex_unlock(&adap->devnode.lock);
@@ -1623,6 +1654,10 @@ int __cec_s_log_addrs(struct cec_adapter *adap,
 		unsigned j;
 
 		log_addrs->log_addr[i] = CEC_LOG_ADDR_INVALID;
+		if (log_addrs->log_addr_type[i] > CEC_LOG_ADDR_TYPE_UNREGISTERED) {
+			dprintk(1, "unknown logical address type\n");
+			return -EINVAL;
+		}
 		if (type_mask & (1 << log_addrs->log_addr_type[i])) {
 			dprintk(1, "duplicate logical address type\n");
 			return -EINVAL;
@@ -1641,10 +1676,6 @@ int __cec_s_log_addrs(struct cec_adapter *adap,
 		}
 		if (log_addrs->primary_device_type[i] == 2) {
 			dprintk(1, "invalid primary device type\n");
-			return -EINVAL;
-		}
-		if (log_addrs->log_addr_type[i] > CEC_LOG_ADDR_TYPE_UNREGISTERED) {
-			dprintk(1, "unknown logical address type\n");
 			return -EINVAL;
 		}
 		for (j = 0; j < feature_sz; j++) {

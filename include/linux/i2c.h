@@ -246,6 +246,7 @@ struct i2c_client {
 	char name[I2C_NAME_SIZE];
 	struct i2c_adapter *adapter;	/* the adapter we sit on	*/
 	struct device dev;		/* the device structure		*/
+	int init_irq;			/* irq set at initialization	*/
 	int irq;			/* irq issued by device		*/
 	struct list_head detected;
 #if IS_ENABLED(CONFIG_I2C_SLAVE)
@@ -564,6 +565,8 @@ struct i2c_adapter_quirks {
 					 I2C_AQ_COMB_READ_SECOND | I2C_AQ_COMB_SAME_ADDR)
 /* clock stretching is not supported */
 #define I2C_AQ_NO_CLK_STRETCH		BIT(4)
+/* adapter cannot do repeated START */
+#define I2C_AQ_NO_REP_START		BIT(7)
 
 /*
  * i2c_adapter is the structure used to identify a physical i2c bus along
@@ -768,6 +771,9 @@ static inline u8 i2c_8bit_addr_from_msg(const struct i2c_msg *msg)
 {
 	return (msg->addr << 1) | (msg->flags & I2C_M_RD ? 1 : 0);
 }
+
+u8 *i2c_get_dma_safe_msg_buf(struct i2c_msg *msg, unsigned int threshold);
+void i2c_release_dma_safe_msg_buf(struct i2c_msg *msg, u8 *buf);
 
 int i2c_handle_smbus_host_notify(struct i2c_adapter *adap, unsigned short addr);
 /**

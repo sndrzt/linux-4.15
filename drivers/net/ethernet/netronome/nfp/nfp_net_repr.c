@@ -200,7 +200,7 @@ static netdev_tx_t nfp_repr_xmit(struct sk_buff *skb, struct net_device *netdev)
 	ret = dev_queue_xmit(skb);
 	nfp_repr_inc_tx_stats(netdev, len, ret);
 
-	return ret;
+	return NETDEV_TX_OK;
 }
 
 static int nfp_repr_stop(struct net_device *netdev)
@@ -250,6 +250,7 @@ const struct net_device_ops nfp_repr_netdev_ops = {
 	.ndo_set_vf_spoofchk	= nfp_app_set_vf_spoofchk,
 	.ndo_get_vf_config	= nfp_app_get_vf_config,
 	.ndo_set_vf_link_state	= nfp_app_set_vf_link_state,
+	.ndo_set_features	= nfp_port_set_features,
 };
 
 static void nfp_repr_clean(struct nfp_repr *repr)
@@ -298,6 +299,8 @@ int nfp_repr_init(struct nfp_app *app, struct net_device *netdev,
 	netdev->max_mtu = pf_netdev->max_mtu;
 
 	SWITCHDEV_SET_OPS(netdev, &nfp_port_switchdev_ops);
+
+	netdev->priv_flags |= IFF_DISABLE_NETPOLL;
 
 	if (nfp_app_has_tc(app)) {
 		netdev->features |= NETIF_F_HW_TC;

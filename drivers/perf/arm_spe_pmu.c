@@ -812,10 +812,10 @@ static void arm_spe_pmu_read(struct perf_event *event)
 {
 }
 
-static void *arm_spe_pmu_setup_aux(int cpu, void **pages, int nr_pages,
-				   bool snapshot)
+static void *arm_spe_pmu_setup_aux(struct perf_event *event, void **pages,
+				   int nr_pages, bool snapshot)
 {
-	int i;
+	int i, cpu = event->cpu;
 	struct page **pglist;
 	struct arm_spe_pmu_buf *buf;
 
@@ -915,6 +915,11 @@ static int arm_spe_pmu_perf_init(struct arm_spe_pmu *spe_pmu)
 
 	idx = atomic_inc_return(&pmu_idx);
 	name = devm_kasprintf(dev, GFP_KERNEL, "%s_%d", PMUNAME, idx);
+	if (!name) {
+		dev_err(dev, "failed to allocate name for pmu %d\n", idx);
+		return -ENOMEM;
+	}
+
 	return perf_pmu_register(&spe_pmu->pmu, name, -1);
 }
 
@@ -1163,6 +1168,15 @@ static int arm_spe_pmu_device_dt_probe(struct platform_device *pdev)
 	int ret;
 	struct arm_spe_pmu *spe_pmu;
 	struct device *dev = &pdev->dev;
+
+	/*
+	 * If kernelspace is unmapped when running at EL0, then the SPE
+	 * buffer will fault and prematurely terminate the AUX session.
+	 */
+	if (arm64_kernel_unmapped_at_el0()) {
+		dev_warn_once(dev, "profiling buffer inaccessible. Try passing \"kpti=off\" on the kernel command line\n");
+		return -EPERM;
+	}
 
 	spe_pmu = devm_kzalloc(dev, sizeof(*spe_pmu), GFP_KERNEL);
 	if (!spe_pmu) {

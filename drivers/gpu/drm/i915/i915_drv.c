@@ -324,7 +324,7 @@ static int i915_getparam(struct drm_device *dev, void *data,
 		value = i915_modparams.semaphores;
 		break;
 	case I915_PARAM_HAS_SECURE_BATCHES:
-		value = capable(CAP_SYS_ADMIN);
+		value = HAS_SECURE_BATCHES(dev_priv) && capable(CAP_SYS_ADMIN);
 		break;
 	case I915_PARAM_CMD_PARSER_VERSION:
 		value = i915_cmd_parser_get_version(dev_priv);
@@ -406,6 +406,9 @@ static int i915_getparam(struct drm_device *dev, void *data,
 		 * INTEL_INFO(), a feature macro, or similar.
 		 */
 		value = 1;
+		break;
+	case I915_PARAM_HAS_CONTEXT_ISOLATION:
+		value = intel_engines_has_context_isolation(dev_priv);
 		break;
 	case I915_PARAM_SLICE_MASK:
 		value = INTEL_INFO(dev_priv)->sseu.slice_mask;
@@ -677,7 +680,7 @@ static int i915_load_modeset_init(struct drm_device *dev)
 	if (ret)
 		goto cleanup_uc;
 
-	intel_modeset_gem_init(dev);
+	intel_setup_overlay(dev_priv);
 
 	if (INTEL_INFO(dev_priv)->num_pipes == 0)
 		return 0;
@@ -724,7 +727,7 @@ static int i915_kick_out_firmware_fb(struct drm_i915_private *dev_priv)
 	if (!ap)
 		return -ENOMEM;
 
-	ap->ranges[0].base = ggtt->mappable_base;
+	ap->ranges[0].base = ggtt->gmadr.start;
 	ap->ranges[0].size = ggtt->mappable_end;
 
 	primary =
@@ -894,7 +897,6 @@ static int i915_driver_init_early(struct drm_i915_private *dev_priv,
 
 	spin_lock_init(&dev_priv->mm.object_stat_lock);
 	mutex_init(&dev_priv->sb_lock);
-	mutex_init(&dev_priv->modeset_restore_lock);
 	mutex_init(&dev_priv->av_mutex);
 	mutex_init(&dev_priv->wm.wm_mutex);
 	mutex_init(&dev_priv->pps_mutex);
@@ -1121,6 +1123,12 @@ static int i915_driver_init_hw(struct drm_i915_private *dev_priv)
 	}
 
 	pci_set_master(pdev);
+
+	/*
+	 * We don't have a max segment size, so set it to the max so sg's
+	 * debugging layer doesn't complain
+	 */
+	dma_set_max_seg_size(&pdev->dev, UINT_MAX);
 
 	/* overlay on gen2 is broken and can't address above 1G */
 	if (IS_GEN2(dev_priv)) {
@@ -1526,11 +1534,6 @@ static int i915_drm_suspend(struct drm_device *dev)
 	pci_power_t opregion_target_state;
 	int error;
 
-	/* ignore lid events during suspend */
-	mutex_lock(&dev_priv->modeset_restore_lock);
-	dev_priv->modeset_restore = MODESET_SUSPENDED;
-	mutex_unlock(&dev_priv->modeset_restore_lock);
-
 	disable_rpm_wakeref_asserts(dev_priv);
 
 	/* We do a lot of poking in a lot of registers, make sure they work
@@ -1585,15 +1588,14 @@ static int i915_drm_suspend_late(struct drm_device *dev, bool hibernation)
 {
 	struct drm_i915_private *dev_priv = to_i915(dev);
 	struct pci_dev *pdev = dev_priv->drm.pdev;
-	bool fw_csr;
 	int ret;
 
 	disable_rpm_wakeref_asserts(dev_priv);
 
 	intel_display_set_init_power(dev_priv, false);
 
-	fw_csr = !IS_GEN9_LP(dev_priv) && !hibernation &&
-		suspend_to_idle(dev_priv) && dev_priv->csr.dmc_payload;
+	i915_rc6_ctx_wa_suspend(dev_priv);
+
 	/*
 	 * In case of firmware assisted context save/restore don't manually
 	 * deinit the power domains. This also means the CSR/DMC firmware will
@@ -1601,8 +1603,11 @@ static int i915_drm_suspend_late(struct drm_device *dev, bool hibernation)
 	 * also enable deeper system power states that would be blocked if the
 	 * firmware was inactive.
 	 */
-	if (!fw_csr)
+	if (IS_GEN9_LP(dev_priv) || hibernation || !suspend_to_idle(dev_priv) ||
+	    dev_priv->csr.dmc_payload == NULL) {
 		intel_power_domains_suspend(dev_priv);
+		dev_priv->power_domains_suspended = true;
+	}
 
 	ret = 0;
 	if (IS_GEN9_LP(dev_priv))
@@ -1614,8 +1619,10 @@ static int i915_drm_suspend_late(struct drm_device *dev, bool hibernation)
 
 	if (ret) {
 		DRM_ERROR("Suspend complete failed: %d\n", ret);
-		if (!fw_csr)
+		if (dev_priv->power_domains_suspended) {
 			intel_power_domains_init_hw(dev_priv, true);
+			dev_priv->power_domains_suspended = false;
+		}
 
 		goto out;
 	}
@@ -1635,8 +1642,6 @@ static int i915_drm_suspend_late(struct drm_device *dev, bool hibernation)
 	 */
 	if (!(hibernation && INTEL_GEN(dev_priv) < 6))
 		pci_set_power_state(pdev, PCI_D3hot);
-
-	dev_priv->suspended_to_idle = suspend_to_idle(dev_priv);
 
 out:
 	enable_rpm_wakeref_asserts(dev_priv);
@@ -1739,10 +1744,6 @@ static int i915_drm_resume(struct drm_device *dev)
 
 	intel_fbdev_set_suspend(dev, FBINFO_STATE_RUNNING, false);
 
-	mutex_lock(&dev_priv->modeset_restore_lock);
-	dev_priv->modeset_restore = MODESET_DONE;
-	mutex_unlock(&dev_priv->modeset_restore_lock);
-
 	intel_opregion_notify_adapter(dev_priv, PCI_D0);
 
 	intel_autoenable_gt_powersave(dev_priv);
@@ -1815,8 +1816,7 @@ static int i915_drm_resume_early(struct drm_device *dev)
 	intel_uncore_resume_early(dev_priv);
 
 	if (IS_GEN9_LP(dev_priv)) {
-		if (!dev_priv->suspended_to_idle)
-			gen9_sanitize_dc_state(dev_priv);
+		gen9_sanitize_dc_state(dev_priv);
 		bxt_disable_dc9(dev_priv);
 	} else if (IS_HASWELL(dev_priv) || IS_BROADWELL(dev_priv)) {
 		hsw_disable_pc8(dev_priv);
@@ -1824,16 +1824,19 @@ static int i915_drm_resume_early(struct drm_device *dev)
 
 	intel_uncore_sanitize(dev_priv);
 
-	if (IS_GEN9_LP(dev_priv) ||
-	    !(dev_priv->suspended_to_idle && dev_priv->csr.dmc_payload))
+	if (dev_priv->power_domains_suspended)
 		intel_power_domains_init_hw(dev_priv, true);
+	else
+		intel_display_set_init_power(dev_priv, true);
 
 	i915_gem_sanitize(dev_priv);
+
+	i915_rc6_ctx_wa_resume(dev_priv);
 
 	enable_rpm_wakeref_asserts(dev_priv);
 
 out:
-	dev_priv->suspended_to_idle = false;
+	dev_priv->power_domains_suspended = false;
 
 	return ret;
 }

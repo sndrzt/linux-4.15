@@ -32,6 +32,7 @@
  *  NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  *  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#include <linux/fs_struct.h>
 #include <linux/file.h>
 #include <linux/falloc.h>
 #include <linux/slab.h>
@@ -252,11 +253,13 @@ do_open_lookup(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate, stru
 		 * Note: create modes (UNCHECKED,GUARDED...) are the same
 		 * in NFSv4 as in v3 except EXCLUSIVE4_1.
 		 */
+		current->fs->umask = open->op_umask;
 		status = do_nfsd_create(rqstp, current_fh, open->op_fname.data,
 					open->op_fname.len, &open->op_iattr,
 					*resfh, open->op_createmode,
 					(u32 *)open->op_verf.data,
 					&open->op_truncate, &open->op_created);
+		current->fs->umask = 0;
 
 		if (!status && open->op_label.len)
 			nfsd4_security_inode_setsecctx(*resfh, &open->op_label, open->op_bmval);
@@ -603,6 +606,7 @@ nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	if (status)
 		return status;
 
+	current->fs->umask = create->cr_umask;
 	switch (create->cr_type) {
 	case NF4LNK:
 		status = nfsd_symlink(rqstp, &cstate->current_fh,
@@ -611,20 +615,22 @@ nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 		break;
 
 	case NF4BLK:
+		status = nfserr_inval;
 		rdev = MKDEV(create->cr_specdata1, create->cr_specdata2);
 		if (MAJOR(rdev) != create->cr_specdata1 ||
 		    MINOR(rdev) != create->cr_specdata2)
-			return nfserr_inval;
+			goto out_umask;
 		status = nfsd_create(rqstp, &cstate->current_fh,
 				     create->cr_name, create->cr_namelen,
 				     &create->cr_iattr, S_IFBLK, rdev, &resfh);
 		break;
 
 	case NF4CHR:
+		status = nfserr_inval;
 		rdev = MKDEV(create->cr_specdata1, create->cr_specdata2);
 		if (MAJOR(rdev) != create->cr_specdata1 ||
 		    MINOR(rdev) != create->cr_specdata2)
-			return nfserr_inval;
+			goto out_umask;
 		status = nfsd_create(rqstp, &cstate->current_fh,
 				     create->cr_name, create->cr_namelen,
 				     &create->cr_iattr,S_IFCHR, rdev, &resfh);
@@ -668,6 +674,8 @@ nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	fh_dup2(&cstate->current_fh, &resfh);
 out:
 	fh_put(&resfh);
+out_umask:
+	current->fs->umask = 0;
 	return status;
 }
 
@@ -998,8 +1006,9 @@ nfsd4_write(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	unsigned long cnt;
 	int nvecs;
 
-	if (write->wr_offset >= OFFSET_MAX)
-		return nfserr_inval;
+	if (write->wr_offset > (u64)OFFSET_MAX ||
+	    write->wr_offset + write->wr_buflen > (u64)OFFSET_MAX)
+		return nfserr_fbig;
 
 	status = nfs4_preprocess_stateid_op(rqstp, cstate, &cstate->current_fh,
 						stateid, WR_STATE, &filp, NULL);
@@ -1031,6 +1040,9 @@ nfsd4_verify_copy(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 		  stateid_t *dst_stateid, struct file **dst)
 {
 	__be32 status;
+
+	if (!cstate->save_fh.fh_dentry)
+		return nfserr_nofilehandle;
 
 	status = nfs4_preprocess_stateid_op(rqstp, cstate, &cstate->save_fh,
 					    src_stateid, RD_STATE, src, NULL);
@@ -1363,14 +1375,14 @@ nfsd4_layoutget(struct svc_rqst *rqstp,
 	const struct nfsd4_layout_ops *ops;
 	struct nfs4_layout_stateid *ls;
 	__be32 nfserr;
-	int accmode;
+	int accmode = NFSD_MAY_READ_IF_EXEC;
 
 	switch (lgp->lg_seg.iomode) {
 	case IOMODE_READ:
-		accmode = NFSD_MAY_READ;
+		accmode |= NFSD_MAY_READ;
 		break;
 	case IOMODE_RW:
-		accmode = NFSD_MAY_READ | NFSD_MAY_WRITE;
+		accmode |= NFSD_MAY_READ | NFSD_MAY_WRITE;
 		break;
 	default:
 		dprintk("%s: invalid iomode %d\n",
@@ -1708,6 +1720,7 @@ nfsd4_proc_compound(struct svc_rqst *rqstp)
 	if (status) {
 		op = &args->ops[0];
 		op->status = status;
+		resp->opcnt = 1;
 		goto encode_op;
 	}
 
@@ -1827,6 +1840,22 @@ out:
 
 #define op_encode_channel_attrs_maxsz	(6 + 1 + 1)
 
+/*
+ * The _rsize() helpers are invoked by the NFSv4 COMPOUND decoder, which
+ * is called before sunrpc sets rq_res.buflen. Thus we have to compute
+ * the maximum payload size here, based on transport limits and the size
+ * of the remaining space in the rq_pages array.
+ */
+static u32 nfsd4_max_payload(const struct svc_rqst *rqstp)
+{
+	u32 buflen;
+
+	buflen = (rqstp->rq_page_end - rqstp->rq_next_page) * PAGE_SIZE;
+	buflen -= rqstp->rq_auth_slack;
+	buflen -= rqstp->rq_res.head[0].iov_len;
+	return min_t(u32, buflen, svc_max_payload(rqstp));
+}
+
 static inline u32 nfsd4_only_status_rsize(struct svc_rqst *rqstp, struct nfsd4_op *op)
 {
 	return (op_encode_hdr_size) * sizeof(__be32);
@@ -1867,9 +1896,9 @@ static inline u32 nfsd4_getattr_rsize(struct svc_rqst *rqstp,
 	u32 ret = 0;
 
 	if (bmap0 & FATTR4_WORD0_ACL)
-		return svc_max_payload(rqstp);
+		return nfsd4_max_payload(rqstp);
 	if (bmap0 & FATTR4_WORD0_FS_LOCATIONS)
-		return svc_max_payload(rqstp);
+		return nfsd4_max_payload(rqstp);
 
 	if (bmap1 & FATTR4_WORD1_OWNER) {
 		ret += IDMAP_NAMESZ + 4;
@@ -1924,20 +1953,14 @@ static inline u32 nfsd4_open_rsize(struct svc_rqst *rqstp, struct nfsd4_op *op)
 
 static inline u32 nfsd4_read_rsize(struct svc_rqst *rqstp, struct nfsd4_op *op)
 {
-	u32 maxcount = 0, rlen = 0;
-
-	maxcount = svc_max_payload(rqstp);
-	rlen = min(op->u.read.rd_length, maxcount);
+	u32 rlen = min(op->u.read.rd_length, nfsd4_max_payload(rqstp));
 
 	return (op_encode_hdr_size + 2 + XDR_QUADLEN(rlen)) * sizeof(__be32);
 }
 
 static inline u32 nfsd4_readdir_rsize(struct svc_rqst *rqstp, struct nfsd4_op *op)
 {
-	u32 maxcount = 0, rlen = 0;
-
-	maxcount = svc_max_payload(rqstp);
-	rlen = min(op->u.readdir.rd_maxcount, maxcount);
+	u32 rlen = min(op->u.readdir.rd_maxcount, nfsd4_max_payload(rqstp));
 
 	return (op_encode_hdr_size + op_encode_verifier_maxsz +
 		XDR_QUADLEN(rlen)) * sizeof(__be32);
@@ -2040,10 +2063,7 @@ static inline u32 nfsd4_copy_rsize(struct svc_rqst *rqstp, struct nfsd4_op *op)
 #ifdef CONFIG_NFSD_PNFS
 static inline u32 nfsd4_getdeviceinfo_rsize(struct svc_rqst *rqstp, struct nfsd4_op *op)
 {
-	u32 maxcount = 0, rlen = 0;
-
-	maxcount = svc_max_payload(rqstp);
-	rlen = min(op->u.getdeviceinfo.gd_maxcount, maxcount);
+	u32 rlen = min(op->u.getdeviceinfo.gd_maxcount, nfsd4_max_payload(rqstp));
 
 	return (op_encode_hdr_size +
 		1 /* gd_layout_type*/ +

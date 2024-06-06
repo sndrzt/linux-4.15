@@ -37,6 +37,7 @@
 static struct kset *iommu_group_kset;
 static DEFINE_IDA(iommu_group_ida);
 static unsigned int iommu_def_domain_type = IOMMU_DOMAIN_DMA;
+static bool iommu_dma_strict __read_mostly = true;
 
 struct iommu_callback_data {
 	const struct iommu_ops *ops;
@@ -125,6 +126,12 @@ static int __init iommu_set_def_domain_type(char *str)
 }
 early_param("iommu.passthrough", iommu_set_def_domain_type);
 
+static int __init iommu_dma_setup(char *str)
+{
+	return kstrtobool(str, &iommu_dma_strict);
+}
+early_param("iommu.strict", iommu_dma_setup);
+
 static ssize_t iommu_group_attr_show(struct kobject *kobj,
 				     struct attribute *__attr, char *buf)
 {
@@ -205,18 +212,21 @@ static int iommu_insert_resv_region(struct iommu_resv_region *new,
 			pos = pos->next;
 		} else if ((start >= a) && (end <= b)) {
 			if (new->type == type)
-				goto done;
+				return 0;
 			else
 				pos = pos->next;
 		} else {
 			if (new->type == type) {
 				phys_addr_t new_start = min(a, start);
 				phys_addr_t new_end = max(b, end);
+				int ret;
 
 				list_del(&entry->list);
 				entry->start = new_start;
 				entry->length = new_end - new_start + 1;
-				iommu_insert_resv_region(entry, regions);
+				ret = iommu_insert_resv_region(entry, regions);
+				kfree(entry);
+				return ret;
 			} else {
 				pos = pos->next;
 			}
@@ -229,7 +239,6 @@ insert:
 		return -ENOMEM;
 
 	list_add_tail(&region->list, pos);
-done:
 	return 0;
 }
 
@@ -357,7 +366,7 @@ struct iommu_group *iommu_group_alloc(void)
 				   NULL, "%d", group->id);
 	if (ret) {
 		ida_simple_remove(&iommu_group_ida, group->id);
-		kfree(group);
+		kobject_put(&group->kobj);
 		return ERR_PTR(ret);
 	}
 
@@ -611,6 +620,7 @@ err_put_group:
 	mutex_unlock(&group->mutex);
 	dev->iommu_group = NULL;
 	kobject_put(group->devices_kobj);
+	sysfs_remove_link(group->devices_kobj, device->name);
 err_free_name:
 	kfree(device->name);
 err_remove_link:
@@ -1035,6 +1045,13 @@ struct iommu_group *iommu_group_get_for_dev(struct device *dev)
 		group->default_domain = dom;
 		if (!group->domain)
 			group->domain = dom;
+
+		if (dom && !iommu_dma_strict) {
+			int attr = 1;
+			iommu_domain_set_attr(dom,
+					      DOMAIN_ATTR_DMA_USE_FLUSH_QUEUE,
+					      &attr);
+		}
 	}
 
 	ret = iommu_group_add_device(group, dev);
@@ -1853,9 +1870,9 @@ int iommu_request_dm_for_dev(struct device *dev)
 	int ret;
 
 	/* Device must already be in a group before calling this function */
-	group = iommu_group_get_for_dev(dev);
-	if (IS_ERR(group))
-		return PTR_ERR(group);
+	group = iommu_group_get(dev);
+	if (!group)
+		return -EINVAL;
 
 	mutex_lock(&group->mutex);
 

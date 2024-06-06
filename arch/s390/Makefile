@@ -62,7 +62,7 @@ aflags-$(CONFIG_PACK_STACK)  += -D__PACK_STACK
 endif
 
 # new style option for packed stacks
-ifeq ($(call cc-option-yn,-mpacked-stack),y)
+ifeq ($(call cc-option-yn,-mpacked-stack -mbackchain -msoft-float),y)
 cflags-$(CONFIG_PACK_STACK)  += -mpacked-stack -D__PACK_STACK
 aflags-$(CONFIG_PACK_STACK)  += -D__PACK_STACK
 endif
@@ -76,6 +76,16 @@ endif
 
 ifeq ($(call cc-option-yn,-mwarn-dynamicstack),y)
 cflags-$(CONFIG_WARN_DYNAMIC_STACK) += -mwarn-dynamicstack
+endif
+
+ifdef CONFIG_EXPOLINE
+  ifeq ($(call cc-option-yn,$(CC_FLAGS_MARCH) -mindirect-branch=thunk),y)
+    CC_FLAGS_EXPOLINE := -mindirect-branch=thunk
+    CC_FLAGS_EXPOLINE += -mfunction-return=thunk
+    CC_FLAGS_EXPOLINE += -mindirect-branch-table
+    export CC_FLAGS_EXPOLINE
+    cflags-y += $(CC_FLAGS_EXPOLINE) -DCC_USING_EXPOLINE
+  endif
 endif
 
 ifdef CONFIG_FUNCTION_TRACER
@@ -111,7 +121,7 @@ tools		:= arch/s390/tools
 
 all: image bzImage
 
-install: vmlinux
+install:
 	$(Q)$(MAKE) $(build)=$(boot) $@
 
 image bzImage: vmlinux

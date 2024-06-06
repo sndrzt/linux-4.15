@@ -448,7 +448,8 @@ static int match_by_id(struct device * dev, void * data)
  * Checks all the children of @parent for a matching @id.  If none
  * found, it allocates a new device and returns it.
  */
-static struct parisc_device * alloc_tree_node(struct device *parent, char id)
+static struct parisc_device * __init alloc_tree_node(
+			struct device *parent, char id)
 {
 	struct match_id_data d = {
 		.id = id,
@@ -504,7 +505,6 @@ alloc_pa_dev(unsigned long hpa, struct hardware_path *mod_path)
 	dev->id.hversion_rev = iodc_data[1] & 0x0f;
 	dev->id.sversion = ((iodc_data[4] & 0x0f) << 16) |
 			(iodc_data[5] << 8) | iodc_data[6];
-	dev->hpa.name = parisc_pathname(dev);
 	dev->hpa.start = hpa;
 	/* This is awkward.  The STI spec says that gfx devices may occupy
 	 * 32MB or 64MB.  Unfortunately, we don't know how to tell whether
@@ -518,10 +518,10 @@ alloc_pa_dev(unsigned long hpa, struct hardware_path *mod_path)
 		dev->hpa.end = hpa + 0xfff;
 	}
 	dev->hpa.flags = IORESOURCE_MEM;
-	name = parisc_hardware_description(&dev->id);
-	if (name) {
-		strlcpy(dev->name, name, sizeof(dev->name));
-	}
+	dev->hpa.name = dev->name;
+	name = parisc_hardware_description(&dev->id) ? : "unknown";
+	snprintf(dev->name, sizeof(dev->name), "%s [%s]",
+		name, parisc_pathname(dev));
 
 	/* Silently fail things like mouse ports which are subsumed within
 	 * the keyboard controller
@@ -650,6 +650,10 @@ static int match_pci_device(struct device *dev, int index,
 		return ((modpath->bc[5] == PCI_SLOT(devfn)) &&
 					(modpath->mod == PCI_FUNC(devfn)));
 	}
+
+	/* index might be out of bounds for bc[] */
+	if (index >= 6)
+		return 0;
 
 	id = PCI_SLOT(pdev->devfn) | (PCI_FUNC(pdev->devfn) << 5);
 	return (modpath->bc[index] == id);
@@ -791,7 +795,7 @@ EXPORT_SYMBOL(device_to_hwpath);
 static void walk_native_bus(unsigned long io_io_low, unsigned long io_io_high,
                             struct device *parent);
 
-void walk_lower_bus(struct parisc_device *dev)
+void __init walk_lower_bus(struct parisc_device *dev)
 {
 	unsigned long io_io_low, io_io_high;
 
@@ -821,8 +825,8 @@ void walk_lower_bus(struct parisc_device *dev)
  * devices which are not physically connected (such as extra serial &
  * keyboard ports).  This problem is not yet solved.
  */
-static void walk_native_bus(unsigned long io_io_low, unsigned long io_io_high,
-                            struct device *parent)
+static void __init walk_native_bus(unsigned long io_io_low,
+	unsigned long io_io_high, struct device *parent)
 {
 	int i, devices_found = 0;
 	unsigned long hpa = io_io_low;
@@ -864,15 +868,13 @@ void walk_central_bus(void)
 			&root);
 }
 
-static void print_parisc_device(struct parisc_device *dev)
+static __init void print_parisc_device(struct parisc_device *dev)
 {
-	char hw_path[64];
-	static int count;
+	static int count __initdata;
 
-	print_pa_hwpath(dev, hw_path);
-	printk(KERN_INFO "%d. %s at 0x%px [%s] { %d, 0x%x, 0x%.3x, 0x%.5x }",
-		++count, dev->name, (void*) dev->hpa.start, hw_path, dev->id.hw_type,
-		dev->id.hversion_rev, dev->id.hversion, dev->id.sversion);
+	printk(KERN_INFO "%d. %s at %pap { type:%d, hv:%#x, sv:%#x, rev:%#x }",
+		++count, dev->name, &(dev->hpa.start), dev->id.hw_type,
+		dev->id.hversion, dev->id.sversion, dev->id.hversion_rev);
 
 	if (dev->num_addrs) {
 		int k;
@@ -896,7 +898,7 @@ void init_parisc_bus(void)
 }
 
 
-static int print_one_device(struct device * dev, void * data)
+static __init int print_one_device(struct device * dev, void * data)
 {
 	struct parisc_device * pdev = to_parisc_device(dev);
 

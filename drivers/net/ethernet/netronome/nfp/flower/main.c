@@ -79,7 +79,7 @@ nfp_flower_repr_get_type_and_port(struct nfp_app *app, u32 port_id, u8 *port)
 			return NFP_REPR_TYPE_VF;
 	}
 
-	return NFP_FLOWER_CMSG_PORT_TYPE_UNSPEC;
+	return __NFP_REPR_TYPE_MAX;
 }
 
 static struct net_device *
@@ -90,6 +90,8 @@ nfp_flower_repr_get(struct nfp_app *app, u32 port_id)
 	u8 port = 0;
 
 	repr_type = nfp_flower_repr_get_type_and_port(app, port_id, &port);
+	if (repr_type > NFP_REPR_TYPE_MAX)
+		return NULL;
 
 	reprs = rcu_dereference(app->reprs[repr_type]);
 	if (!reprs)
@@ -272,7 +274,7 @@ nfp_flower_spawn_phy_reprs(struct nfp_app *app, struct nfp_flower_priv *priv)
 		}
 
 		SET_NETDEV_DEV(reprs->reprs[phys_port], &priv->nn->pdev->dev);
-		nfp_net_get_mac_addr(app->pf, port);
+		nfp_net_get_mac_addr(app->pf, reprs->reprs[phys_port], port);
 
 		cmsg_port_id = nfp_flower_cmsg_phys_port(phys_port);
 		err = nfp_repr_init(app, reprs->reprs[phys_port],

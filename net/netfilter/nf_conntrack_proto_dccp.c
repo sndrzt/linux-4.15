@@ -243,14 +243,14 @@ dccp_state_table[CT_DCCP_ROLE_MAX + 1][DCCP_PKT_SYNCACK + 1][CT_DCCP_MAX + 1] = 
 		 * We currently ignore Sync packets
 		 *
 		 *	sNO, sRQ, sRS, sPO, sOP, sCR, sCG, sTW */
-			sIG, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
+			sIV, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
 		},
 		[DCCP_PKT_SYNCACK] = {
 		/*
 		 * We currently ignore SyncAck packets
 		 *
 		 *	sNO, sRQ, sRS, sPO, sOP, sCR, sCG, sTW */
-			sIG, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
+			sIV, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
 		},
 	},
 	[CT_DCCP_ROLE_SERVER] = {
@@ -371,14 +371,14 @@ dccp_state_table[CT_DCCP_ROLE_MAX + 1][DCCP_PKT_SYNCACK + 1][CT_DCCP_MAX + 1] = 
 		 * We currently ignore Sync packets
 		 *
 		 *	sNO, sRQ, sRS, sPO, sOP, sCR, sCG, sTW */
-			sIG, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
+			sIV, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
 		},
 		[DCCP_PKT_SYNCACK] = {
 		/*
 		 * We currently ignore SyncAck packets
 		 *
 		 *	sNO, sRQ, sRS, sPO, sOP, sCR, sCG, sTW */
-			sIG, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
+			sIV, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
 		},
 	},
 };
@@ -711,6 +711,9 @@ static int dccp_timeout_nlattr_to_obj(struct nlattr *tb[],
 	struct nf_dccp_net *dn = dccp_pernet(net);
 	unsigned int *timeouts = data;
 	int i;
+
+	if (!timeouts)
+		 timeouts = dn->dccp_timeout;
 
 	/* set default DCCP timeouts. */
 	for (i=0; i<CT_DCCP_MAX; i++)

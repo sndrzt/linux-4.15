@@ -1654,10 +1654,10 @@ static int mlxsw_pci_sw_reset(struct mlxsw_pci *mlxsw_pci,
 		u32 val = mlxsw_pci_read32(mlxsw_pci, FW_READY);
 
 		if ((val & MLXSW_PCI_FW_READY_MASK) == MLXSW_PCI_FW_READY_MAGIC)
-			break;
+			return 0;
 		cond_resched();
 	} while (time_before(jiffies, end));
-	return 0;
+	return -EBUSY;
 }
 
 static int mlxsw_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -1772,6 +1772,7 @@ int mlxsw_pci_driver_register(struct pci_driver *pci_driver)
 {
 	pci_driver->probe = mlxsw_pci_probe;
 	pci_driver->remove = mlxsw_pci_remove;
+	pci_driver->shutdown = mlxsw_pci_remove;
 	return pci_register_driver(pci_driver);
 }
 EXPORT_SYMBOL(mlxsw_pci_driver_register);

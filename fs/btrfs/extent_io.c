@@ -12,6 +12,7 @@
 #include <linux/pagevec.h>
 #include <linux/prefetch.h>
 #include <linux/cleancache.h>
+#include <linux/overflow.h>
 #include "extent_io.h"
 #include "extent_map.h"
 #include "ctree.h"
@@ -139,13 +140,71 @@ static void add_extent_changeset(struct extent_state *state, unsigned bits,
 	BUG_ON(ret < 0);
 }
 
-static noinline void flush_write_bio(void *data);
 static inline struct btrfs_fs_info *
 tree_fs_info(struct extent_io_tree *tree)
 {
 	if (tree->ops)
 		return tree->ops->tree_fs_info(tree->private_data);
 	return NULL;
+}
+
+static int __must_check submit_one_bio(struct bio *bio, int mirror_num,
+				       unsigned long bio_flags)
+{
+	blk_status_t ret = 0;
+	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
+	struct page *page = bvec->bv_page;
+	struct extent_io_tree *tree = bio->bi_private;
+	u64 start;
+
+	start = page_offset(page) + bvec->bv_offset;
+
+	bio->bi_private = NULL;
+	bio_get(bio);
+
+	if (tree->ops)
+		ret = tree->ops->submit_bio_hook(tree->private_data, bio,
+					   mirror_num, bio_flags, start);
+	else
+		btrfsic_submit_bio(bio);
+
+	bio_put(bio);
+	return blk_status_to_errno(ret);
+}
+
+
+/* Cleanup unsubmitted bios */
+static void end_write_bio(struct extent_page_data *epd, int ret)
+{
+	if (epd->bio) {
+		epd->bio->bi_status = errno_to_blk_status(ret);
+		bio_endio(epd->bio);
+		epd->bio = NULL;
+	}
+}
+
+/*
+ * Submit bio from extent page data via submit_one_bio
+ *
+ * Return 0 if everything is OK.
+ * Return <0 for error.
+ */
+static int __must_check flush_write_bio(struct extent_page_data *epd)
+{
+	int ret = 0;
+
+	if (epd->bio) {
+		ret = submit_one_bio(epd->bio, 0, 0);
+		/*
+		 * Clean up of epd->bio is handled by its endio function.
+		 * And endio is either triggered by successful bio execution
+		 * or the error handler of submit bio hook.
+		 * So at this point, no matter what happened, we don't need
+		 * to clean up epd->bio.
+		 */
+		epd->bio = NULL;
+	}
+	return ret;
 }
 
 int __init extent_io_init(void)
@@ -1720,7 +1779,8 @@ static int __process_pages_contig(struct address_space *mapping,
 				if (!PageDirty(pages[i]) ||
 				    pages[i]->mapping != mapping) {
 					unlock_page(pages[i]);
-					put_page(pages[i]);
+					for (; i < ret; i++)
+						put_page(pages[i]);
 					err = -EAGAIN;
 					goto out;
 				}
@@ -2612,7 +2672,7 @@ readpage_ok:
 			unsigned off;
 
 			/* Zero out the end if this page straddles i_size */
-			off = i_size & (PAGE_SIZE-1);
+			off = offset_in_page(i_size);
 			if (page->index == end_index && off)
 				zero_user_segment(page, off, PAGE_SIZE);
 			SetPageUptodate(page);
@@ -2718,30 +2778,6 @@ struct bio *btrfs_bio_clone_partial(struct bio *orig, int offset, int size)
 	bio_trim(bio, offset >> 9, size >> 9);
 	btrfs_bio->iter = bio->bi_iter;
 	return bio;
-}
-
-static int __must_check submit_one_bio(struct bio *bio, int mirror_num,
-				       unsigned long bio_flags)
-{
-	blk_status_t ret = 0;
-	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
-	struct page *page = bvec->bv_page;
-	struct extent_io_tree *tree = bio->bi_private;
-	u64 start;
-
-	start = page_offset(page) + bvec->bv_offset;
-
-	bio->bi_private = NULL;
-	bio_get(bio);
-
-	if (tree->ops)
-		ret = tree->ops->submit_bio_hook(tree->private_data, bio,
-					   mirror_num, bio_flags, start);
-	else
-		btrfsic_submit_bio(bio);
-
-	bio_put(bio);
-	return blk_status_to_errno(ret);
 }
 
 static int merge_bio(struct extent_io_tree *tree, struct page *page,
@@ -2916,7 +2952,7 @@ static int __do_readpage(struct extent_io_tree *tree,
 
 	if (page->index == last_byte >> PAGE_SHIFT) {
 		char *userpage;
-		size_t zero_offset = last_byte & (PAGE_SIZE - 1);
+		size_t zero_offset = offset_in_page(last_byte);
 
 		if (zero_offset) {
 			iosize = PAGE_SIZE - zero_offset;
@@ -3014,11 +3050,11 @@ static int __do_readpage(struct extent_io_tree *tree,
 		 */
 		if (test_bit(EXTENT_FLAG_COMPRESSED, &em->flags) &&
 		    prev_em_start && *prev_em_start != (u64)-1 &&
-		    *prev_em_start != em->orig_start)
+		    *prev_em_start != em->start)
 			force_bio_submit = true;
 
 		if (prev_em_start)
-			*prev_em_start = em->orig_start;
+			*prev_em_start = em->start;
 
 		free_extent_map(em);
 		em = NULL;
@@ -3215,7 +3251,7 @@ static void update_nr_written(struct writeback_control *wbc,
 /*
  * helper for __extent_writepage, doing all of the delayed allocation setup.
  *
- * This returns 1 if our fill_delalloc function did all the work required
+ * This returns 1 if btrfs_run_delalloc_range function did all the work required
  * to write the page (copy into inline extent).  In this case the IO has
  * been started and the page is already unlocked.
  *
@@ -3236,7 +3272,7 @@ static noinline_for_stack int writepage_delalloc(struct inode *inode,
 	int ret;
 	int page_started = 0;
 
-	if (epd->extent_locked || !tree->ops || !tree->ops->fill_delalloc)
+	if (epd->extent_locked)
 		return 0;
 
 	while (delalloc_end < page_end) {
@@ -3249,18 +3285,16 @@ static noinline_for_stack int writepage_delalloc(struct inode *inode,
 			delalloc_start = delalloc_end + 1;
 			continue;
 		}
-		ret = tree->ops->fill_delalloc(inode, page,
-					       delalloc_start,
-					       delalloc_end,
-					       &page_started,
-					       nr_written, wbc);
+		ret = btrfs_run_delalloc_range(inode, page, delalloc_start,
+				delalloc_end, &page_started, nr_written, wbc);
 		/* File system has been set read-only */
 		if (ret) {
 			SetPageError(page);
-			/* fill_delalloc should be return < 0 for error
-			 * but just in case, we use > 0 here meaning the
-			 * IO is started, so we don't want to return > 0
-			 * unless things are going well.
+			/*
+			 * btrfs_run_delalloc_range should return < 0 for error
+			 * but just in case, we use > 0 here meaning the IO is
+			 * started, so we don't want to return > 0 unless
+			 * things are going well.
 			 */
 			ret = ret < 0 ? ret : -EIO;
 			goto done;
@@ -3480,7 +3514,7 @@ static int __extent_writepage(struct page *page, struct writeback_control *wbc,
 
 	ClearPageError(page);
 
-	pg_offset = i_size & (PAGE_SIZE - 1);
+	pg_offset = offset_in_page(i_size);
 	if (page->index > end_index ||
 	   (page->index == end_index && !pg_offset)) {
 		page->mapping->a_ops->invalidatepage(page, 0, PAGE_SIZE);
@@ -3536,18 +3570,34 @@ void wait_on_extent_buffer_writeback(struct extent_buffer *eb)
 		       TASK_UNINTERRUPTIBLE);
 }
 
+static void end_extent_buffer_writeback(struct extent_buffer *eb)
+{
+	clear_bit(EXTENT_BUFFER_WRITEBACK, &eb->bflags);
+	smp_mb__after_atomic();
+	wake_up_bit(&eb->bflags, EXTENT_BUFFER_WRITEBACK);
+}
+
+/*
+ * Lock eb pages and flush the bio if we can't the locks
+ *
+ * Return  0 if nothing went wrong
+ * Return >0 is same as 0, except bio is not submitted
+ * Return <0 if something went wrong, no page is locked
+ */
 static noinline_for_stack int
 lock_extent_buffer_for_io(struct extent_buffer *eb,
 			  struct btrfs_fs_info *fs_info,
 			  struct extent_page_data *epd)
 {
-	unsigned long i, num_pages;
+	int i, num_pages, failed_page_nr;
 	int flush = 0;
 	int ret = 0;
 
 	if (!btrfs_try_tree_write_lock(eb)) {
+		ret = flush_write_bio(epd);
+		if (ret < 0)
+			return ret;
 		flush = 1;
-		flush_write_bio(epd);
 		btrfs_tree_lock(eb);
 	}
 
@@ -3556,7 +3606,9 @@ lock_extent_buffer_for_io(struct extent_buffer *eb,
 		if (!epd->sync_io)
 			return 0;
 		if (!flush) {
-			flush_write_bio(epd);
+			ret = flush_write_bio(epd);
+			if (ret < 0)
+				return ret;
 			flush = 1;
 		}
 		while (1) {
@@ -3597,7 +3649,14 @@ lock_extent_buffer_for_io(struct extent_buffer *eb,
 
 		if (!trylock_page(p)) {
 			if (!flush) {
-				flush_write_bio(epd);
+				int err;
+
+				err = flush_write_bio(epd);
+				if (err < 0) {
+					ret = err;
+					failed_page_nr = i;
+					goto err_unlock;
+				}
 				flush = 1;
 			}
 			lock_page(p);
@@ -3605,13 +3664,25 @@ lock_extent_buffer_for_io(struct extent_buffer *eb,
 	}
 
 	return ret;
-}
-
-static void end_extent_buffer_writeback(struct extent_buffer *eb)
-{
-	clear_bit(EXTENT_BUFFER_WRITEBACK, &eb->bflags);
-	smp_mb__after_atomic();
-	wake_up_bit(&eb->bflags, EXTENT_BUFFER_WRITEBACK);
+err_unlock:
+	/* Unlock already locked pages */
+	for (i = 0; i < failed_page_nr; i++)
+		unlock_page(eb->pages[i]);
+	/*
+	 * Clear EXTENT_BUFFER_WRITEBACK and wake up anyone waiting on it.
+	 * Also set back EXTENT_BUFFER_DIRTY so future attempts to this eb can
+	 * be made and undo everything done before.
+	 */
+	btrfs_tree_lock(eb);
+	spin_lock(&eb->refs_lock);
+	set_bit(EXTENT_BUFFER_DIRTY, &eb->bflags);
+	end_extent_buffer_writeback(eb);
+	spin_unlock(&eb->refs_lock);
+	percpu_counter_add_batch(&fs_info->dirty_metadata_bytes, eb->len,
+				 fs_info->dirty_metadata_batch);
+	btrfs_clear_header_flag(eb, BTRFS_HEADER_FLAG_WRITTEN);
+	btrfs_tree_unlock(eb);
+	return ret;
 }
 
 static void set_btree_ioerr(struct page *page)
@@ -3788,6 +3859,7 @@ int btree_write_cache_pages(struct address_space *mapping,
 		.sync_io = wbc->sync_mode == WB_SYNC_ALL,
 	};
 	int ret = 0;
+	int flush_ret;
 	int done = 0;
 	int nr_to_write_done = 0;
 	struct pagevec pvec;
@@ -3858,6 +3930,10 @@ retry:
 			if (!ret) {
 				free_extent_buffer(eb);
 				continue;
+			} else if (ret < 0) {
+				done = 1;
+				free_extent_buffer(eb);
+				break;
 			}
 
 			ret = write_one_eb(eb, fs_info, wbc, &epd);
@@ -3887,7 +3963,44 @@ retry:
 		index = 0;
 		goto retry;
 	}
-	flush_write_bio(&epd);
+	ASSERT(ret <= 0);
+	if (ret < 0) {
+		end_write_bio(&epd, ret);
+		return ret;
+	}
+	/*
+	 * If something went wrong, don't allow any metadata write bio to be
+	 * submitted.
+	 *
+	 * This would prevent use-after-free if we had dirty pages not
+	 * cleaned up, which can still happen by fuzzed images.
+	 *
+	 * - Bad extent tree
+	 *   Allowing existing tree block to be allocated for other trees.
+	 *
+	 * - Log tree operations
+	 *   Exiting tree blocks get allocated to log tree, bumps its
+	 *   generation, then get cleaned in tree re-balance.
+	 *   Such tree block will not be written back, since it's clean,
+	 *   thus no WRITTEN flag set.
+	 *   And after log writes back, this tree block is not traced by
+	 *   any dirty extent_io_tree.
+	 *
+	 * - Offending tree block gets re-dirtied from its original owner
+	 *   Since it has bumped generation, no WRITTEN flag, it can be
+	 *   reused without COWing. This tree block will not be traced
+	 *   by btrfs_transaction::dirty_pages.
+	 *
+	 *   Now such dirty tree block will not be cleaned by any dirty
+	 *   extent io tree. Thus we don't want to submit such wild eb
+	 *   if the fs already has error.
+	 */
+	if (!test_bit(BTRFS_FS_STATE_ERROR, &fs_info->fs_state)) {
+		ret = flush_write_bio(&epd);
+	} else {
+		ret = -EUCLEAN;
+		end_write_bio(&epd, ret);
+	}
 	return ret;
 }
 
@@ -3908,8 +4021,7 @@ retry:
  */
 static int extent_write_cache_pages(struct address_space *mapping,
 			     struct writeback_control *wbc,
-			     writepage_t writepage, void *data,
-			     void (*flush_fn)(void *))
+			     writepage_t writepage, void *data)
 {
 	struct inode *inode = mapping->host;
 	int ret = 0;
@@ -3964,7 +4076,7 @@ retry:
 		for (i = 0; i < nr_pages; i++) {
 			struct page *page = pvec.pages[i];
 
-			done_index = page->index;
+			done_index = page->index + 1;
 			/*
 			 * At this point we hold neither mapping->tree_lock nor
 			 * lock on the page itself: the page may be truncated or
@@ -3973,7 +4085,7 @@ retry:
 			 * mapping
 			 */
 			if (!trylock_page(page)) {
-				flush_fn(data);
+				flush_write_bio(data);
 				lock_page(page);
 			}
 
@@ -3984,7 +4096,7 @@ retry:
 
 			if (wbc->sync_mode != WB_SYNC_NONE) {
 				if (PageWriteback(page))
-					flush_fn(data);
+					flush_write_bio(data);
 				wait_on_page_writeback(page);
 			}
 
@@ -4001,16 +4113,6 @@ retry:
 				ret = 0;
 			}
 			if (ret < 0) {
-				/*
-				 * done_index is set past this page,
-				 * so media errors will not choke
-				 * background writeout for the entire
-				 * file. This has consequences for
-				 * range_cyclic semantics (ie. it may
-				 * not be suitable for data integrity
-				 * writeout).
-				 */
-				done_index = page->index + 1;
 				done = 1;
 				break;
 			}
@@ -4032,6 +4134,14 @@ retry:
 		 */
 		scanned = 1;
 		index = 0;
+
+		/*
+		 * If we're looping we could run into a page that is locked by a
+		 * writer and that writer could be waiting on writeback for a
+		 * page in our current bio, and thus deadlock, so flush the
+		 * write bio here.
+		 */
+		flush_write_bio(data);
 		goto retry;
 	}
 
@@ -4053,17 +4163,12 @@ static void flush_epd_write_bio(struct extent_page_data *epd)
 	}
 }
 
-static noinline void flush_write_bio(void *data)
-{
-	struct extent_page_data *epd = data;
-	flush_epd_write_bio(epd);
-}
-
 int extent_write_full_page(struct extent_io_tree *tree, struct page *page,
 			  get_extent_t *get_extent,
 			  struct writeback_control *wbc)
 {
 	int ret;
+	int flush_ret;
 	struct extent_page_data epd = {
 		.bio = NULL,
 		.tree = tree,
@@ -4074,7 +4179,8 @@ int extent_write_full_page(struct extent_io_tree *tree, struct page *page,
 
 	ret = __extent_writepage(page, wbc, &epd);
 
-	flush_epd_write_bio(&epd);
+	flush_ret = flush_write_bio(&epd);
+	BUG_ON(flush_ret < 0);
 	return ret;
 }
 
@@ -4083,6 +4189,7 @@ int extent_write_locked_range(struct extent_io_tree *tree, struct inode *inode,
 			      int mode)
 {
 	int ret = 0;
+	int flush_ret;
 	struct address_space *mapping = inode->i_mapping;
 	struct page *page;
 	unsigned long nr_pages = (end - start + PAGE_SIZE) >>
@@ -4117,7 +4224,8 @@ int extent_write_locked_range(struct extent_io_tree *tree, struct inode *inode,
 		start += PAGE_SIZE;
 	}
 
-	flush_epd_write_bio(&epd);
+	flush_ret = flush_write_bio(&epd);
+	BUG_ON(flush_ret < 0);
 	return ret;
 }
 
@@ -4127,6 +4235,7 @@ int extent_writepages(struct extent_io_tree *tree,
 		      struct writeback_control *wbc)
 {
 	int ret = 0;
+	int flush_ret;
 	struct extent_page_data epd = {
 		.bio = NULL,
 		.tree = tree,
@@ -4135,9 +4244,9 @@ int extent_writepages(struct extent_io_tree *tree,
 		.sync_io = wbc->sync_mode == WB_SYNC_ALL,
 	};
 
-	ret = extent_write_cache_pages(mapping, wbc, __extent_writepage, &epd,
-				       flush_write_bio);
-	flush_epd_write_bio(&epd);
+	ret = extent_write_cache_pages(mapping, wbc, __extent_writepage, &epd);
+	flush_ret = flush_write_bio(&epd);
+	BUG_ON(flush_ret < 0);
 	return ret;
 }
 
@@ -4261,6 +4370,7 @@ int try_release_extent_mapping(struct extent_map_tree *map,
 	struct extent_map *em;
 	u64 start = page_offset(page);
 	u64 end = start + PAGE_SIZE - 1;
+	struct btrfs_inode *btrfs_inode = BTRFS_I(page->mapping->host);
 
 	if (gfpflags_allow_blocking(mask) &&
 	    page->mapping->host->i_size > SZ_16M) {
@@ -4283,6 +4393,8 @@ int try_release_extent_mapping(struct extent_map_tree *map,
 					    extent_map_end(em) - 1,
 					    EXTENT_LOCKED | EXTENT_WRITEBACK,
 					    0, NULL)) {
+				set_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
+					&btrfs_inode->runtime_flags);
 				remove_extent_mapping(map, em);
 				/* once for the rb tree */
 				free_extent_map(em);
@@ -4292,6 +4404,8 @@ int try_release_extent_mapping(struct extent_map_tree *map,
 
 			/* once for us */
 			free_extent_map(em);
+
+			cond_resched(); /* Allow large-extent preemption. */
 		}
 	}
 	return try_release_extent_state(map, tree, page, mask);
@@ -4832,25 +4946,28 @@ struct extent_buffer *alloc_dummy_extent_buffer(struct btrfs_fs_info *fs_info,
 static void check_buffer_tree_ref(struct extent_buffer *eb)
 {
 	int refs;
-	/* the ref bit is tricky.  We have to make sure it is set
-	 * if we have the buffer dirty.   Otherwise the
-	 * code to free a buffer can end up dropping a dirty
-	 * page
+	/*
+	 * The TREE_REF bit is first set when the extent_buffer is added
+	 * to the radix tree. It is also reset, if unset, when a new reference
+	 * is created by find_extent_buffer.
 	 *
-	 * Once the ref bit is set, it won't go away while the
-	 * buffer is dirty or in writeback, and it also won't
-	 * go away while we have the reference count on the
-	 * eb bumped.
+	 * It is only cleared in two cases: freeing the last non-tree
+	 * reference to the extent_buffer when its STALE bit is set or
+	 * calling releasepage when the tree reference is the only reference.
 	 *
-	 * We can't just set the ref bit without bumping the
-	 * ref on the eb because free_extent_buffer might
-	 * see the ref bit and try to clear it.  If this happens
-	 * free_extent_buffer might end up dropping our original
-	 * ref by mistake and freeing the page before we are able
-	 * to add one more ref.
+	 * In both cases, care is taken to ensure that the extent_buffer's
+	 * pages are not under io. However, releasepage can be concurrently
+	 * called with creating new references, which is prone to race
+	 * conditions between the calls to check_buffer_tree_ref in those
+	 * codepaths and clearing TREE_REF in try_release_extent_buffer.
 	 *
-	 * So bump the ref count first, then set the bit.  If someone
-	 * beat us to it, drop the ref we added.
+	 * The actual lifetime of the extent_buffer in the radix tree is
+	 * adequately protected by the refcount, but the TREE_REF bit and
+	 * its corresponding reference are not. To protect against this
+	 * class of races, we call check_buffer_tree_ref from the codepaths
+	 * which trigger io after they set eb->io_pages. Note that once io is
+	 * initiated, TREE_REF can no longer be cleared, so that is the
+	 * moment at which any such race is best fixed.
 	 */
 	refs = atomic_read(&eb->refs);
 	if (refs >= 2 && test_bit(EXTENT_BUFFER_TREE_REF, &eb->bflags))
@@ -4927,12 +5044,14 @@ struct extent_buffer *alloc_test_extent_buffer(struct btrfs_fs_info *fs_info,
 		return eb;
 	eb = alloc_dummy_extent_buffer(fs_info, start);
 	if (!eb)
-		return NULL;
+		return ERR_PTR(-ENOMEM);
 	eb->fs_info = fs_info;
 again:
 	ret = radix_tree_preload(GFP_NOFS);
-	if (ret)
+	if (ret) {
+		exists = ERR_PTR(ret);
 		goto free_eb;
+	}
 	spin_lock(&fs_info->buffer_lock);
 	ret = radix_tree_insert(&fs_info->buffer_radix,
 				start >> PAGE_SHIFT, eb);
@@ -5312,6 +5431,11 @@ int read_extent_buffer_pages(struct extent_io_tree *tree,
 	clear_bit(EXTENT_BUFFER_READ_ERR, &eb->bflags);
 	eb->read_mirror = 0;
 	atomic_set(&eb->io_pages, num_reads);
+	/*
+	 * It is possible for releasepage to clear the TREE_REF bit before we
+	 * set io_pages. See check_buffer_tree_ref for a more detailed comment.
+	 */
+	check_buffer_tree_ref(eb);
 	for (i = 0; i < num_pages; i++) {
 		page = eb->pages[i];
 
@@ -5371,6 +5495,36 @@ unlock_exit:
 	return ret;
 }
 
+static bool report_eb_range(const struct extent_buffer *eb, unsigned long start,
+			    unsigned long len)
+{
+	btrfs_warn(eb->fs_info,
+		"access to eb bytenr %llu len %lu out of range start %lu len %lu",
+		eb->start, eb->len, start, len);
+	WARN_ON(IS_ENABLED(CONFIG_BTRFS_DEBUG));
+
+	return true;
+}
+
+/*
+ * Check if the [start, start + len) range is valid before reading/writing
+ * the eb.
+ * NOTE: @start and @len are offset inside the eb, not logical address.
+ *
+ * Caller should not touch the dst/src memory if this function returns error.
+ */
+static inline int check_eb_range(const struct extent_buffer *eb,
+				 unsigned long start, unsigned long len)
+{
+	unsigned long offset;
+
+	/* start, start + len should not go beyond eb->len nor overflow */
+	if (unlikely(check_add_overflow(start, len, &offset) || offset > eb->len))
+		return report_eb_range(eb, start, len);
+
+	return false;
+}
+
 void read_extent_buffer(const struct extent_buffer *eb, void *dstv,
 			unsigned long start, unsigned long len)
 {
@@ -5379,17 +5533,12 @@ void read_extent_buffer(const struct extent_buffer *eb, void *dstv,
 	struct page *page;
 	char *kaddr;
 	char *dst = (char *)dstv;
-	size_t start_offset = eb->start & ((u64)PAGE_SIZE - 1);
-	unsigned long i = (start_offset + start) >> PAGE_SHIFT;
+	unsigned long i = start >> PAGE_SHIFT;
 
-	if (start + len > eb->len) {
-		WARN(1, KERN_ERR "btrfs bad mapping eb start %llu len %lu, wanted %lu %lu\n",
-		     eb->start, eb->len, start, len);
-		memset(dst, 0, len);
+	if (check_eb_range(eb, start, len))
 		return;
-	}
 
-	offset = (start_offset + start) & (PAGE_SIZE - 1);
+	offset = offset_in_page(start);
 
 	while (len > 0) {
 		page = eb->pages[i];
@@ -5405,30 +5554,29 @@ void read_extent_buffer(const struct extent_buffer *eb, void *dstv,
 	}
 }
 
-int read_extent_buffer_to_user(const struct extent_buffer *eb,
-			       void __user *dstv,
-			       unsigned long start, unsigned long len)
+int read_extent_buffer_to_user_nofault(const struct extent_buffer *eb,
+				       void __user *dstv,
+				       unsigned long start, unsigned long len)
 {
 	size_t cur;
 	size_t offset;
 	struct page *page;
 	char *kaddr;
 	char __user *dst = (char __user *)dstv;
-	size_t start_offset = eb->start & ((u64)PAGE_SIZE - 1);
-	unsigned long i = (start_offset + start) >> PAGE_SHIFT;
+	unsigned long i = start >> PAGE_SHIFT;
 	int ret = 0;
 
 	WARN_ON(start > eb->len);
 	WARN_ON(start + len > eb->start + eb->len);
 
-	offset = (start_offset + start) & (PAGE_SIZE - 1);
+	offset = offset_in_page(start);
 
 	while (len > 0) {
 		page = eb->pages[i];
 
 		cur = min(len, (PAGE_SIZE - offset));
 		kaddr = page_address(page);
-		if (copy_to_user(dst, kaddr + offset, cur)) {
+		if (probe_user_write(dst, kaddr + offset, cur)) {
 			ret = -EFAULT;
 			break;
 		}
@@ -5455,7 +5603,7 @@ int map_private_extent_buffer(const struct extent_buffer *eb,
 	size_t offset = start & (PAGE_SIZE - 1);
 	char *kaddr;
 	struct page *p;
-	size_t start_offset = eb->start & ((u64)PAGE_SIZE - 1);
+	size_t start_offset = offset_in_page(eb->start);
 	unsigned long i = (start_offset + start) >> PAGE_SHIFT;
 	unsigned long end_i = (start_offset + start + min_len - 1) >>
 		PAGE_SHIFT;
@@ -5492,14 +5640,13 @@ int memcmp_extent_buffer(const struct extent_buffer *eb, const void *ptrv,
 	struct page *page;
 	char *kaddr;
 	char *ptr = (char *)ptrv;
-	size_t start_offset = eb->start & ((u64)PAGE_SIZE - 1);
-	unsigned long i = (start_offset + start) >> PAGE_SHIFT;
+	unsigned long i = start >> PAGE_SHIFT;
 	int ret = 0;
 
-	WARN_ON(start > eb->len);
-	WARN_ON(start + len > eb->start + eb->len);
+	if (check_eb_range(eb, start, len))
+		return -EINVAL;
 
-	offset = (start_offset + start) & (PAGE_SIZE - 1);
+	offset = offset_in_page(start);
 
 	while (len > 0) {
 		page = eb->pages[i];
@@ -5548,13 +5695,12 @@ void write_extent_buffer(struct extent_buffer *eb, const void *srcv,
 	struct page *page;
 	char *kaddr;
 	char *src = (char *)srcv;
-	size_t start_offset = eb->start & ((u64)PAGE_SIZE - 1);
-	unsigned long i = (start_offset + start) >> PAGE_SHIFT;
+	unsigned long i = start >> PAGE_SHIFT;
 
-	WARN_ON(start > eb->len);
-	WARN_ON(start + len > eb->start + eb->len);
+	if (check_eb_range(eb, start, len))
+		return;
 
-	offset = (start_offset + start) & (PAGE_SIZE - 1);
+	offset = offset_in_page(start);
 
 	while (len > 0) {
 		page = eb->pages[i];
@@ -5578,13 +5724,12 @@ void memzero_extent_buffer(struct extent_buffer *eb, unsigned long start,
 	size_t offset;
 	struct page *page;
 	char *kaddr;
-	size_t start_offset = eb->start & ((u64)PAGE_SIZE - 1);
-	unsigned long i = (start_offset + start) >> PAGE_SHIFT;
+	unsigned long i = start >> PAGE_SHIFT;
 
-	WARN_ON(start > eb->len);
-	WARN_ON(start + len > eb->start + eb->len);
+	if (check_eb_range(eb, start, len))
+		return;
 
-	offset = (start_offset + start) & (PAGE_SIZE - 1);
+	offset = offset_in_page(start);
 
 	while (len > 0) {
 		page = eb->pages[i];
@@ -5623,13 +5768,15 @@ void copy_extent_buffer(struct extent_buffer *dst, struct extent_buffer *src,
 	size_t offset;
 	struct page *page;
 	char *kaddr;
-	size_t start_offset = dst->start & ((u64)PAGE_SIZE - 1);
-	unsigned long i = (start_offset + dst_offset) >> PAGE_SHIFT;
+	unsigned long i = dst_offset >> PAGE_SHIFT;
+
+	if (check_eb_range(dst, dst_offset, len) ||
+	    check_eb_range(src, src_offset, len))
+		return;
 
 	WARN_ON(src->len != dst_len);
 
-	offset = (start_offset + dst_offset) &
-		(PAGE_SIZE - 1);
+	offset = offset_in_page(dst_offset);
 
 	while (len > 0) {
 		page = dst->pages[i];
@@ -5705,7 +5852,6 @@ static inline void eb_bitmap_offset(struct extent_buffer *eb,
 				    unsigned long *page_index,
 				    size_t *page_offset)
 {
-	size_t start_offset = eb->start & ((u64)PAGE_SIZE - 1);
 	size_t byte_offset = BIT_BYTE(nr);
 	size_t offset;
 
@@ -5714,10 +5860,10 @@ static inline void eb_bitmap_offset(struct extent_buffer *eb,
 	 * the bitmap item in the extent buffer + the offset of the byte in the
 	 * bitmap item.
 	 */
-	offset = start_offset + start + byte_offset;
+	offset = start + byte_offset;
 
 	*page_index = offset >> PAGE_SHIFT;
-	*page_offset = offset & (PAGE_SIZE - 1);
+	*page_offset = offset_in_page(offset);
 }
 
 /**
@@ -5855,35 +6001,22 @@ static void copy_pages(struct page *dst_page, struct page *src_page,
 void memcpy_extent_buffer(struct extent_buffer *dst, unsigned long dst_offset,
 			   unsigned long src_offset, unsigned long len)
 {
-	struct btrfs_fs_info *fs_info = dst->fs_info;
 	size_t cur;
 	size_t dst_off_in_page;
 	size_t src_off_in_page;
-	size_t start_offset = dst->start & ((u64)PAGE_SIZE - 1);
 	unsigned long dst_i;
 	unsigned long src_i;
 
-	if (src_offset + len > dst->len) {
-		btrfs_err(fs_info,
-			"memmove bogus src_offset %lu move len %lu dst len %lu",
-			 src_offset, len, dst->len);
-		BUG_ON(1);
-	}
-	if (dst_offset + len > dst->len) {
-		btrfs_err(fs_info,
-			"memmove bogus dst_offset %lu move len %lu dst len %lu",
-			 dst_offset, len, dst->len);
-		BUG_ON(1);
-	}
+	if (check_eb_range(dst, dst_offset, len) ||
+	    check_eb_range(dst, src_offset, len))
+		return;
 
 	while (len > 0) {
-		dst_off_in_page = (start_offset + dst_offset) &
-			(PAGE_SIZE - 1);
-		src_off_in_page = (start_offset + src_offset) &
-			(PAGE_SIZE - 1);
+		dst_off_in_page = offset_in_page(dst_offset);
+		src_off_in_page = offset_in_page(src_offset);
 
-		dst_i = (start_offset + dst_offset) >> PAGE_SHIFT;
-		src_i = (start_offset + src_offset) >> PAGE_SHIFT;
+		dst_i = dst_offset >> PAGE_SHIFT;
+		src_i = src_offset >> PAGE_SHIFT;
 
 		cur = min(len, (unsigned long)(PAGE_SIZE -
 					       src_off_in_page));
@@ -5902,40 +6035,27 @@ void memcpy_extent_buffer(struct extent_buffer *dst, unsigned long dst_offset,
 void memmove_extent_buffer(struct extent_buffer *dst, unsigned long dst_offset,
 			   unsigned long src_offset, unsigned long len)
 {
-	struct btrfs_fs_info *fs_info = dst->fs_info;
 	size_t cur;
 	size_t dst_off_in_page;
 	size_t src_off_in_page;
 	unsigned long dst_end = dst_offset + len - 1;
 	unsigned long src_end = src_offset + len - 1;
-	size_t start_offset = dst->start & ((u64)PAGE_SIZE - 1);
 	unsigned long dst_i;
 	unsigned long src_i;
 
-	if (src_offset + len > dst->len) {
-		btrfs_err(fs_info,
-			  "memmove bogus src_offset %lu move len %lu len %lu",
-			  src_offset, len, dst->len);
-		BUG_ON(1);
-	}
-	if (dst_offset + len > dst->len) {
-		btrfs_err(fs_info,
-			  "memmove bogus dst_offset %lu move len %lu len %lu",
-			  dst_offset, len, dst->len);
-		BUG_ON(1);
-	}
+	if (check_eb_range(dst, dst_offset, len) ||
+	    check_eb_range(dst, src_offset, len))
+		return;
 	if (dst_offset < src_offset) {
 		memcpy_extent_buffer(dst, dst_offset, src_offset, len);
 		return;
 	}
 	while (len > 0) {
-		dst_i = (start_offset + dst_end) >> PAGE_SHIFT;
-		src_i = (start_offset + src_end) >> PAGE_SHIFT;
+		dst_i = dst_end >> PAGE_SHIFT;
+		src_i = src_end >> PAGE_SHIFT;
 
-		dst_off_in_page = (start_offset + dst_end) &
-			(PAGE_SIZE - 1);
-		src_off_in_page = (start_offset + src_end) &
-			(PAGE_SIZE - 1);
+		dst_off_in_page = offset_in_page(dst_end);
+		src_off_in_page = offset_in_page(src_end);
 
 		cur = min_t(unsigned long, len, src_off_in_page + 1);
 		cur = min(cur, dst_off_in_page + 1);

@@ -163,6 +163,16 @@ MODULE_LICENSE("GPL");
 
 static const char * const ashs_ids[] = { "ATK4001", "ATK4002", NULL };
 
+static bool ashs_present(void)
+{
+	int i = 0;
+	while (ashs_ids[i]) {
+		if (acpi_dev_found(ashs_ids[i++]))
+			return true;
+	}
+	return false;
+}
+
 struct bios_args {
 	u32 arg0;
 	u32 arg1;
@@ -452,13 +462,7 @@ static void kbd_led_update(struct work_struct *work)
 
 	asus = container_of(work, struct asus_wmi, kbd_led_work);
 
-	/*
-	 * bits 0-2: level
-	 * bit 7: light on/off
-	 */
-	if (asus->kbd_led_wk > 0)
-		ctrl_param = 0x80 | (asus->kbd_led_wk & 0x7F);
-
+	ctrl_param = 0x80 | (asus->kbd_led_wk & 0x7F);
 	asus_wmi_set_devstate(ASUS_WMI_DEVID_KBD_BACKLIGHT, ctrl_param, NULL);
 }
 
@@ -1025,6 +1029,9 @@ static int asus_new_rfkill(struct asus_wmi *asus,
 
 static void asus_wmi_rfkill_exit(struct asus_wmi *asus)
 {
+	if (asus->driver->wlan_ctrl_by_user && ashs_present())
+		return;
+
 	asus_unregister_rfkill_notifier(asus, "\\_SB.PCI0.P0P5");
 	asus_unregister_rfkill_notifier(asus, "\\_SB.PCI0.P0P6");
 	asus_unregister_rfkill_notifier(asus, "\\_SB.PCI0.P0P7");
@@ -1162,6 +1169,8 @@ static void asus_wmi_set_xusb2pr(struct asus_wmi *asus)
 
 	pci_write_config_dword(xhci_pdev, USB_INTEL_XUSB2PR,
 				cpu_to_le32(ports_available));
+
+	pci_dev_put(xhci_pdev);
 
 	pr_info("set USB_INTEL_XUSB2PR old: 0x%04x, new: 0x%04x\n",
 			orig_ports_available, ports_available);
@@ -1968,6 +1977,9 @@ static int show_dsts(struct seq_file *m, void *data)
 	int err;
 	u32 retval = -1;
 
+	if (kernel_is_locked_down("Asus WMI"))
+		return -EPERM;
+
 	err = asus_wmi_get_devstate(asus, asus->debug.dev_id, &retval);
 
 	if (err < 0)
@@ -1983,6 +1995,9 @@ static int show_devs(struct seq_file *m, void *data)
 	struct asus_wmi *asus = m->private;
 	int err;
 	u32 retval = -1;
+
+	if (kernel_is_locked_down("Asus WMI"))
+		return -EPERM;
 
 	err = asus_wmi_set_devstate(asus->debug.dev_id, asus->debug.ctrl_param,
 				    &retval);
@@ -2007,6 +2022,9 @@ static int show_call(struct seq_file *m, void *data)
 	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
 	union acpi_object *obj;
 	acpi_status status;
+
+	if (kernel_is_locked_down("Asus WMI"))
+		return -EPERM;
 
 	status = wmi_evaluate_method(ASUS_WMI_MGMT_GUID,
 				     0, asus->debug.method_id,
@@ -2121,16 +2139,6 @@ static int asus_wmi_fan_init(struct asus_wmi *asus)
 	return 0;
 }
 
-static bool ashs_present(void)
-{
-	int i = 0;
-	while (ashs_ids[i]) {
-		if (acpi_dev_found(ashs_ids[i++]))
-			return true;
-	}
-	return false;
-}
-
 /*
  * WMI Driver
  */
@@ -2207,7 +2215,8 @@ static int asus_wmi_add(struct platform_device *pdev)
 		err = asus_wmi_backlight_init(asus);
 		if (err && err != -ENODEV)
 			goto fail_backlight;
-	}
+	} else if (asus->driver->quirks->wmi_backlight_set_devstate)
+		err = asus_wmi_set_devstate(ASUS_WMI_DEVID_BACKLIGHT, 2, NULL);
 
 	status = wmi_install_notify_handler(asus->driver->event_guid,
 					    asus_wmi_notify, asus);

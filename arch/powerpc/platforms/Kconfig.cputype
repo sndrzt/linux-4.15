@@ -297,7 +297,7 @@ config PPC_STD_MMU_32
 
 config PPC_RADIX_MMU
 	bool "Radix MMU Support"
-	depends on PPC_BOOK3S_64
+	depends on PPC_BOOK3S_64 && HUGETLB_PAGE
 	select ARCH_HAS_GIGANTIC_PAGE if (MEMORY_ISOLATION && COMPACTION) || CMA
 	default y
 	help
@@ -334,6 +334,7 @@ config PPC_BOOK3E_MMU
 config PPC_MM_SLICES
 	bool
 	default y if PPC_BOOK3S_64
+	default y if PPC_8xx && HUGETLB_PAGE
 	default n
 
 config PPC_HAVE_PMU_SUPPORT

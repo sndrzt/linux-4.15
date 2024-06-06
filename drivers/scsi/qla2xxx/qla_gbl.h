@@ -134,7 +134,6 @@ extern int ql2xasynctmfenable;
 extern int ql2xgffidenable;
 extern int ql2xenabledif;
 extern int ql2xenablehba_err_chk;
-extern int ql2xtargetreset;
 extern int ql2xdontresethba;
 extern uint64_t ql2xmaxlun;
 extern int ql2xmdcapmask;
@@ -203,6 +202,7 @@ void qla2x00_handle_login_done_event(struct scsi_qla_host *, fc_port_t *,
 	uint16_t *);
 int qla24xx_post_gnl_work(struct scsi_qla_host *, fc_port_t *);
 int qla24xx_async_abort_cmd(srb_t *);
+void qla2x00_wait_for_sess_deletion(scsi_qla_host_t *);
 
 /*
  * Global Functions in qla_mid.c source file.
@@ -728,7 +728,6 @@ extern void qlafx00_abort_iocb(srb_t *, struct abort_iocb_entry_fx00 *);
 extern void qlafx00_fxdisc_iocb(srb_t *, struct fxdisc_entry_fx00 *);
 extern void qlafx00_timer_routine(scsi_qla_host_t *);
 extern int qlafx00_rescan_isp(scsi_qla_host_t *);
-extern int qlafx00_loop_reset(scsi_qla_host_t *vha);
 
 /* qla82xx related functions */
 
@@ -864,8 +863,7 @@ void qla24xx_do_nack_work(struct scsi_qla_host *, struct qla_work_evt *);
 void qlt_plogi_ack_link(struct scsi_qla_host *, struct qlt_plogi_ack_t *,
 	struct fc_port *, enum qlt_plogi_link_t);
 void qlt_plogi_ack_unref(struct scsi_qla_host *, struct qlt_plogi_ack_t *);
-extern void qlt_schedule_sess_for_deletion(struct fc_port *, bool);
-extern void qlt_schedule_sess_for_deletion_lock(struct fc_port *);
+extern void qlt_schedule_sess_for_deletion(struct fc_port *);
 extern struct fc_port *qlt_find_sess_invalidate_other(scsi_qla_host_t *,
 	uint64_t wwn, port_id_t port_id, uint16_t loop_id, struct fc_port **);
 void qla24xx_delete_sess_fn(struct work_struct *);

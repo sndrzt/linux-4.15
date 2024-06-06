@@ -383,8 +383,8 @@ static void tcp_options(const struct sk_buff *skb,
 				 length, buff);
 	BUG_ON(ptr == NULL);
 
-	state->td_scale =
-	state->flags = 0;
+	state->td_scale = 0;
+	state->flags &= IP_CT_TCP_FLAG_BE_LIBERAL;
 
 	while (length > 0) {
 		int opcode=*ptr++;
@@ -501,6 +501,7 @@ static bool tcp_in_window(const struct nf_conn *ct,
 	struct ip_ct_tcp_state *receiver = &state->seen[!dir];
 	const struct nf_conntrack_tuple *tuple = &ct->tuplehash[dir].tuple;
 	__u32 seq, ack, sack, end, win, swin;
+	u16 win_raw;
 	s32 receiver_offset;
 	bool res, in_recv_win;
 
@@ -509,7 +510,8 @@ static bool tcp_in_window(const struct nf_conn *ct,
 	 */
 	seq = ntohl(tcph->seq);
 	ack = sack = ntohl(tcph->ack_seq);
-	win = ntohs(tcph->window);
+	win_raw = ntohs(tcph->window);
+	win = win_raw;
 	end = segment_seq_plus_len(seq, skb->len, dataoff, tcph);
 
 	if (receiver->flags & IP_CT_TCP_FLAG_SACK_PERM)
@@ -568,13 +570,20 @@ static bool tcp_in_window(const struct nf_conn *ct,
 			swin = win << sender->td_scale;
 			sender->td_maxwin = (swin == 0 ? 1 : swin);
 			sender->td_maxend = end + sender->td_maxwin;
-			/*
-			 * We haven't seen traffic in the other direction yet
-			 * but we have to tweak window tracking to pass III
-			 * and IV until that happens.
-			 */
-			if (receiver->td_maxwin == 0)
+			if (receiver->td_maxwin == 0) {
+				/* We haven't seen traffic in the other
+				 * direction yet but we have to tweak window
+				 * tracking to pass III and IV until that
+				 * happens.
+				 */
 				receiver->td_end = receiver->td_maxend = sack;
+			} else if (sack == receiver->td_end + 1) {
+				/* Likely a reply to a keepalive.
+				 * Needed for III.
+				 */
+				receiver->td_end++;
+			}
+
 		}
 	} else if (((state->state == TCP_CONNTRACK_SYN_SENT
 		     && dir == IP_CT_DIR_ORIGINAL)
@@ -684,14 +693,14 @@ static bool tcp_in_window(const struct nf_conn *ct,
 			    && state->last_seq == seq
 			    && state->last_ack == ack
 			    && state->last_end == end
-			    && state->last_win == win)
+			    && state->last_win == win_raw)
 				state->retrans++;
 			else {
 				state->last_dir = dir;
 				state->last_seq = seq;
 				state->last_ack = ack;
 				state->last_end = end;
-				state->last_win = win;
+				state->last_win = win_raw;
 				state->retrans = 0;
 			}
 		}
@@ -795,6 +804,22 @@ static unsigned int *tcp_get_timeouts(struct net *net)
 	return tcp_pernet(net)->timeouts;
 }
 
+static bool nf_conntrack_tcp_established(const struct nf_conn *ct)
+{
+	return ct->proto.tcp.state == TCP_CONNTRACK_ESTABLISHED &&
+	       test_bit(IPS_ASSURED_BIT, &ct->status);
+}
+
+static void nf_ct_tcp_state_reset(struct ip_ct_tcp_state *state)
+{
+	state->td_end		= 0;
+	state->td_maxend	= 0;
+	state->td_maxwin	= 0;
+	state->td_maxack	= 0;
+	state->td_scale		= 0;
+	state->flags		&= IP_CT_TCP_FLAG_BE_LIBERAL;
+}
+
 /* Returns verdict for packet, or -1 for invalid. */
 static int tcp_packet(struct nf_conn *ct,
 		      const struct sk_buff *skb,
@@ -894,8 +919,7 @@ static int tcp_packet(struct nf_conn *ct,
 			ct->proto.tcp.last_flags &= ~IP_CT_EXP_CHALLENGE_ACK;
 			ct->proto.tcp.seen[ct->proto.tcp.last_dir].flags =
 				ct->proto.tcp.last_flags;
-			memset(&ct->proto.tcp.seen[dir], 0,
-			       sizeof(struct ip_ct_tcp_state));
+			nf_ct_tcp_state_reset(&ct->proto.tcp.seen[dir]);
 			break;
 		}
 		ct->proto.tcp.last_index = index;
@@ -979,16 +1003,38 @@ static int tcp_packet(struct nf_conn *ct,
 		}
 		break;
 	case TCP_CONNTRACK_CLOSE:
-		if (index == TCP_RST_SET
-		    && (ct->proto.tcp.seen[!dir].flags & IP_CT_TCP_FLAG_MAXACK_SET)
-		    && before(ntohl(th->seq), ct->proto.tcp.seen[!dir].td_maxack)) {
-			/* Invalid RST  */
-			spin_unlock_bh(&ct->lock);
-			nf_ct_l4proto_log_invalid(skb, ct, "invalid rst");
-			return -NF_ACCEPT;
+		if (index != TCP_RST_SET)
+			break;
+
+		if (ct->proto.tcp.seen[!dir].flags & IP_CT_TCP_FLAG_MAXACK_SET) {
+			u32 seq = ntohl(th->seq);
+
+			if (before(seq, ct->proto.tcp.seen[!dir].td_maxack)) {
+				/* Invalid RST  */
+				spin_unlock_bh(&ct->lock);
+				nf_ct_l4proto_log_invalid(skb, ct, "invalid rst");
+				return -NF_ACCEPT;
+			}
+
+			if (!nf_conntrack_tcp_established(ct) ||
+			    seq == ct->proto.tcp.seen[!dir].td_maxack)
+				break;
+
+			/* Check if rst is part of train, such as
+			 *   foo:80 > bar:4379: P, 235946583:235946602(19) ack 42
+			 *   foo:80 > bar:4379: R, 235946602:235946602(0)  ack 42
+			 */
+			if (ct->proto.tcp.last_index == TCP_ACK_SET &&
+			    ct->proto.tcp.last_dir == dir &&
+			    seq == ct->proto.tcp.last_end)
+				break;
+
+			/* ... RST sequence number doesn't match exactly, keep
+			 * established state to allow a possible challenge ACK.
+			 */
+			new_state = old_state;
 		}
-		if (index == TCP_RST_SET
-		    && ((test_bit(IPS_SEEN_REPLY_BIT, &ct->status)
+		if (((test_bit(IPS_SEEN_REPLY_BIT, &ct->status)
 			 && ct->proto.tcp.last_index == TCP_SYN_SET)
 			|| (!test_bit(IPS_ASSURED_BIT, &ct->status)
 			    && ct->proto.tcp.last_index == TCP_ACK_SET))
@@ -1004,7 +1050,7 @@ static int tcp_packet(struct nf_conn *ct,
 			 * segments we ignored. */
 			goto in_window;
 		}
-		/* Just fall through */
+		break;
 	default:
 		/* Keep compilers happy. */
 		break;
@@ -1035,6 +1081,8 @@ static int tcp_packet(struct nf_conn *ct,
 	if (ct->proto.tcp.retrans >= tn->tcp_max_retrans &&
 	    timeouts[new_state] > timeouts[TCP_CONNTRACK_RETRANS])
 		timeout = timeouts[TCP_CONNTRACK_RETRANS];
+	else if (unlikely(index == TCP_RST_SET))
+		timeout = timeouts[TCP_CONNTRACK_CLOSE];
 	else if ((ct->proto.tcp.seen[0].flags | ct->proto.tcp.seen[1].flags) &
 		 IP_CT_TCP_FLAG_DATA_UNACKNOWLEDGED &&
 		 timeouts[new_state] > timeouts[TCP_CONNTRACK_UNACK])

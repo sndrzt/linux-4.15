@@ -68,17 +68,23 @@ static int bnxt_tc_parse_redir(struct bnxt *bp,
 	return 0;
 }
 
-static void bnxt_tc_parse_vlan(struct bnxt *bp,
-			       struct bnxt_tc_actions *actions,
-			       const struct tc_action *tc_act)
+static int bnxt_tc_parse_vlan(struct bnxt *bp,
+			      struct bnxt_tc_actions *actions,
+			      const struct tc_action *tc_act)
 {
-	if (tcf_vlan_action(tc_act) == TCA_VLAN_ACT_POP) {
+	switch (tcf_vlan_action(tc_act)) {
+	case TCA_VLAN_ACT_POP:
 		actions->flags |= BNXT_TC_ACTION_FLAG_POP_VLAN;
-	} else if (tcf_vlan_action(tc_act) == TCA_VLAN_ACT_PUSH) {
+		break;
+	case TCA_VLAN_ACT_PUSH:
 		actions->flags |= BNXT_TC_ACTION_FLAG_PUSH_VLAN;
 		actions->push_vlan_tci = htons(tcf_vlan_push_vid(tc_act));
 		actions->push_vlan_tpid = tcf_vlan_push_proto(tc_act);
+		break;
+	default:
+		return -EOPNOTSUPP;
 	}
+	return 0;
 }
 
 static int bnxt_tc_parse_tunnel_set(struct bnxt *bp,
@@ -129,7 +135,9 @@ static int bnxt_tc_parse_actions(struct bnxt *bp,
 
 		/* Push/pop VLAN */
 		if (is_tcf_vlan(tc_act)) {
-			bnxt_tc_parse_vlan(bp, actions, tc_act);
+			rc = bnxt_tc_parse_vlan(bp, actions, tc_act);
+			if (rc)
+				return rc;
 			continue;
 		}
 
@@ -148,9 +156,6 @@ static int bnxt_tc_parse_actions(struct bnxt *bp,
 		}
 	}
 
-	if (rc)
-		return rc;
-
 	if (actions->flags & BNXT_TC_ACTION_FLAG_FWD) {
 		if (actions->flags & BNXT_TC_ACTION_FLAG_TUNNEL_ENCAP) {
 			/* dst_fid is PF's fid */
@@ -164,7 +169,7 @@ static int bnxt_tc_parse_actions(struct bnxt *bp,
 		}
 	}
 
-	return rc;
+	return 0;
 }
 
 #define GET_KEY(flow_cmd, key_type)					\
@@ -982,8 +987,10 @@ static int bnxt_tc_get_decap_handle(struct bnxt *bp, struct bnxt_tc_flow *flow,
 
 	/* Check if there's another flow using the same tunnel decap.
 	 * If not, add this tunnel to the table and resolve the other
-	 * tunnel header fileds
+	 * tunnel header fileds. Ignore src_port in the tunnel_key,
+	 * since it is not required for decap filters.
 	 */
+	decap_key->tp_src = 0;
 	decap_node = bnxt_tc_get_tunnel_node(bp, &tc_info->decap_table,
 					     &tc_info->decap_ht_params,
 					     decap_key);

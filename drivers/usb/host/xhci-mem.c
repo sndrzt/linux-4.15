@@ -357,7 +357,7 @@ static int xhci_alloc_segments_for_ring(struct xhci_hcd *xhci,
  * Set the end flag and the cycle toggle bit on the last segment.
  * See section 4.9.1 and figures 15 and 16.
  */
-static struct xhci_ring *xhci_ring_alloc(struct xhci_hcd *xhci,
+struct xhci_ring *xhci_ring_alloc(struct xhci_hcd *xhci,
 		unsigned int num_segs, unsigned int cycle_state,
 		enum xhci_ring_type type, unsigned int max_packet, gfp_t flags)
 {
@@ -454,7 +454,7 @@ int xhci_ring_expansion(struct xhci_hcd *xhci, struct xhci_ring *ring,
 	return 0;
 }
 
-static struct xhci_container_ctx *xhci_alloc_container_ctx(struct xhci_hcd *xhci,
+struct xhci_container_ctx *xhci_alloc_container_ctx(struct xhci_hcd *xhci,
 						    int type, gfp_t flags)
 {
 	struct xhci_container_ctx *ctx;
@@ -479,7 +479,7 @@ static struct xhci_container_ctx *xhci_alloc_container_ctx(struct xhci_hcd *xhci
 	return ctx;
 }
 
-static void xhci_free_container_ctx(struct xhci_hcd *xhci,
+void xhci_free_container_ctx(struct xhci_hcd *xhci,
 			     struct xhci_container_ctx *ctx)
 {
 	if (!ctx)
@@ -591,7 +591,7 @@ struct xhci_ring *xhci_stream_id_to_ring(
 	if (!ep->stream_info)
 		return NULL;
 
-	if (stream_id > ep->stream_info->num_streams)
+	if (stream_id >= ep->stream_info->num_streams)
 		return NULL;
 	return ep->stream_info->stream_rings[stream_id];
 }
@@ -644,7 +644,7 @@ struct xhci_stream_info *xhci_alloc_stream_info(struct xhci_hcd *xhci,
 			num_stream_ctxs, &stream_info->ctx_array_dma,
 			mem_flags);
 	if (!stream_info->stream_ctx_array)
-		goto cleanup_ctx;
+		goto cleanup_ring_array;
 	memset(stream_info->stream_ctx_array, 0,
 			sizeof(struct xhci_stream_ctx)*num_stream_ctxs);
 
@@ -705,6 +705,11 @@ cleanup_rings:
 	}
 	xhci_free_command(xhci, stream_info->free_streams_command);
 cleanup_ctx:
+	xhci_free_stream_ctx(xhci,
+		stream_info->num_stream_ctxs,
+		stream_info->stream_ctx_array,
+		stream_info->ctx_array_dma);
+cleanup_ring_array:
 	kfree(stream_info->stream_rings);
 cleanup_info:
 	kfree(stream_info);
@@ -878,11 +883,11 @@ void xhci_free_virt_device(struct xhci_hcd *xhci, int slot_id)
 
 	dev = xhci->devs[slot_id];
 
-	trace_xhci_free_virt_device(dev);
-
 	xhci->dcbaa->dev_context_ptrs[slot_id] = 0;
 	if (!dev)
 		return;
+
+	trace_xhci_free_virt_device(dev);
 
 	if (dev->tt_info)
 		old_active_eps = dev->tt_info->active_eps;
@@ -893,15 +898,19 @@ void xhci_free_virt_device(struct xhci_hcd *xhci, int slot_id)
 		if (dev->eps[i].stream_info)
 			xhci_free_stream_info(xhci,
 					dev->eps[i].stream_info);
-		/* Endpoints on the TT/root port lists should have been removed
-		 * when usb_disable_device() was called for the device.
-		 * We can't drop them anyway, because the udev might have gone
-		 * away by this point, and we can't tell what speed it was.
+		/*
+		 * Endpoints are normally deleted from the bandwidth list when
+		 * endpoints are dropped, before device is freed.
+		 * If host is dying or being removed then endpoints aren't
+		 * dropped cleanly, so delete the endpoint from list here.
+		 * Only applicable for hosts with software bandwidth checking.
 		 */
-		if (!list_empty(&dev->eps[i].bw_endpoint_list))
-			xhci_warn(xhci, "Slot %u endpoint %u "
-					"not removed from BW list!\n",
-					slot_id, i);
+
+		if (!list_empty(&dev->eps[i].bw_endpoint_list)) {
+			list_del_init(&dev->eps[i].bw_endpoint_list);
+			xhci_dbg(xhci, "Slot %u endpoint %u not removed from BW list!\n",
+				 slot_id, i);
+		}
 	}
 	/* If this is a hub, free the TT(s) from the TT list */
 	xhci_free_tt_info(xhci, dev, slot_id);
@@ -913,6 +922,8 @@ void xhci_free_virt_device(struct xhci_hcd *xhci, int slot_id)
 	if (dev->out_ctx)
 		xhci_free_container_ctx(xhci, dev->out_ctx);
 
+	if (dev->udev && dev->udev->slot_id)
+		dev->udev->slot_id = 0;
 	kfree(xhci->devs[slot_id]);
 	xhci->devs[slot_id] = NULL;
 }
@@ -1466,9 +1477,15 @@ int xhci_endpoint_init(struct xhci_hcd *xhci,
 	/* Allow 3 retries for everything but isoc, set CErr = 3 */
 	if (!usb_endpoint_xfer_isoc(&ep->desc))
 		err_count = 3;
-	/* Some devices get this wrong */
-	if (usb_endpoint_xfer_bulk(&ep->desc) && udev->speed == USB_SPEED_HIGH)
-		max_packet = 512;
+	/* HS bulk max packet should be 512, FS bulk supports 8, 16, 32 or 64 */
+	if (usb_endpoint_xfer_bulk(&ep->desc)) {
+		if (udev->speed == USB_SPEED_HIGH)
+			max_packet = 512;
+		if (udev->speed == USB_SPEED_FULL) {
+			max_packet = rounddown_pow_of_two(max_packet);
+			max_packet = clamp_val(max_packet, 8, 64);
+		}
+	}
 	/* xHCI 1.0 and 1.1 indicates that ctrl ep avg TRB Length should be 8 */
 	if (usb_endpoint_xfer_control(&ep->desc) && xhci->hci_version >= 0x100)
 		avg_trb_len = 8;
@@ -1604,6 +1621,10 @@ void xhci_endpoint_copy(struct xhci_hcd *xhci,
 	in_ep_ctx->ep_info2 = out_ep_ctx->ep_info2;
 	in_ep_ctx->deq = out_ep_ctx->deq;
 	in_ep_ctx->tx_info = out_ep_ctx->tx_info;
+	if (xhci->quirks & XHCI_MTK_HOST) {
+		in_ep_ctx->reserved[0] = out_ep_ctx->reserved[0];
+		in_ep_ctx->reserved[1] = out_ep_ctx->reserved[1];
+	}
 }
 
 /* Copy output xhci_slot_ctx to the input xhci_slot_ctx.
@@ -1764,21 +1785,61 @@ void xhci_free_command(struct xhci_hcd *xhci,
 	kfree(command);
 }
 
+int xhci_alloc_erst(struct xhci_hcd *xhci,
+		    struct xhci_ring *evt_ring,
+		    struct xhci_erst *erst,
+		    gfp_t flags)
+{
+	size_t size;
+	unsigned int val;
+	struct xhci_segment *seg;
+	struct xhci_erst_entry *entry;
+
+	size = sizeof(struct xhci_erst_entry) * evt_ring->num_segs;
+	erst->entries = dma_alloc_coherent(xhci_to_hcd(xhci)->self.sysdev,
+					   size,
+					   &erst->erst_dma_addr,
+					   flags);
+	if (!erst->entries)
+		return -ENOMEM;
+
+	memset(erst->entries, 0, size);
+	erst->num_entries = evt_ring->num_segs;
+
+	seg = evt_ring->first_seg;
+	for (val = 0; val < evt_ring->num_segs; val++) {
+		entry = &erst->entries[val];
+		entry->seg_addr = cpu_to_le64(seg->dma);
+		entry->seg_size = cpu_to_le32(TRBS_PER_SEGMENT);
+		entry->rsvd = 0;
+		seg = seg->next;
+	}
+
+	return 0;
+}
+
+void xhci_free_erst(struct xhci_hcd *xhci, struct xhci_erst *erst)
+{
+	size_t size;
+	struct device *dev = xhci_to_hcd(xhci)->self.sysdev;
+
+	size = sizeof(struct xhci_erst_entry) * (erst->num_entries);
+	if (erst->entries)
+		dma_free_coherent(dev, size,
+				erst->entries,
+				erst->erst_dma_addr);
+	erst->entries = NULL;
+}
+
 void xhci_mem_cleanup(struct xhci_hcd *xhci)
 {
 	struct device	*dev = xhci_to_hcd(xhci)->self.sysdev;
-	int size;
 	int i, j, num_ports;
 
 	cancel_delayed_work_sync(&xhci->cmd_timer);
 
-	/* Free the Event Ring Segment Table and the actual Event Ring */
-	size = sizeof(struct xhci_erst_entry)*(xhci->erst.num_entries);
-	if (xhci->erst.entries)
-		dma_free_coherent(dev, size,
-				xhci->erst.entries, xhci->erst.erst_dma_addr);
-	xhci->erst.entries = NULL;
-	xhci_dbg_trace(xhci, trace_xhci_dbg_init, "Freed ERST");
+	xhci_free_erst(xhci, &xhci->erst);
+
 	if (xhci->event_ring)
 		xhci_ring_free(xhci, xhci->event_ring);
 	xhci->event_ring = NULL;
@@ -1852,10 +1913,14 @@ no_bw:
 	kfree(xhci->port_array);
 	kfree(xhci->rh_bw);
 	kfree(xhci->ext_caps);
+	kfree(xhci->usb2_rhub.psi);
+	kfree(xhci->usb3_rhub.psi);
 
 	xhci->usb2_ports = NULL;
 	xhci->usb3_ports = NULL;
 	xhci->port_array = NULL;
+	xhci->usb2_rhub.psi = NULL;
+	xhci->usb3_rhub.psi = NULL;
 	xhci->rh_bw = NULL;
 	xhci->ext_caps = NULL;
 
@@ -2061,6 +2126,15 @@ static void xhci_add_in_port(struct xhci_hcd *xhci, unsigned int num_ports,
 
 	if (major_revision == 0x03) {
 		rhub = &xhci->usb3_rhub;
+		/*
+		 * Some hosts incorrectly use sub-minor version for minor
+		 * version (i.e. 0x02 instead of 0x20 for bcdUSB 0x320 and 0x01
+		 * for bcdUSB 0x310). Since there is no USB release with sub
+		 * minor version 0x301 to 0x309, we can assume that they are
+		 * incorrect and fix it here.
+		 */
+		if (minor_revision > 0x00 && minor_revision < 0x10)
+			minor_revision <<= 4;
 	} else if (major_revision <= 0x02) {
 		rhub = &xhci->usb2_rhub;
 	} else {
@@ -2315,9 +2389,8 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
 	struct device	*dev = xhci_to_hcd(xhci)->self.sysdev;
 	unsigned int	val, val2;
 	u64		val_64;
-	struct xhci_segment	*seg;
-	u32 page_size, temp;
-	int i;
+	u32		page_size, temp;
+	int		i, ret;
 
 	INIT_LIST_HEAD(&xhci->cmd_list);
 
@@ -2456,32 +2529,9 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
 	if (xhci_check_trb_in_td_math(xhci) < 0)
 		goto fail;
 
-	xhci->erst.entries = dma_alloc_coherent(dev,
-			sizeof(struct xhci_erst_entry) * ERST_NUM_SEGS, &dma,
-			flags);
-	if (!xhci->erst.entries)
+	ret = xhci_alloc_erst(xhci, xhci->event_ring, &xhci->erst, flags);
+	if (ret)
 		goto fail;
-	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
-			"// Allocated event ring segment table at 0x%llx",
-			(unsigned long long)dma);
-
-	memset(xhci->erst.entries, 0, sizeof(struct xhci_erst_entry)*ERST_NUM_SEGS);
-	xhci->erst.num_entries = ERST_NUM_SEGS;
-	xhci->erst.erst_dma_addr = dma;
-	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
-			"Set ERST to 0; private num segs = %i, virt addr = %p, dma addr = 0x%llx",
-			xhci->erst.num_entries,
-			xhci->erst.entries,
-			(unsigned long long)xhci->erst.erst_dma_addr);
-
-	/* set ring base address and size for each segment table entry */
-	for (val = 0, seg = xhci->event_ring->first_seg; val < ERST_NUM_SEGS; val++) {
-		struct xhci_erst_entry *entry = &xhci->erst.entries[val];
-		entry->seg_addr = cpu_to_le64(seg->dma);
-		entry->seg_size = cpu_to_le32(TRBS_PER_SEGMENT);
-		entry->rsvd = 0;
-		seg = seg->next;
-	}
 
 	/* set ERST count with the number of entries in the segment table */
 	val = readl(&xhci->ir_set->erst_size);
@@ -2541,7 +2591,7 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
 
 fail:
 	xhci_halt(xhci);
-	xhci_reset(xhci);
+	xhci_reset(xhci, XHCI_RESET_SHORT_USEC);
 	xhci_mem_cleanup(xhci);
 	return -ENOMEM;
 }

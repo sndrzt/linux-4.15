@@ -164,7 +164,7 @@ struct cp_control {
 };
 
 /*
- * For CP/NAT/SIT/SSA readahead
+ * indicate meta/data type
  */
 enum {
 	META_CP,
@@ -172,6 +172,8 @@ enum {
 	META_SIT,
 	META_SSA,
 	META_POR,
+	DATA_GENERIC,
+	META_GENERIC,
 };
 
 /* for the list of ino */
@@ -523,6 +525,7 @@ struct extent_tree {
 	struct list_head list;		/* to be used by sbi->zombie_list */
 	rwlock_t lock;			/* protect extent info rb-tree */
 	atomic_t node_cnt;		/* # of extent node in rb-tree*/
+	bool largest_updated;		/* largest extent updated */
 };
 
 /*
@@ -549,6 +552,7 @@ enum {
 	F2FS_GET_BLOCK_DEFAULT,
 	F2FS_GET_BLOCK_FIEMAP,
 	F2FS_GET_BLOCK_BMAP,
+	F2FS_GET_BLOCK_DIO,
 	F2FS_GET_BLOCK_PRE_DIO,
 	F2FS_GET_BLOCK_PRE_AIO,
 };
@@ -682,12 +686,12 @@ static inline bool __is_front_mergeable(struct extent_info *cur,
 }
 
 extern void f2fs_mark_inode_dirty_sync(struct inode *inode, bool sync);
-static inline void __try_update_largest_extent(struct inode *inode,
-			struct extent_tree *et, struct extent_node *en)
+static inline void __try_update_largest_extent(struct extent_tree *et,
+						struct extent_node *en)
 {
 	if (en->ei.len > et->largest.len) {
 		et->largest = en->ei;
-		f2fs_mark_inode_dirty_sync(inode, true);
+		et->largest_updated = true;
 	}
 }
 
@@ -956,6 +960,7 @@ struct f2fs_io_info {
 	bool submitted;		/* indicate IO submission */
 	int need_lock;		/* indicate we need to lock cp_rwsem */
 	bool in_list;		/* indicate fio is in io_list */
+	bool is_meta;		/* indicate borrow meta inode mapping or not */
 	enum iostat_type io_type;	/* io type */
 };
 
@@ -1215,6 +1220,17 @@ static inline bool time_to_inject(struct f2fs_sb_info *sbi, int type)
 	return false;
 }
 #endif
+
+/*
+ * Test if the mounted volume is a multi-device volume.
+ *   - For a single regular disk volume, sbi->s_ndevs is 0.
+ *   - For a single zoned disk volume, sbi->s_ndevs is 1.
+ *   - For a multi-device volume, sbi->s_ndevs is always 2 or more.
+ */
+static inline bool f2fs_is_multi_device(struct f2fs_sb_info *sbi)
+{
+	return sbi->s_ndevs > 1;
+}
 
 /* For write statistics. Suppose sector size is 512 bytes,
  * and the return value is in kbytes. s is of struct f2fs_sb_info.
@@ -1529,18 +1545,6 @@ static inline bool __exist_node_summaries(struct f2fs_sb_info *sbi)
 }
 
 /*
- * Check whether the given nid is within node id range.
- */
-static inline int check_nid_range(struct f2fs_sb_info *sbi, nid_t nid)
-{
-	if (unlikely(nid < F2FS_ROOT_INO(sbi)))
-		return -EINVAL;
-	if (unlikely(nid >= NM_I(sbi)->max_nid))
-		return -EINVAL;
-	return 0;
-}
-
-/*
  * Check whether the inode has blocks or not
  */
 static inline int F2FS_HAS_BLOCKS(struct inode *inode)
@@ -1591,22 +1595,25 @@ static inline int inc_valid_block_count(struct f2fs_sb_info *sbi,
 		sbi->total_valid_block_count = avail_user_block_count;
 		if (!*count) {
 			spin_unlock(&sbi->stat_lock);
-			percpu_counter_sub(&sbi->alloc_valid_block_count, diff);
 			goto enospc;
 		}
 	}
 	spin_unlock(&sbi->stat_lock);
 
-	if (release)
+	if (unlikely(release)) {
+		percpu_counter_sub(&sbi->alloc_valid_block_count, release);
 		dquot_release_reservation_block(inode, release);
+	}
 	f2fs_i_blocks_write(inode, *count, true, true);
 	return 0;
 
 enospc:
+	percpu_counter_sub(&sbi->alloc_valid_block_count, release);
 	dquot_release_reservation_block(inode, release);
 	return -ENOSPC;
 }
 
+void f2fs_msg(struct super_block *sb, const char *level, const char *fmt, ...);
 static inline void dec_valid_block_count(struct f2fs_sb_info *sbi,
 						struct inode *inode,
 						block_t count)
@@ -1615,13 +1622,21 @@ static inline void dec_valid_block_count(struct f2fs_sb_info *sbi,
 
 	spin_lock(&sbi->stat_lock);
 	f2fs_bug_on(sbi, sbi->total_valid_block_count < (block_t) count);
-	f2fs_bug_on(sbi, inode->i_blocks < sectors);
 	sbi->total_valid_block_count -= (block_t)count;
 	if (sbi->reserved_blocks &&
 		sbi->current_reserved_blocks < sbi->reserved_blocks)
 		sbi->current_reserved_blocks = min(sbi->reserved_blocks,
 					sbi->current_reserved_blocks + count);
 	spin_unlock(&sbi->stat_lock);
+	if (unlikely(inode->i_blocks < sectors)) {
+		f2fs_msg(sbi->sb, KERN_WARNING,
+			"Inconsistent i_blocks, ino:%lu, iblocks:%llu, sectors:%llu",
+			inode->i_ino,
+			(unsigned long long)inode->i_blocks,
+			(unsigned long long)sectors);
+		set_sbi_flag(sbi, SBI_NEED_FSCK);
+		return;
+	}
 	f2fs_i_blocks_write(inode, count, false, true);
 }
 
@@ -1855,8 +1870,13 @@ static inline struct page *f2fs_grab_cache_page(struct address_space *mapping,
 						pgoff_t index, bool for_write)
 {
 #ifdef CONFIG_F2FS_FAULT_INJECTION
-	struct page *page = find_lock_page(mapping, index);
+	struct page *page;
 
+	if (!for_write)
+		page = find_get_page_flags(mapping, index,
+						FGP_LOCK | FGP_ACCESSED);
+	else
+		page = find_lock_page(mapping, index);
 	if (page)
 		return page;
 
@@ -2273,7 +2293,9 @@ static inline void *inline_xattr_addr(struct inode *inode, struct page *page)
 
 static inline int inline_xattr_size(struct inode *inode)
 {
-	return get_inline_xattr_addrs(inode) * sizeof(__le32);
+	if (f2fs_has_inline_xattr(inode))
+		return get_inline_xattr_addrs(inode) * sizeof(__le32);
+	return 0;
 }
 
 static inline int f2fs_has_inline_data(struct inode *inode)
@@ -2399,8 +2421,17 @@ static inline bool is_dot_dotdot(const struct qstr *str)
 
 static inline bool f2fs_may_extent_tree(struct inode *inode)
 {
-	if (!test_opt(F2FS_I_SB(inode), EXTENT_CACHE) ||
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+
+	if (!test_opt(sbi, EXTENT_CACHE) ||
 			is_inode_flag_set(inode, FI_NO_EXTENT))
+		return false;
+
+	/*
+	 * for recovered files during mount do not create extents
+	 * if shrinker is not registered.
+	 */
+	if (list_empty(&sbi->s_list))
 		return false;
 
 	return S_ISREG(inode->i_mode);
@@ -2466,6 +2497,38 @@ static inline void f2fs_update_iostat(struct f2fs_sb_info *sbi,
 			sbi->write_iostat[APP_WRITE_IO] -
 			sbi->write_iostat[APP_DIRECT_IO];
 	spin_unlock(&sbi->iostat_lock);
+}
+
+#define __is_meta_io(fio) (PAGE_TYPE_OF_BIO(fio->type) == META &&	\
+				(!is_read_io(fio->op) || fio->is_meta))
+
+bool f2fs_is_valid_blkaddr(struct f2fs_sb_info *sbi,
+					block_t blkaddr, int type);
+static inline void verify_blkaddr(struct f2fs_sb_info *sbi,
+					block_t blkaddr, int type)
+{
+	if (!f2fs_is_valid_blkaddr(sbi, blkaddr, type)) {
+		f2fs_msg(sbi->sb, KERN_ERR,
+			"invalid blkaddr: %u, type: %d, run fsck to fix.",
+			blkaddr, type);
+		f2fs_bug_on(sbi, 1);
+	}
+}
+
+static inline bool __is_valid_data_blkaddr(block_t blkaddr)
+{
+	if (blkaddr == NEW_ADDR || blkaddr == NULL_ADDR)
+		return false;
+	return true;
+}
+
+static inline bool is_valid_data_blkaddr(struct f2fs_sb_info *sbi,
+						block_t blkaddr)
+{
+	if (!__is_valid_data_blkaddr(blkaddr))
+		return false;
+	verify_blkaddr(sbi, blkaddr, DATA_GENERIC);
+	return true;
 }
 
 /*
@@ -2577,6 +2640,7 @@ f2fs_hash_t f2fs_dentry_hash(const struct qstr *name_info,
 struct dnode_of_data;
 struct node_info;
 
+int check_nid_range(struct f2fs_sb_info *sbi, nid_t nid);
 bool available_free_memory(struct f2fs_sb_info *sbi, int type);
 int need_dentry_mark(struct f2fs_sb_info *sbi, nid_t nid);
 bool is_checkpointed_node(struct f2fs_sb_info *sbi, nid_t nid);
@@ -2680,7 +2744,8 @@ void f2fs_stop_checkpoint(struct f2fs_sb_info *sbi, bool end_io);
 struct page *grab_meta_page(struct f2fs_sb_info *sbi, pgoff_t index);
 struct page *get_meta_page(struct f2fs_sb_info *sbi, pgoff_t index);
 struct page *get_tmp_page(struct f2fs_sb_info *sbi, pgoff_t index);
-bool is_valid_blkaddr(struct f2fs_sb_info *sbi, block_t blkaddr, int type);
+bool f2fs_is_valid_blkaddr(struct f2fs_sb_info *sbi,
+					block_t blkaddr, int type);
 int ra_meta_pages(struct f2fs_sb_info *sbi, block_t start, int nrpages,
 			int type, bool sync);
 void ra_meta_pages_cond(struct f2fs_sb_info *sbi, pgoff_t index);
@@ -3065,7 +3130,7 @@ static inline void f2fs_set_encrypted_inode(struct inode *inode)
 {
 #ifdef CONFIG_F2FS_FS_ENCRYPTION
 	file_set_encrypt(inode);
-	inode->i_flags |= S_ENCRYPTED;
+	f2fs_set_inode_flags(inode);
 #endif
 }
 
@@ -3157,3 +3222,7 @@ static inline bool f2fs_may_encrypt(struct inode *inode)
 }
 
 #endif
+
+#define EFSBADCRC	EBADMSG		/* Bad CRC detected */
+#define EFSCORRUPTED	EUCLEAN		/* Filesystem is corrupted */
+

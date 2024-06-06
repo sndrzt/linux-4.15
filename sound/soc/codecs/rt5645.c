@@ -3681,6 +3681,23 @@ static const struct dmi_system_id dmi_platform_minix_z83_4[] = {
 	{ }
 };
 
+static const struct rt5645_platform_data lattepanda_board_platform_data = {
+       .jd_mode = 2,
+       .inv_jd1_1 = true,
+};
+
+static const struct dmi_system_id dmi_platform_lattepanda_board[] = {
+	{
+		.ident = "LattePanda board",
+		.matches = {
+		  DMI_EXACT_MATCH(DMI_BOARD_VENDOR, "AMI Corporation"),
+		  DMI_EXACT_MATCH(DMI_BOARD_NAME, "Cherry Trail CR"),
+		  DMI_EXACT_MATCH(DMI_BOARD_VERSION, "Default string"),
+		},
+	},
+	{ }
+};
+
 static bool rt5645_check_dp(struct device *dev)
 {
 	if (device_property_present(dev, "realtek,in2-differential") ||
@@ -3737,6 +3754,8 @@ static int rt5645_i2c_probe(struct i2c_client *i2c,
 		rt5645->pdata = general_platform_data2;
 	else if (dmi_check_system(dmi_platform_minix_z83_4))
 		rt5645->pdata = minix_z83_4_platform_data;
+	else if (dmi_check_system(dmi_platform_lattepanda_board))
+		rt5645->pdata = lattepanda_board_platform_data;
 
 	if (quirk != -1) {
 		rt5645->pdata.in2_diff = QUIRK_IN2_DIFF(quirk);
@@ -3993,9 +4012,14 @@ static int rt5645_i2c_remove(struct i2c_client *i2c)
 	if (i2c->irq)
 		free_irq(i2c->irq, rt5645);
 
+	/*
+	 * Since the rt5645_btn_check_callback() can queue jack_detect_work,
+	 * the timer need to be delted first
+	 */
+	del_timer_sync(&rt5645->btn_check_timer);
+
 	cancel_delayed_work_sync(&rt5645->jack_detect_work);
 	cancel_delayed_work_sync(&rt5645->rcclock_work);
-	del_timer_sync(&rt5645->btn_check_timer);
 
 	snd_soc_unregister_codec(&i2c->dev);
 	regulator_bulk_disable(ARRAY_SIZE(rt5645->supplies), rt5645->supplies);

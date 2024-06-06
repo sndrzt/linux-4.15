@@ -275,9 +275,9 @@ static void bfqg_and_blkg_get(struct bfq_group *bfqg)
 
 void bfqg_and_blkg_put(struct bfq_group *bfqg)
 {
-	bfqg_put(bfqg);
-
 	blkg_put(bfqg_to_blkg(bfqg));
+
+	bfqg_put(bfqg);
 }
 
 /* @stats = 0 */
@@ -525,12 +525,13 @@ struct bfq_group *bfq_find_set_group(struct bfq_data *bfqd,
 	 */
 	entity = &bfqg->entity;
 	for_each_entity(entity) {
-		bfqg = container_of(entity, struct bfq_group, entity);
-		if (bfqg != bfqd->root_group) {
-			parent = bfqg_parent(bfqg);
+		struct bfq_group *curr_bfqg = container_of(entity,
+						struct bfq_group, entity);
+		if (curr_bfqg != bfqd->root_group) {
+			parent = bfqg_parent(curr_bfqg);
 			if (!parent)
 				parent = bfqd->root_group;
-			bfq_group_set_parent(bfqg, parent);
+			bfq_group_set_parent(curr_bfqg, parent);
 		}
 	}
 
@@ -775,10 +776,11 @@ static void bfq_pd_offline(struct blkg_policy_data *pd)
 	unsigned long flags;
 	int i;
 
-	if (!entity) /* root group */
-		return;
-
 	spin_lock_irqsave(&bfqd->lock, flags);
+
+	if (!entity) /* root group */
+		goto put_async_queues;
+
 	/*
 	 * Empty all service_trees belonging to this group before
 	 * deactivating the group itself.
@@ -809,6 +811,8 @@ static void bfq_pd_offline(struct blkg_policy_data *pd)
 	}
 
 	__bfq_deactivate_entity(entity, false);
+
+put_async_queues:
 	bfq_put_async_queues(bfqd, bfqg);
 
 	spin_unlock_irqrestore(&bfqd->lock, flags);
@@ -910,7 +914,8 @@ static ssize_t bfq_io_set_weight(struct kernfs_open_file *of,
 	if (ret)
 		return ret;
 
-	return bfq_io_set_weight_legacy(of_css(of), NULL, weight);
+	ret = bfq_io_set_weight_legacy(of_css(of), NULL, weight);
+	return ret ?: nbytes;
 }
 
 #ifdef CONFIG_DEBUG_BLK_CGROUP

@@ -216,36 +216,30 @@ inline void megasas_return_cmd_fusion(struct megasas_instance *instance,
 /**
  * megasas_fire_cmd_fusion -	Sends command to the FW
  * @instance:			Adapter soft state
- * @req_desc:			32bit or 64bit Request descriptor
+ * @req_desc:			64bit Request descriptor
  *
- * Perform PCI Write. Ventura supports 32 bit Descriptor.
- * Prior to Ventura (12G) MR controller supports 64 bit Descriptor.
+ * Perform PCI Write.
  */
 
 static void
 megasas_fire_cmd_fusion(struct megasas_instance *instance,
 		union MEGASAS_REQUEST_DESCRIPTOR_UNION *req_desc)
 {
-	if (instance->adapter_type == VENTURA_SERIES)
-		writel(le32_to_cpu(req_desc->u.low),
-			&instance->reg_set->inbound_single_queue_port);
-	else {
 #if defined(writeq) && defined(CONFIG_64BIT)
-		u64 req_data = (((u64)le32_to_cpu(req_desc->u.high) << 32) |
-				le32_to_cpu(req_desc->u.low));
+	u64 req_data = (((u64)le32_to_cpu(req_desc->u.high) << 32) |
+		le32_to_cpu(req_desc->u.low));
 
-		writeq(req_data, &instance->reg_set->inbound_low_queue_port);
+	writeq(req_data, &instance->reg_set->inbound_low_queue_port);
 #else
-		unsigned long flags;
-		spin_lock_irqsave(&instance->hba_lock, flags);
-		writel(le32_to_cpu(req_desc->u.low),
-			&instance->reg_set->inbound_low_queue_port);
-		writel(le32_to_cpu(req_desc->u.high),
-			&instance->reg_set->inbound_high_queue_port);
-		mmiowb();
-		spin_unlock_irqrestore(&instance->hba_lock, flags);
+	unsigned long flags;
+	spin_lock_irqsave(&instance->hba_lock, flags);
+	writel(le32_to_cpu(req_desc->u.low),
+		&instance->reg_set->inbound_low_queue_port);
+	writel(le32_to_cpu(req_desc->u.high),
+		&instance->reg_set->inbound_high_queue_port);
+	mmiowb();
+	spin_unlock_irqrestore(&instance->hba_lock, flags);
 #endif
-	}
 }
 
 /**
@@ -536,7 +530,8 @@ retry_alloc:
 
 	fusion->io_request_frames =
 			dma_pool_alloc(fusion->io_request_frames_pool,
-				GFP_KERNEL, &fusion->io_request_frames_phys);
+				GFP_KERNEL | __GFP_NOWARN,
+				&fusion->io_request_frames_phys);
 	if (!fusion->io_request_frames) {
 		if (instance->max_fw_cmds >= (MEGASAS_REDUCE_QD_COUNT * 2)) {
 			instance->max_fw_cmds -= MEGASAS_REDUCE_QD_COUNT;
@@ -574,7 +569,7 @@ retry_alloc:
 
 		fusion->io_request_frames =
 			dma_pool_alloc(fusion->io_request_frames_pool,
-				       GFP_KERNEL,
+				       GFP_KERNEL | __GFP_NOWARN,
 				       &fusion->io_request_frames_phys);
 
 		if (!fusion->io_request_frames) {
@@ -982,7 +977,6 @@ megasas_ioc_init_fusion(struct megasas_instance *instance)
 	const char *sys_info;
 	MFI_CAPABILITIES *drv_ops;
 	u32 scratch_pad_2;
-	unsigned long flags;
 	struct timeval tv;
 	bool cur_fw_64bit_dma_capable;
 
@@ -1121,14 +1115,7 @@ megasas_ioc_init_fusion(struct megasas_instance *instance)
 			break;
 	}
 
-	/* For Ventura also IOC INIT required 64 bit Descriptor write. */
-	spin_lock_irqsave(&instance->hba_lock, flags);
-	writel(le32_to_cpu(req_desc.u.low),
-	       &instance->reg_set->inbound_low_queue_port);
-	writel(le32_to_cpu(req_desc.u.high),
-	       &instance->reg_set->inbound_high_queue_port);
-	mmiowb();
-	spin_unlock_irqrestore(&instance->hba_lock, flags);
+	megasas_fire_cmd_fusion(instance, &req_desc);
 
 	wait_and_poll(instance, cmd, MFI_POLL_TIMEOUT_SECS);
 
@@ -1138,12 +1125,12 @@ megasas_ioc_init_fusion(struct megasas_instance *instance)
 		goto fail_fw_init;
 	}
 
-	ret = 0;
+	return 0;
 
 fail_fw_init:
 	dev_err(&instance->pdev->dev,
-		"Init cmd return status %s for SCSI host %d\n",
-		ret ? "FAILED" : "SUCCESS", instance->host->host_no);
+		"Init cmd return status FAILED for SCSI host %d\n",
+		instance->host->host_no);
 
 	return ret;
 }
@@ -2655,11 +2642,8 @@ megasas_build_ldio_fusion(struct megasas_instance *instance,
 			fp_possible = (io_info.fpOkForIo > 0) ? true : false;
 	}
 
-	/* Use raw_smp_processor_id() for now until cmd->request->cpu is CPU
-	   id by default, not CPU group id, otherwise all MSI-X queues won't
-	   be utilized */
-	cmd->request_desc->SCSIIO.MSIxIndex = instance->msix_vectors ?
-		raw_smp_processor_id() % instance->msix_vectors : 0;
+	cmd->request_desc->SCSIIO.MSIxIndex =
+		instance->reply_map[raw_smp_processor_id()];
 
 	praid_context = &io_request->RaidContext;
 
@@ -2846,7 +2830,7 @@ static void megasas_build_ld_nonrw_fusion(struct megasas_instance *instance,
 		device_id < instance->fw_supported_vd_count)) {
 
 		ld = MR_TargetIdToLdGet(device_id, local_map_ptr);
-		if (ld >= instance->fw_supported_vd_count)
+		if (ld >= instance->fw_supported_vd_count - 1)
 			fp_possible = 0;
 		else {
 			raid = MR_LdRaidGet(ld, local_map_ptr);
@@ -2981,10 +2965,9 @@ megasas_build_syspd_fusion(struct megasas_instance *instance,
 	}
 
 	cmd->request_desc->SCSIIO.DevHandle = io_request->DevHandle;
-	cmd->request_desc->SCSIIO.MSIxIndex =
-		instance->msix_vectors ?
-		(raw_smp_processor_id() % instance->msix_vectors) : 0;
 
+	cmd->request_desc->SCSIIO.MSIxIndex =
+		instance->reply_map[raw_smp_processor_id()];
 
 	if (!fp_possible) {
 		/* system pd firmware path */
@@ -2995,6 +2978,9 @@ megasas_build_syspd_fusion(struct megasas_instance *instance,
 		pRAID_Context->timeout_value = cpu_to_le16(os_timeout_value);
 		pRAID_Context->virtual_disk_tgt_id = cpu_to_le16(device_id);
 	} else {
+		if (os_timeout_value)
+			os_timeout_value++;
+
 		/* system pd Fast Path */
 		io_request->Function = MPI2_FUNCTION_SCSI_IO_REQUEST;
 		timeout_limit = (scmd->device->type == TYPE_DISK) ?
@@ -4529,6 +4515,7 @@ int megasas_reset_fusion(struct Scsi_Host *shost, int reason)
 	if (instance->requestorId && !instance->skip_heartbeat_timer_del)
 		del_timer_sync(&instance->sriov_heartbeat_timer);
 	set_bit(MEGASAS_FUSION_IN_RESET, &instance->reset_flags);
+	set_bit(MEGASAS_FUSION_OCR_NOT_POSSIBLE, &instance->reset_flags);
 	atomic_set(&instance->adprecovery, MEGASAS_ADPRESET_SM_POLLING);
 	instance->instancet->disable_intr(instance);
 	megasas_sync_irqs((unsigned long)instance);
@@ -4710,7 +4697,7 @@ fail_kill_adapter:
 		atomic_set(&instance->adprecovery, MEGASAS_HBA_OPERATIONAL);
 	}
 out:
-	clear_bit(MEGASAS_FUSION_IN_RESET, &instance->reset_flags);
+	clear_bit(MEGASAS_FUSION_OCR_NOT_POSSIBLE, &instance->reset_flags);
 	mutex_unlock(&instance->reset_mutex);
 	return retval;
 }

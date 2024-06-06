@@ -642,7 +642,6 @@ static struct btrfsic_dev_state *btrfsic_dev_state_hashtable_lookup(dev_t dev,
 static int btrfsic_process_superblock(struct btrfsic_state *state,
 				      struct btrfs_fs_devices *fs_devices)
 {
-	struct btrfs_fs_info *fs_info = state->fs_info;
 	struct btrfs_super_block *selected_super;
 	struct list_head *dev_head = &fs_devices->devices;
 	struct btrfs_device *device;
@@ -713,7 +712,7 @@ static int btrfsic_process_superblock(struct btrfsic_state *state,
 			break;
 		}
 
-		num_copies = btrfs_num_copies(fs_info, next_bytenr,
+		num_copies = btrfs_num_copies(state->fs_info, next_bytenr,
 					      state->metablock_size);
 		if (state->print_mask & BTRFSIC_PRINT_MASK_NUM_COPIES)
 			pr_info("num_copies(log_bytenr=%llu) = %d\n",
@@ -1215,24 +1214,24 @@ static void btrfsic_read_from_block_data(
 	void *dstv, u32 offset, size_t len)
 {
 	size_t cur;
-	size_t offset_in_page;
+	size_t pgoff;
 	char *kaddr;
 	char *dst = (char *)dstv;
-	size_t start_offset = block_ctx->start & ((u64)PAGE_SIZE - 1);
+	size_t start_offset = offset_in_page(block_ctx->start);
 	unsigned long i = (start_offset + offset) >> PAGE_SHIFT;
 
 	WARN_ON(offset + len > block_ctx->len);
-	offset_in_page = (start_offset + offset) & (PAGE_SIZE - 1);
+	pgoff = offset_in_page(start_offset + offset);
 
 	while (len > 0) {
-		cur = min(len, ((size_t)PAGE_SIZE - offset_in_page));
+		cur = min(len, ((size_t)PAGE_SIZE - pgoff));
 		BUG_ON(i >= DIV_ROUND_UP(block_ctx->len, PAGE_SIZE));
 		kaddr = block_ctx->datav[i];
-		memcpy(dst, kaddr + offset_in_page, cur);
+		memcpy(dst, kaddr + pgoff, cur);
 
 		dst += cur;
 		len -= cur;
-		offset_in_page = 0;
+		pgoff = 0;
 		i++;
 	}
 }
@@ -1552,7 +1551,12 @@ static int btrfsic_map_block(struct btrfsic_state *state, u64 bytenr, u32 len,
 	}
 
 	device = multi->stripes[0].dev;
-	block_ctx_out->dev = btrfsic_dev_state_lookup(device->bdev->bd_dev);
+	if (test_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state) ||
+	    !device->bdev || !device->name)
+		block_ctx_out->dev = NULL;
+	else
+		block_ctx_out->dev = btrfsic_dev_state_lookup(
+							device->bdev->bd_dev);
 	block_ctx_out->dev_bytenr = multi->stripes[0].physical;
 	block_ctx_out->start = bytenr;
 	block_ctx_out->len = len;

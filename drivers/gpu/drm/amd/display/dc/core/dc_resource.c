@@ -35,6 +35,7 @@
 #include "core_types.h"
 #include "set_mode_types.h"
 #include "virtual/virtual_stream_encoder.h"
+#include "dpcd_defs.h"
 
 #include "dce80/dce80_resource.h"
 #include "dce100/dce100_resource.h"
@@ -216,7 +217,7 @@ bool resource_construct(
 		 * PORT_CONNECTIVITY == 1 (as instructed by HW team).
 		 */
 		update_num_audio(&straps, &num_audio, &pool->audio_support);
-		for (i = 0; i < pool->pipe_count && i < num_audio; i++) {
+		for (i = 0; i < caps->num_audio; i++) {
 			struct audio *aud = create_funcs->create_audio(ctx, i);
 
 			if (aud == NULL) {
@@ -262,23 +263,29 @@ bool resource_construct(
 
 	return true;
 }
+static int find_matching_clock_source(
+		const struct resource_pool *pool,
+		struct clock_source *clock_source)
+{
 
+	int i;
+
+	for (i = 0; i < pool->clk_src_count; i++) {
+		if (pool->clock_sources[i] == clock_source)
+			return i;
+	}
+	return -1;
+}
 
 void resource_unreference_clock_source(
 		struct resource_context *res_ctx,
 		const struct resource_pool *pool,
 		struct clock_source *clock_source)
 {
-	int i;
+	int i = find_matching_clock_source(pool, clock_source);
 
-	for (i = 0; i < pool->clk_src_count; i++) {
-		if (pool->clock_sources[i] != clock_source)
-			continue;
-
+	if (i > -1)
 		res_ctx->clock_source_ref_count[i]--;
-
-		break;
-	}
 
 	if (pool->dp_clock_source == clock_source)
 		res_ctx->dp_clock_source_ref_count--;
@@ -289,17 +296,29 @@ void resource_reference_clock_source(
 		const struct resource_pool *pool,
 		struct clock_source *clock_source)
 {
-	int i;
-	for (i = 0; i < pool->clk_src_count; i++) {
-		if (pool->clock_sources[i] != clock_source)
-			continue;
+	int i = find_matching_clock_source(pool, clock_source);
 
+	if (i > -1)
 		res_ctx->clock_source_ref_count[i]++;
-		break;
-	}
 
 	if (pool->dp_clock_source == clock_source)
 		res_ctx->dp_clock_source_ref_count++;
+}
+
+int resource_get_clock_source_reference(
+		struct resource_context *res_ctx,
+		const struct resource_pool *pool,
+		struct clock_source *clock_source)
+{
+	int i = find_matching_clock_source(pool, clock_source);
+
+	if (i > -1)
+		return res_ctx->clock_source_ref_count[i];
+
+	if (pool->dp_clock_source == clock_source)
+		return res_ctx->dp_clock_source_ref_count;
+
+	return -1;
 }
 
 bool resource_are_streams_timing_synchronizable(
@@ -324,12 +343,29 @@ bool resource_are_streams_timing_synchronizable(
 				!= stream2->timing.pix_clk_khz)
 		return false;
 
+	if (stream1->clamping.c_depth != stream2->clamping.c_depth)
+		return false;
+
 	if (stream1->phy_pix_clk != stream2->phy_pix_clk
 			&& (!dc_is_dp_signal(stream1->signal)
 			|| !dc_is_dp_signal(stream2->signal)))
 		return false;
 
 	return true;
+}
+static bool is_dp_and_hdmi_sharable(
+		struct dc_stream_state *stream1,
+		struct dc_stream_state *stream2)
+{
+	if (stream1->ctx->dc->caps.disable_dp_clk_share)
+		return false;
+
+	if (stream1->clamping.c_depth != COLOR_DEPTH_888 ||
+	    stream2->clamping.c_depth != COLOR_DEPTH_888)
+	return false;
+
+	return true;
+
 }
 
 static bool is_sharable_clk_src(
@@ -342,7 +378,10 @@ static bool is_sharable_clk_src(
 	if (pipe_with_clk_src->stream->signal == SIGNAL_TYPE_VIRTUAL)
 		return false;
 
-	if (dc_is_dp_signal(pipe_with_clk_src->stream->signal))
+	if (dc_is_dp_signal(pipe_with_clk_src->stream->signal) ||
+		(dc_is_dp_signal(pipe->stream->signal) &&
+		!is_dp_and_hdmi_sharable(pipe_with_clk_src->stream,
+				     pipe->stream)))
 		return false;
 
 	if (dc_is_hdmi_signal(pipe_with_clk_src->stream->signal)
@@ -1169,10 +1208,12 @@ bool dc_remove_plane_from_context(
 			 * For head pipe detach surfaces from pipe for tail
 			 * pipe just zero it out
 			 */
-			if (!pipe_ctx->top_pipe) {
+			if (!pipe_ctx->top_pipe || (!pipe_ctx->top_pipe->top_pipe &&
+					pipe_ctx->top_pipe->stream_res.opp != pipe_ctx->stream_res.opp)) {
+				pipe_ctx->top_pipe = NULL;
 				pipe_ctx->plane_state = NULL;
 				pipe_ctx->bottom_pipe = NULL;
-			} else  {
+			} else {
 				memset(pipe_ctx, 0, sizeof(*pipe_ctx));
 			}
 		}
@@ -1464,6 +1505,12 @@ static struct audio *find_first_free_audio(
 			return pool->audios[i];
 		}
 	}
+
+    /* use engine id to find free audio */
+	if ((id < pool->audio_count) && (res_ctx->is_audio_acquired[id] == false)) {
+		return pool->audios[id];
+	}
+
 	/*not found the matching one, first come first serve*/
 	for (i = 0; i < pool->audio_count; i++) {
 		if (res_ctx->is_audio_acquired[i] == false) {
@@ -1546,8 +1593,6 @@ enum dc_status dc_remove_stream_from_ctx(
 							  del_pipe->clock_source);
 
 			memset(del_pipe, 0, sizeof(*del_pipe));
-
-			break;
 		}
 	}
 
@@ -1626,6 +1671,7 @@ static int get_norm_pix_clk(const struct dc_crtc_timing *timing)
 		pix_clk /= 2;
 	if (timing->pixel_encoding != PIXEL_ENCODING_YCBCR422) {
 		switch (timing->display_color_depth) {
+		case COLOR_DEPTH_666:
 		case COLOR_DEPTH_888:
 			normalized_pix_clk = pix_clk;
 			break;
@@ -1679,6 +1725,8 @@ enum dc_status resource_map_pool_resources(
 		}
 	*/
 
+	calculate_phy_pix_clks(stream);
+
 	/* acquire new resources */
 	pipe_idx = acquire_first_free_pipe(&context->res_ctx, pool, stream);
 
@@ -1707,7 +1755,7 @@ enum dc_status resource_map_pool_resources(
 	/* TODO: Add check if ASIC support and EDID audio */
 	if (!stream->sink->converter_disable_audio &&
 	    dc_is_audio_capable_signal(pipe_ctx->stream->signal) &&
-	    stream->audio_info.mode_count) {
+	    stream->audio_info.mode_count && stream->audio_info.flags.all) {
 		pipe_ctx->stream_res.audio = find_first_free_audio(
 		&context->res_ctx, pool, pipe_ctx->stream_res.stream_enc->id);
 
@@ -2428,7 +2476,8 @@ static void set_vsc_info_packet(
 	unsigned int vscPacketRevision = 0;
 	unsigned int i;
 
-	if (stream->sink->link->psr_enabled) {
+	/*VSC packet set to 2 when DP revision >= 1.2*/
+	if (stream->sink->link->dpcd_caps.dpcd_rev.raw >= DPCD_REV_12) {
 		vscPacketRevision = 2;
 	}
 

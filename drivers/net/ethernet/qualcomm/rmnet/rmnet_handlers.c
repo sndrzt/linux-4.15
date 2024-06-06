@@ -125,7 +125,7 @@ static int rmnet_map_egress_handler(struct sk_buff *skb,
 	required_headroom = sizeof(struct rmnet_map_header);
 
 	if (skb_headroom(skb) < required_headroom) {
-		if (pskb_expand_head(skb, required_headroom, 0, GFP_KERNEL))
+		if (pskb_expand_head(skb, required_headroom, 0, GFP_ATOMIC))
 			goto fail;
 	}
 
@@ -152,6 +152,9 @@ fail:
 static void
 rmnet_bridge_handler(struct sk_buff *skb, struct net_device *bridge_dev)
 {
+	if (skb_mac_header_was_set(skb))
+		skb_push(skb, skb->mac_len);
+
 	if (bridge_dev) {
 		skb->dev = bridge_dev;
 		dev_queue_xmit(skb);
@@ -173,8 +176,16 @@ rx_handler_result_t rmnet_rx_handler(struct sk_buff **pskb)
 	if (!skb)
 		goto done;
 
+	if (skb->pkt_type == PACKET_LOOPBACK)
+		return RX_HANDLER_PASS;
+
 	dev = skb->dev;
-	port = rmnet_get_port(dev);
+	port = rmnet_get_port_rcu(dev);
+	if (unlikely(!port)) {
+		atomic_long_inc(&skb->dev->rx_nohandler);
+		kfree_skb(skb);
+		goto done;
+	}
 
 	switch (port->rmnet_mode) {
 	case RMNET_EPMODE_VND:
@@ -206,7 +217,7 @@ void rmnet_egress_handler(struct sk_buff *skb)
 	skb->dev = priv->real_dev;
 	mux_id = priv->mux_id;
 
-	port = rmnet_get_port(skb->dev);
+	port = rmnet_get_port_rcu(skb->dev);
 	if (!port) {
 		kfree_skb(skb);
 		return;

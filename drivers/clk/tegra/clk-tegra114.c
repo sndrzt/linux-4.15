@@ -955,8 +955,7 @@ static void __init tegra114_pll_init(void __iomem *clk_base,
 
 	/* PLLM */
 	clk = tegra_clk_register_pllm("pll_m", "pll_ref", clk_base, pmc,
-			     CLK_IGNORE_UNUSED | CLK_SET_RATE_GATE,
-			     &pll_m_params, NULL);
+			     CLK_SET_RATE_GATE, &pll_m_params, NULL);
 	clks[TEGRA114_CLK_PLL_M] = clk;
 
 	/* PLLM_OUT1 */
@@ -1341,6 +1340,7 @@ static void __init tegra114_clock_init(struct device_node *np)
 	}
 
 	pmc_base = of_iomap(node, 0);
+	of_node_put(node);
 	if (!pmc_base) {
 		pr_err("Can't map pmc registers\n");
 		WARN_ON(1);

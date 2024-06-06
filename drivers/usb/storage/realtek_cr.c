@@ -38,7 +38,11 @@ MODULE_LICENSE("GPL");
 
 static int auto_delink_en = 1;
 module_param(auto_delink_en, int, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(auto_delink_en, "enable auto delink");
+MODULE_PARM_DESC(auto_delink_en, "auto delink mode (0=firmware, 1=software [default])");
+
+static int enable_mmc = 1;
+module_param(enable_mmc, int, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(enable_mmc, "enable mmc support");
 
 #ifdef CONFIG_REALTEK_AUTOPM
 static int ss_en = 1;
@@ -364,7 +368,7 @@ static int rts51x_read_mem(struct us_data *us, u16 addr, u8 *data, u16 len)
 
 	buf = kmalloc(len, GFP_NOIO);
 	if (buf == NULL)
-		return USB_STOR_TRANSPORT_ERROR;
+		return -ENOMEM;
 
 	usb_stor_dbg(us, "addr = 0x%x, len = %d\n", addr, len);
 
@@ -472,6 +476,27 @@ static int rts51x_check_status(struct us_data *us, u8 lun)
 	}
 
 	return 0;
+}
+
+static int rts51x_lun_is_mmc_xd(struct us_data *us, u8 lun)
+{
+	struct rts51x_chip *chip = (struct rts51x_chip *)(us->extra);
+
+	if (rts51x_check_status(us, lun))
+		return -EIO;
+
+	usb_stor_dbg(us,"cur_lun = 0x%02X\n", chip->status[lun].cur_lun);
+	usb_stor_dbg(us,"card_type = 0x%02X\n", chip->status[lun].card_type);
+	usb_stor_dbg(us,"detailed_type1= 0x%02X\n", chip->status[lun].detailed_type.detailed_type1);
+	switch (chip->status[lun].card_type) {
+	case 0x4: /* XD */
+		return 1;
+	case 0x2: /* SD/MMC */
+		if (chip->status[lun].detailed_type.detailed_type1 & 0x08)
+			return 1;
+	default:
+		return 0;
+	}
 }
 
 static int enable_oscillator(struct us_data *us)
@@ -763,18 +788,16 @@ static void rts51x_suspend_timer_fn(struct timer_list *t)
 		break;
 	case RTS51X_STAT_IDLE:
 	case RTS51X_STAT_SS:
-		usb_stor_dbg(us, "RTS51X_STAT_SS, intf->pm_usage_cnt:%d, power.usage:%d\n",
-			     atomic_read(&us->pusb_intf->pm_usage_cnt),
+		usb_stor_dbg(us, "RTS51X_STAT_SS, power.usage:%d\n",
 			     atomic_read(&us->pusb_intf->dev.power.usage_count));
 
-		if (atomic_read(&us->pusb_intf->pm_usage_cnt) > 0) {
+		if (atomic_read(&us->pusb_intf->dev.power.usage_count) > 0) {
 			usb_stor_dbg(us, "Ready to enter SS state\n");
 			rts51x_set_stat(chip, RTS51X_STAT_SS);
 			/* ignore mass storage interface's children */
 			pm_suspend_ignore_children(&us->pusb_intf->dev, true);
 			usb_autopm_put_interface_async(us->pusb_intf);
-			usb_stor_dbg(us, "RTS51X_STAT_SS 01, intf->pm_usage_cnt:%d, power.usage:%d\n",
-				     atomic_read(&us->pusb_intf->pm_usage_cnt),
+			usb_stor_dbg(us, "RTS51X_STAT_SS 01, power.usage:%d\n",
 				     atomic_read(&us->pusb_intf->dev.power.usage_count));
 		}
 		break;
@@ -807,11 +830,10 @@ static void rts51x_invoke_transport(struct scsi_cmnd *srb, struct us_data *us)
 	int ret;
 
 	if (working_scsi(srb)) {
-		usb_stor_dbg(us, "working scsi, intf->pm_usage_cnt:%d, power.usage:%d\n",
-			     atomic_read(&us->pusb_intf->pm_usage_cnt),
+		usb_stor_dbg(us, "working scsi, power.usage:%d\n",
 			     atomic_read(&us->pusb_intf->dev.power.usage_count));
 
-		if (atomic_read(&us->pusb_intf->pm_usage_cnt) <= 0) {
+		if (atomic_read(&us->pusb_intf->dev.power.usage_count) <= 0) {
 			ret = usb_autopm_get_interface(us->pusb_intf);
 			usb_stor_dbg(us, "working scsi, ret=%d\n", ret);
 		}
@@ -852,6 +874,17 @@ static void rts51x_invoke_transport(struct scsi_cmnd *srb, struct us_data *us)
 			chip->proto_handler_backup(srb, us);
 			/* Check whether card is plugged in */
 			if (srb->cmnd[0] == TEST_UNIT_READY) {
+				if (!enable_mmc && rts51x_lun_is_mmc_xd(us, srb->device->lun)) {
+					usb_stor_dbg(us,"%s: lun is mmc/xd\n", __func__);
+					srb->result = SAM_STAT_CHECK_CONDITION;
+					memcpy(srb->sense_buffer,
+							media_not_present,
+							US_SENSE_SIZE);
+					CLR_LUN_READY(chip, srb->device->lun);
+					card_first_show = 1;
+					return;
+				}
+
 				if (srb->result == SAM_STAT_GOOD) {
 					SET_LUN_READY(chip, srb->device->lun);
 					if (card_first_show) {
@@ -999,12 +1032,15 @@ static int init_realtek_cr(struct us_data *us)
 			goto INIT_FAIL;
 	}
 
-	if (CHECK_FW_VER(chip, 0x5888) || CHECK_FW_VER(chip, 0x5889) ||
-	    CHECK_FW_VER(chip, 0x5901))
-		SET_AUTO_DELINK(chip);
-	if (STATUS_LEN(chip) == 16) {
-		if (SUPPORT_AUTO_DELINK(chip))
+	if (CHECK_PID(chip, 0x0138) || CHECK_PID(chip, 0x0158) ||
+	    CHECK_PID(chip, 0x0159)) {
+		if (CHECK_FW_VER(chip, 0x5888) || CHECK_FW_VER(chip, 0x5889) ||
+				CHECK_FW_VER(chip, 0x5901))
 			SET_AUTO_DELINK(chip);
+		if (STATUS_LEN(chip) == 16) {
+			if (SUPPORT_AUTO_DELINK(chip))
+				SET_AUTO_DELINK(chip);
+		}
 	}
 #ifdef CONFIG_REALTEK_AUTOPM
 	if (ss_en)

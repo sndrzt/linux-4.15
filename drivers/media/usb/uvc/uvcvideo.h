@@ -153,6 +153,9 @@
 #define UVC_GUID_FORMAT_INVI \
 	{ 'I',  'N',  'V',  'I', 0xdb, 0x57, 0x49, 0x5e, \
 	 0x8e, 0x3f, 0xf4, 0x79, 0x53, 0x2b, 0x94, 0x6f}
+#define UVC_GUID_FORMAT_HEVC \
+	{ 'H',  'E',  'V',  'C', 0x00, 0x00, 0x10, 0x00, \
+	 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}
 
 /* ------------------------------------------------------------------------
  * Driver specific constants.
@@ -167,7 +170,7 @@
 /* Maximum status buffer size in bytes of interrupt URB. */
 #define UVC_MAX_STATUS_SIZE	16
 
-#define UVC_CTRL_CONTROL_TIMEOUT	500
+#define UVC_CTRL_CONTROL_TIMEOUT	5000
 #define UVC_CTRL_STREAMING_TIMEOUT	5000
 
 /* Maximum allowed number of control mappings per device */
@@ -713,6 +716,7 @@ void uvc_video_clock_update(struct uvc_streaming *stream,
 
 /* Status */
 extern int uvc_status_init(struct uvc_device *dev);
+extern void uvc_status_unregister(struct uvc_device *dev);
 extern void uvc_status_cleanup(struct uvc_device *dev);
 extern int uvc_status_start(struct uvc_device *dev, gfp_t flags);
 extern void uvc_status_stop(struct uvc_device *dev);

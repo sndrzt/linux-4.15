@@ -195,6 +195,7 @@
 #endif
 #else
 	PTR_SUBU	t0, $0, a2
+	move		a2, zero		/* No remaining longs */
 	PTR_ADDIU	t0, 1
 	STORE_BYTE(0)
 	STORE_BYTE(1)
@@ -219,7 +220,7 @@
 1:	PTR_ADDIU	a0, 1			/* fill bytewise */
 	R10KCBARRIER(0(ra))
 	bne		t1, a0, 1b
-	sb		a1, -1(a0)
+	 EX(sb, a1, -1(a0), .Lsmall_fixup\@)
 
 2:	jr		ra			/* done */
 	move		a2, zero
@@ -231,7 +232,7 @@
 
 #ifdef CONFIG_CPU_MIPSR6
 .Lbyte_fixup\@:
-	PTR_SUBU	a2, $0, t0
+	PTR_SUBU	a2, t0
 	jr		ra
 	 PTR_ADDIU	a2, 1
 #endif /* CONFIG_CPU_MIPSR6 */
@@ -252,13 +253,20 @@
 	PTR_L		t0, TI_TASK($28)
 	andi		a2, STORMASK
 	LONG_L		t0, THREAD_BUADDR(t0)
-	LONG_ADDU	a2, t1
+	LONG_ADDU	a2, a0
 	jr		ra
 	LONG_SUBU	a2, t0
 
 .Llast_fixup\@:
 	jr		ra
-	andi		v1, a2, STORMASK
+	 nop
+
+.Lsmall_fixup\@:
+	.set		reorder
+	PTR_SUBU	a2, t1, a0
+	PTR_ADDIU	a2, 1
+	jr		ra
+	.set		noreorder
 
 	.endm
 

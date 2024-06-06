@@ -184,8 +184,12 @@ static void sdhci_omap_conf_bus_power(struct sdhci_omap_host *omap_host,
 
 	/* wait 1ms */
 	timeout = ktime_add_ms(ktime_get(), SDHCI_OMAP_TIMEOUT);
-	while (!(sdhci_omap_readl(omap_host, SDHCI_OMAP_HCTL) & HCTL_SDBP)) {
-		if (WARN_ON(ktime_after(ktime_get(), timeout)))
+	while (1) {
+		bool timedout = ktime_after(ktime_get(), timeout);
+
+		if (sdhci_omap_readl(omap_host, SDHCI_OMAP_HCTL) & HCTL_SDBP)
+			break;
+		if (WARN_ON(timedout))
 			return;
 		usleep_range(5, 10);
 	}
@@ -328,7 +332,8 @@ static void sdhci_omap_set_power(struct sdhci_host *host, unsigned char mode,
 {
 	struct mmc_host *mmc = host->mmc;
 
-	mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, vdd);
+	if (!IS_ERR(mmc->supply.vmmc))
+		mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, vdd);
 }
 
 static int sdhci_omap_enable_dma(struct sdhci_host *host)
@@ -389,8 +394,12 @@ static void sdhci_omap_init_74_clocks(struct sdhci_host *host, u8 power_mode)
 
 	/* wait 1ms */
 	timeout = ktime_add_ms(ktime_get(), SDHCI_OMAP_TIMEOUT);
-	while (!(sdhci_omap_readl(omap_host, SDHCI_OMAP_STAT) & INT_CC_EN)) {
-		if (WARN_ON(ktime_after(ktime_get(), timeout)))
+	while (1) {
+		bool timedout = ktime_after(ktime_get(), timeout);
+
+		if (sdhci_omap_readl(omap_host, SDHCI_OMAP_STAT) & INT_CC_EN)
+			break;
+		if (WARN_ON(timedout))
 			return;
 		usleep_range(5, 10);
 	}

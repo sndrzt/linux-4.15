@@ -395,17 +395,19 @@ processes_bind_error:
 /* This is called directly from KGD at ISR. */
 void kgd2kfd_interrupt(struct kfd_dev *kfd, const void *ih_ring_entry)
 {
+	unsigned long flags;
+
 	if (!kfd->init_complete)
 		return;
 
-	spin_lock(&kfd->interrupt_lock);
+	spin_lock_irqsave(&kfd->interrupt_lock, flags);
 
 	if (kfd->interrupts_active
 	    && interrupt_is_wanted(kfd, ih_ring_entry)
 	    && enqueue_ih_ring_entry(kfd, ih_ring_entry))
 		queue_work(kfd->ih_wq, &kfd->interrupt_work);
 
-	spin_unlock(&kfd->interrupt_lock);
+	spin_unlock_irqrestore(&kfd->interrupt_lock, flags);
 }
 
 static int kfd_gtt_sa_init(struct kfd_dev *kfd, unsigned int buf_size,
@@ -559,9 +561,9 @@ kfd_gtt_out:
 	return 0;
 
 kfd_gtt_no_free_chunk:
-	pr_debug("Allocation failed with mem_obj = %p\n", mem_obj);
+	pr_debug("Allocation failed with mem_obj = %p\n", *mem_obj);
 	mutex_unlock(&kfd->gtt_sa_lock);
-	kfree(mem_obj);
+	kfree(*mem_obj);
 	return -ENOMEM;
 }
 

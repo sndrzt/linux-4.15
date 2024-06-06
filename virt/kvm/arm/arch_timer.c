@@ -309,9 +309,9 @@ static void phys_timer_emulate(struct kvm_vcpu *vcpu)
 	struct arch_timer_context *ptimer = vcpu_ptimer(vcpu);
 
 	/*
-	 * If the timer can fire now we have just raised the IRQ line and we
-	 * don't need to have a soft timer scheduled for the future.  If the
-	 * timer cannot fire at all, then we also don't need a soft timer.
+	 * If the timer can fire now, we don't need to have a soft timer
+	 * scheduled for the future.  If the timer cannot fire at all,
+	 * then we also don't need a soft timer.
 	 */
 	if (kvm_timer_should_fire(ptimer) || !kvm_timer_irq_can_fire(ptimer)) {
 		soft_timer_cancel(&timer->phys_timer, NULL);
@@ -338,10 +338,10 @@ static void kvm_timer_update_state(struct kvm_vcpu *vcpu)
 	if (kvm_timer_should_fire(vtimer) != vtimer->irq.level)
 		kvm_timer_update_irq(vcpu, !vtimer->irq.level, vtimer);
 
+	phys_timer_emulate(vcpu);
+
 	if (kvm_timer_should_fire(ptimer) != ptimer->irq.level)
 		kvm_timer_update_irq(vcpu, !ptimer->irq.level, ptimer);
-
-	phys_timer_emulate(vcpu);
 }
 
 static void vtimer_save_state(struct kvm_vcpu *vcpu)
@@ -474,6 +474,7 @@ void kvm_timer_vcpu_load(struct kvm_vcpu *vcpu)
 {
 	struct arch_timer_cpu *timer = &vcpu->arch.timer_cpu;
 	struct arch_timer_context *vtimer = vcpu_vtimer(vcpu);
+	struct arch_timer_context *ptimer = vcpu_ptimer(vcpu);
 
 	if (unlikely(!timer->enabled))
 		return;
@@ -489,6 +490,10 @@ void kvm_timer_vcpu_load(struct kvm_vcpu *vcpu)
 
 	/* Set the background timer for the physical timer emulation. */
 	phys_timer_emulate(vcpu);
+
+	/* If the timer fired while we weren't running, inject it now */
+	if (kvm_timer_should_fire(ptimer) != ptimer->irq.level)
+		kvm_timer_update_irq(vcpu, !ptimer->irq.level, ptimer);
 }
 
 bool kvm_timer_should_notify_user(struct kvm_vcpu *vcpu)
@@ -589,6 +594,7 @@ void kvm_timer_sync_hwstate(struct kvm_vcpu *vcpu)
 
 int kvm_timer_vcpu_reset(struct kvm_vcpu *vcpu)
 {
+	struct arch_timer_cpu *timer = &vcpu->arch.timer_cpu;
 	struct arch_timer_context *vtimer = vcpu_vtimer(vcpu);
 	struct arch_timer_context *ptimer = vcpu_ptimer(vcpu);
 
@@ -601,6 +607,9 @@ int kvm_timer_vcpu_reset(struct kvm_vcpu *vcpu)
 	vtimer->cnt_ctl = 0;
 	ptimer->cnt_ctl = 0;
 	kvm_timer_update_state(vcpu);
+
+	if (timer->enabled && irqchip_in_kernel(vcpu->kvm))
+		kvm_vgic_reset_mapped_irq(vcpu, vtimer->irq.irq);
 
 	return 0;
 }
@@ -773,7 +782,7 @@ int kvm_timer_hyp_init(bool has_gic)
 		}
 	}
 
-	kvm_info("virtual timer IRQ%d\n", host_vtimer_irq);
+	kvm_debug("virtual timer IRQ%d\n", host_vtimer_irq);
 
 	cpuhp_setup_state(CPUHP_AP_KVM_ARM_TIMER_STARTING,
 			  "kvm/arm/timer:starting", kvm_timer_starting_cpu,

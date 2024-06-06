@@ -26,6 +26,7 @@
 #include <linux/cred.h>
 #include <linux/timekeeping.h>
 #include <linux/ctype.h>
+#include <linux/nospec.h>
 
 #define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PROG_ARRAY || \
 			   (map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
@@ -42,7 +43,8 @@ static DEFINE_SPINLOCK(prog_idr_lock);
 static DEFINE_IDR(map_idr);
 static DEFINE_SPINLOCK(map_idr_lock);
 
-int sysctl_unprivileged_bpf_disabled __read_mostly;
+int sysctl_unprivileged_bpf_disabled __read_mostly =
+	IS_BUILTIN(CONFIG_BPF_UNPRIV_DEFAULT_OFF) ? 2 : 0;
 
 static const struct bpf_map_ops * const bpf_map_types[] = {
 #define BPF_PROG_TYPE(_id, _ops)
@@ -96,17 +98,28 @@ static int check_uarg_tail_zero(void __user *uaddr,
 
 static struct bpf_map *find_and_alloc_map(union bpf_attr *attr)
 {
+	const struct bpf_map_ops *ops;
+	u32 type = attr->map_type;
 	struct bpf_map *map;
+	int err;
 
-	if (attr->map_type >= ARRAY_SIZE(bpf_map_types) ||
-	    !bpf_map_types[attr->map_type])
+	if (type >= ARRAY_SIZE(bpf_map_types))
+		return ERR_PTR(-EINVAL);
+	type = array_index_nospec(type, ARRAY_SIZE(bpf_map_types));
+	ops = bpf_map_types[type];
+	if (!ops)
 		return ERR_PTR(-EINVAL);
 
-	map = bpf_map_types[attr->map_type]->map_alloc(attr);
+	if (ops->map_alloc_check) {
+		err = ops->map_alloc_check(attr);
+		if (err)
+			return ERR_PTR(err);
+	}
+	map = ops->map_alloc(attr);
 	if (IS_ERR(map))
 		return map;
-	map->ops = bpf_map_types[attr->map_type];
-	map->map_type = attr->map_type;
+	map->ops = ops;
+	map->map_type = type;
 	return map;
 }
 
@@ -220,8 +233,8 @@ static void bpf_map_free_deferred(struct work_struct *work)
 static void bpf_map_put_uref(struct bpf_map *map)
 {
 	if (atomic_dec_and_test(&map->usercnt)) {
-		if (map->map_type == BPF_MAP_TYPE_PROG_ARRAY)
-			bpf_fd_array_map_clear(map);
+		if (map->ops->map_release_uref)
+			map->ops->map_release_uref(map);
 	}
 }
 
@@ -427,12 +440,12 @@ static int map_create(union bpf_attr *attr)
 	err = bpf_map_new_fd(map, f_flags);
 	if (err < 0) {
 		/* failed to allocate fd.
-		 * bpf_map_put() is needed because the above
+		 * bpf_map_put_with_uref() is needed because the above
 		 * bpf_map_alloc_id() has published the map
 		 * to the userspace and the userspace may
 		 * have refcnt-ed it through BPF_MAP_GET_FD_BY_ID.
 		 */
-		bpf_map_put(map);
+		bpf_map_put_with_uref(map);
 		return err;
 	}
 
@@ -579,7 +592,10 @@ static int map_lookup_elem(union bpf_attr *attr)
 		err = bpf_fd_htab_map_lookup_elem(map, key, value);
 	} else {
 		rcu_read_lock();
-		ptr = map->ops->map_lookup_elem(map, key);
+		if (map->ops->map_lookup_elem_sys_only)
+			ptr = map->ops->map_lookup_elem_sys_only(map, key);
+		else
+			ptr = map->ops->map_lookup_elem(map, key);
 		if (ptr)
 			memcpy(value, ptr, value_size);
 		rcu_read_unlock();
@@ -603,6 +619,17 @@ free_key:
 err_put:
 	fdput(f);
 	return err;
+}
+
+static void maybe_wait_bpf_programs(struct bpf_map *map)
+{
+	/* Wait for any running BPF programs to complete so that
+	 * userspace, when we return to it, knows that all programs
+	 * that could be running use the new map value.
+	 */
+	if (map->map_type == BPF_MAP_TYPE_HASH_OF_MAPS ||
+	    map->map_type == BPF_MAP_TYPE_ARRAY_OF_MAPS)
+		synchronize_rcu();
 }
 
 #define BPF_MAP_UPDATE_ELEM_LAST_FIELD flags
@@ -689,6 +716,7 @@ static int map_update_elem(union bpf_attr *attr)
 	}
 	__this_cpu_dec(bpf_prog_active);
 	preempt_enable();
+	maybe_wait_bpf_programs(map);
 out:
 	if (!err)
 		trace_bpf_map_update_elem(map, ufd, key, value);
@@ -738,6 +766,7 @@ static int map_delete_elem(union bpf_attr *attr)
 	rcu_read_unlock();
 	__this_cpu_dec(bpf_prog_active);
 	preempt_enable();
+	maybe_wait_bpf_programs(map);
 
 	if (!err)
 		trace_bpf_map_delete_elem(map, ufd, key);
@@ -821,11 +850,17 @@ static const struct bpf_prog_ops * const bpf_prog_types[] = {
 
 static int find_prog_type(enum bpf_prog_type type, struct bpf_prog *prog)
 {
-	if (type >= ARRAY_SIZE(bpf_prog_types) || !bpf_prog_types[type])
+	const struct bpf_prog_ops *ops;
+
+	if (type >= ARRAY_SIZE(bpf_prog_types))
+		return -EINVAL;
+	type = array_index_nospec(type, ARRAY_SIZE(bpf_prog_types));
+	ops = bpf_prog_types[type];
+	if (!ops)
 		return -EINVAL;
 
 	if (!bpf_prog_is_dev_bound(prog->aux))
-		prog->aux->ops = bpf_prog_types[type];
+		prog->aux->ops = ops;
 	else
 		prog->aux->ops = &bpf_offload_prog_ops;
 	prog->type = type;
@@ -1202,20 +1237,26 @@ static int bpf_prog_load(union bpf_attr *attr)
 	if (err)
 		goto free_used_maps;
 
-	err = bpf_prog_new_fd(prog);
-	if (err < 0) {
-		/* failed to allocate fd.
-		 * bpf_prog_put() is needed because the above
-		 * bpf_prog_alloc_id() has published the prog
-		 * to the userspace and the userspace may
-		 * have refcnt-ed it through BPF_PROG_GET_FD_BY_ID.
-		 */
-		bpf_prog_put(prog);
-		return err;
-	}
-
+	/* Upon success of bpf_prog_alloc_id(), the BPF prog is
+	 * effectively publicly exposed. However, retrieving via
+	 * bpf_prog_get_fd_by_id() will take another reference,
+	 * therefore it cannot be gone underneath us.
+	 *
+	 * Only for the time /after/ successful bpf_prog_new_fd()
+	 * and before returning to userspace, we might just hold
+	 * one reference and any parallel close on that fd could
+	 * rip everything out. Hence, below notifications must
+	 * happen before bpf_prog_new_fd().
+	 *
+	 * Also, any failure handling from this point onwards must
+	 * be using bpf_prog_put() given the program is exposed.
+	 */
 	bpf_prog_kallsyms_add(prog);
 	trace_bpf_prog_load(prog, err);
+
+	err = bpf_prog_new_fd(prog);
+	if (err < 0)
+		bpf_prog_put(prog);
 	return err;
 
 free_used_maps:
@@ -1546,7 +1587,7 @@ static int bpf_map_get_fd_by_id(const union bpf_attr *attr)
 
 	fd = bpf_map_new_fd(map, f_flags);
 	if (fd < 0)
-		bpf_map_put(map);
+		bpf_map_put_with_uref(map);
 
 	return fd;
 }
@@ -1556,7 +1597,7 @@ static int bpf_prog_get_info_by_fd(struct bpf_prog *prog,
 				   union bpf_attr __user *uattr)
 {
 	struct bpf_prog_info __user *uinfo = u64_to_user_ptr(attr->info.info);
-	struct bpf_prog_info info = {};
+	struct bpf_prog_info info;
 	u32 info_len = attr->info.info_len;
 	char __user *uinsns;
 	u32 ulen;
@@ -1567,6 +1608,7 @@ static int bpf_prog_get_info_by_fd(struct bpf_prog *prog,
 		return err;
 	info_len = min_t(u32, sizeof(info), info_len);
 
+	memset(&info, 0, sizeof(info));
 	if (copy_from_user(&info, uinfo, info_len))
 		return -EFAULT;
 
@@ -1629,7 +1671,7 @@ static int bpf_map_get_info_by_fd(struct bpf_map *map,
 				  union bpf_attr __user *uattr)
 {
 	struct bpf_map_info __user *uinfo = u64_to_user_ptr(attr->info.info);
-	struct bpf_map_info info = {};
+	struct bpf_map_info info;
 	u32 info_len = attr->info.info_len;
 	int err;
 
@@ -1638,6 +1680,7 @@ static int bpf_map_get_info_by_fd(struct bpf_map *map,
 		return err;
 	info_len = min_t(u32, sizeof(info), info_len);
 
+	memset(&info, 0, sizeof(info));
 	info.type = map->map_type;
 	info.id = map->id;
 	info.key_size = map->key_size;
@@ -1684,10 +1727,10 @@ static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
 
 SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
 {
-	union bpf_attr attr = {};
+	union bpf_attr attr;
 	int err;
 
-	if (!capable(CAP_SYS_ADMIN) && sysctl_unprivileged_bpf_disabled)
+	if (sysctl_unprivileged_bpf_disabled && !capable(CAP_SYS_ADMIN))
 		return -EPERM;
 
 	err = check_uarg_tail_zero(uattr, sizeof(attr), size);
@@ -1696,6 +1739,7 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
 	size = min_t(u32, size, sizeof(attr));
 
 	/* copy attributes from user space, may be less than sizeof(bpf_attr) */
+	memset(&attr, 0, sizeof(attr));
 	if (copy_from_user(&attr, uattr, size) != 0)
 		return -EFAULT;
 

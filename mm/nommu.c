@@ -450,10 +450,14 @@ void vm_unmap_aliases(void)
 EXPORT_SYMBOL_GPL(vm_unmap_aliases);
 
 /*
- * Implement a stub for vmalloc_sync_all() if the architecture chose not to
- * have one.
+ * Implement a stub for vmalloc_sync_[un]mapping() if the architecture
+ * chose not to have one.
  */
-void __weak vmalloc_sync_all(void)
+void __weak vmalloc_sync_mappings(void)
+{
+}
+
+void __weak vmalloc_sync_unmappings(void)
 {
 }
 
@@ -641,7 +645,7 @@ static void __put_nommu_region(struct vm_region *region)
 		up_write(&nommu_region_sem);
 
 		if (region->vm_file)
-			fput(region->vm_file);
+			vmr_fput(region);
 
 		/* IO memory and memory shared directly out of the pagecache
 		 * from ramfs/tmpfs mustn't be released here */
@@ -799,9 +803,9 @@ static void delete_vma(struct mm_struct *mm, struct vm_area_struct *vma)
 	if (vma->vm_ops && vma->vm_ops->close)
 		vma->vm_ops->close(vma);
 	if (vma->vm_file)
-		fput(vma->vm_file);
+		vma_fput(vma);
 	put_nommu_region(vma->vm_region);
-	kmem_cache_free(vm_area_cachep, vma);
+	vm_area_free(vma);
 }
 
 /*
@@ -1236,7 +1240,7 @@ unsigned long do_mmap(struct file *file,
 	if (!region)
 		goto error_getting_region;
 
-	vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
+	vma = vm_area_alloc(current->mm);
 	if (!vma)
 		goto error_getting_vma;
 
@@ -1244,7 +1248,6 @@ unsigned long do_mmap(struct file *file,
 	region->vm_flags = vm_flags;
 	region->vm_pgoff = pgoff;
 
-	INIT_LIST_HEAD(&vma->anon_vma_chain);
 	vma->vm_flags = vm_flags;
 	vma->vm_pgoff = pgoff;
 
@@ -1321,7 +1324,7 @@ unsigned long do_mmap(struct file *file,
 					goto error_just_free;
 				}
 			}
-			fput(region->vm_file);
+			vmr_fput(region);
 			kmem_cache_free(vm_region_jar, region);
 			region = pregion;
 			result = start;
@@ -1396,11 +1399,11 @@ error_just_free:
 	up_write(&nommu_region_sem);
 error:
 	if (region->vm_file)
-		fput(region->vm_file);
+		vmr_fput(region);
 	kmem_cache_free(vm_region_jar, region);
 	if (vma->vm_file)
-		fput(vma->vm_file);
-	kmem_cache_free(vm_area_cachep, vma);
+		vma_fput(vma);
+	vm_area_free(vma);
 	return ret;
 
 sharing_violation:
@@ -1494,14 +1497,13 @@ int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 	if (!region)
 		return -ENOMEM;
 
-	new = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
+	new = vm_area_dup(vma);
 	if (!new) {
 		kmem_cache_free(vm_region_jar, region);
 		return -ENOMEM;
 	}
 
 	/* most fields are the same, copy all, and then fixup */
-	*new = *vma;
 	*region = *vma->vm_region;
 	new->vm_region = region;
 
@@ -1815,7 +1817,8 @@ int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
 	struct vm_area_struct *vma;
 	int write = gup_flags & FOLL_WRITE;
 
-	down_read(&mm->mmap_sem);
+	if (down_read_killable(&mm->mmap_sem))
+		return 0;
 
 	/* the access must start within one of the target process's mappings */
 	vma = find_vma(mm, addr);

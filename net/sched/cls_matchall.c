@@ -21,10 +21,7 @@ struct cls_mall_head {
 	struct tcf_result res;
 	u32 handle;
 	u32 flags;
-	union {
-		struct work_struct work;
-		struct rcu_head	rcu;
-	};
+	struct rcu_work rwork;
 };
 
 static int mall_classify(struct sk_buff *skb, const struct tcf_proto *tp,
@@ -53,20 +50,12 @@ static void __mall_destroy(struct cls_mall_head *head)
 
 static void mall_destroy_work(struct work_struct *work)
 {
-	struct cls_mall_head *head = container_of(work, struct cls_mall_head,
-						  work);
+	struct cls_mall_head *head = container_of(to_rcu_work(work),
+						  struct cls_mall_head,
+						  rwork);
 	rtnl_lock();
 	__mall_destroy(head);
 	rtnl_unlock();
-}
-
-static void mall_destroy_rcu(struct rcu_head *rcu)
-{
-	struct cls_mall_head *head = container_of(rcu, struct cls_mall_head,
-						  rcu);
-
-	INIT_WORK(&head->work, mall_destroy_work);
-	tcf_queue_work(&head->work);
 }
 
 static void mall_destroy_hw_filter(struct tcf_proto *tp,
@@ -119,23 +108,31 @@ static void mall_destroy(struct tcf_proto *tp)
 	if (!head)
 		return;
 
+	tcf_unbind_filter(tp, &head->res);
+
 	if (!tc_skip_hw(head->flags))
 		mall_destroy_hw_filter(tp, head, (unsigned long) head);
 
 	if (tcf_exts_get_net(&head->exts))
-		call_rcu(&head->rcu, mall_destroy_rcu);
+		tcf_queue_work(&head->rwork, mall_destroy_work);
 	else
 		__mall_destroy(head);
 }
 
 static void *mall_get(struct tcf_proto *tp, u32 handle)
 {
+	struct cls_mall_head *head = rtnl_dereference(tp->root);
+
+	if (head && head->handle == handle)
+		return head;
+
 	return NULL;
 }
 
 static const struct nla_policy mall_policy[TCA_MATCHALL_MAX + 1] = {
 	[TCA_MATCHALL_UNSPEC]		= { .type = NLA_UNSPEC },
 	[TCA_MATCHALL_CLASSID]		= { .type = NLA_U32 },
+	[TCA_MATCHALL_FLAGS]		= { .type = NLA_U32 },
 };
 
 static int mall_set_parms(struct net *net, struct tcf_proto *tp,
@@ -188,7 +185,7 @@ static int mall_change(struct net *net, struct sk_buff *in_skb,
 	if (!new)
 		return -ENOBUFS;
 
-	err = tcf_exts_init(&new->exts, TCA_MATCHALL_ACT, 0);
+	err = tcf_exts_init(&new->exts, net, TCA_MATCHALL_ACT, 0);
 	if (err)
 		goto err_exts_init;
 
@@ -276,12 +273,17 @@ nla_put_failure:
 	return -1;
 }
 
-static void mall_bind_class(void *fh, u32 classid, unsigned long cl)
+static void mall_bind_class(void *fh, u32 classid, unsigned long cl, void *q,
+			    unsigned long base)
 {
 	struct cls_mall_head *head = fh;
 
-	if (head && head->res.classid == classid)
-		head->res.class = cl;
+	if (head && head->res.classid == classid) {
+		if (cl)
+			__tcf_bind_filter(q, &head->res, base);
+		else
+			__tcf_unbind_filter(q, &head->res);
+	}
 }
 
 static struct tcf_proto_ops cls_mall_ops __read_mostly = {

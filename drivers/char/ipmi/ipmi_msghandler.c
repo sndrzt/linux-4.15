@@ -49,6 +49,7 @@
 #include <linux/moduleparam.h>
 #include <linux/workqueue.h>
 #include <linux/uuid.h>
+#include <linux/nospec.h>
 
 #define PFX "IPMI message handler: "
 
@@ -1262,6 +1263,7 @@ int ipmi_set_my_address(ipmi_user_t   user,
 {
 	if (channel >= IPMI_MAX_CHANNELS)
 		return -EINVAL;
+	channel = array_index_nospec(channel, IPMI_MAX_CHANNELS);
 	user->intf->addrinfo[channel].address = address;
 	return 0;
 }
@@ -1273,6 +1275,7 @@ int ipmi_get_my_address(ipmi_user_t   user,
 {
 	if (channel >= IPMI_MAX_CHANNELS)
 		return -EINVAL;
+	channel = array_index_nospec(channel, IPMI_MAX_CHANNELS);
 	*address = user->intf->addrinfo[channel].address;
 	return 0;
 }
@@ -1284,6 +1287,7 @@ int ipmi_set_my_LUN(ipmi_user_t   user,
 {
 	if (channel >= IPMI_MAX_CHANNELS)
 		return -EINVAL;
+	channel = array_index_nospec(channel, IPMI_MAX_CHANNELS);
 	user->intf->addrinfo[channel].lun = LUN & 0x3;
 	return 0;
 }
@@ -1295,6 +1299,7 @@ int ipmi_get_my_LUN(ipmi_user_t   user,
 {
 	if (channel >= IPMI_MAX_CHANNELS)
 		return -EINVAL;
+	channel = array_index_nospec(channel, IPMI_MAX_CHANNELS);
 	*address = user->intf->addrinfo[channel].lun;
 	return 0;
 }
@@ -2061,6 +2066,7 @@ static int check_addr(ipmi_smi_t       intf,
 {
 	if (addr->channel >= IPMI_MAX_CHANNELS)
 		return -EINVAL;
+	addr->channel = array_index_nospec(addr->channel, IPMI_MAX_CHANNELS);
 	*lun = intf->addrinfo[addr->channel].lun;
 	*saddr = intf->addrinfo[addr->channel].address;
 	return 0;
@@ -2588,7 +2594,7 @@ static ssize_t device_id_show(struct device *dev,
 
 	return snprintf(buf, 10, "%u\n", id.device_id);
 }
-static DEVICE_ATTR(device_id, S_IRUGO, device_id_show, NULL);
+static DEVICE_ATTR_RO(device_id);
 
 static ssize_t provides_device_sdrs_show(struct device *dev,
 					 struct device_attribute *attr,
@@ -2604,8 +2610,7 @@ static ssize_t provides_device_sdrs_show(struct device *dev,
 
 	return snprintf(buf, 10, "%u\n", (id.device_revision & 0x80) >> 7);
 }
-static DEVICE_ATTR(provides_device_sdrs, S_IRUGO, provides_device_sdrs_show,
-		   NULL);
+static DEVICE_ATTR_RO(provides_device_sdrs);
 
 static ssize_t revision_show(struct device *dev, struct device_attribute *attr,
 			     char *buf)
@@ -2620,7 +2625,7 @@ static ssize_t revision_show(struct device *dev, struct device_attribute *attr,
 
 	return snprintf(buf, 20, "%u\n", id.device_revision & 0x0F);
 }
-static DEVICE_ATTR(revision, S_IRUGO, revision_show, NULL);
+static DEVICE_ATTR_RO(revision);
 
 static ssize_t firmware_revision_show(struct device *dev,
 				      struct device_attribute *attr,
@@ -2637,7 +2642,7 @@ static ssize_t firmware_revision_show(struct device *dev,
 	return snprintf(buf, 20, "%u.%x\n", id.firmware_revision_1,
 			id.firmware_revision_2);
 }
-static DEVICE_ATTR(firmware_revision, S_IRUGO, firmware_revision_show, NULL);
+static DEVICE_ATTR_RO(firmware_revision);
 
 static ssize_t ipmi_version_show(struct device *dev,
 				 struct device_attribute *attr,
@@ -2655,7 +2660,7 @@ static ssize_t ipmi_version_show(struct device *dev,
 			ipmi_version_major(&id),
 			ipmi_version_minor(&id));
 }
-static DEVICE_ATTR(ipmi_version, S_IRUGO, ipmi_version_show, NULL);
+static DEVICE_ATTR_RO(ipmi_version);
 
 static ssize_t add_dev_support_show(struct device *dev,
 				    struct device_attribute *attr,
@@ -2688,7 +2693,7 @@ static ssize_t manufacturer_id_show(struct device *dev,
 
 	return snprintf(buf, 20, "0x%6.6x\n", id.manufacturer_id);
 }
-static DEVICE_ATTR(manufacturer_id, S_IRUGO, manufacturer_id_show, NULL);
+static DEVICE_ATTR_RO(manufacturer_id);
 
 static ssize_t product_id_show(struct device *dev,
 			       struct device_attribute *attr,
@@ -2704,7 +2709,7 @@ static ssize_t product_id_show(struct device *dev,
 
 	return snprintf(buf, 10, "0x%4.4x\n", id.product_id);
 }
-static DEVICE_ATTR(product_id, S_IRUGO, product_id_show, NULL);
+static DEVICE_ATTR_RO(product_id);
 
 static ssize_t aux_firmware_rev_show(struct device *dev,
 				     struct device_attribute *attr,
@@ -2742,7 +2747,7 @@ static ssize_t guid_show(struct device *dev, struct device_attribute *attr,
 
 	return snprintf(buf, 38, "%pUl\n", guid.b);
 }
-static DEVICE_ATTR(guid, S_IRUGO, guid_show, NULL);
+static DEVICE_ATTR_RO(guid);
 
 static struct attribute *bmc_dev_attrs[] = {
 	&dev_attr_device_id.attr,
@@ -3005,8 +3010,11 @@ static int __ipmi_bmc_register(ipmi_smi_t intf,
 		bmc->pdev.name = "ipmi_bmc";
 
 		rv = ida_simple_get(&ipmi_bmc_ida, 0, 0, GFP_KERNEL);
-		if (rv < 0)
+		if (rv < 0) {
+			kfree(bmc);
 			goto out;
+		}
+
 		bmc->pdev.dev.driver = &ipmidriver.driver;
 		bmc->pdev.id = rv;
 		bmc->pdev.dev.release = release_bmc_device;
@@ -3171,8 +3179,8 @@ static void __get_guid(ipmi_smi_t intf)
 	if (rv)
 		/* Send failed, no GUID available. */
 		bmc->dyn_guid_set = 0;
-
-	wait_event(intf->waitq, bmc->dyn_guid_set != 2);
+	else
+		wait_event(intf->waitq, bmc->dyn_guid_set != 2);
 
 	/* dyn_guid_set makes the guid data available. */
 	smp_rmb();
@@ -3508,12 +3516,16 @@ static void deliver_smi_err_response(ipmi_smi_t intf,
 				     struct ipmi_smi_msg *msg,
 				     unsigned char err)
 {
+	int rv;
 	msg->rsp[0] = msg->data[0] | 4;
 	msg->rsp[1] = msg->data[1];
 	msg->rsp[2] = err;
 	msg->rsp_size = 3;
-	/* It's an error, so it will never requeue, no need to check return. */
-	handle_one_recv_msg(intf, msg);
+
+	/* This will never requeue, but it may ask us to free the message. */
+	rv = handle_one_recv_msg(intf, msg);
+	if (rv == 0)
+		ipmi_free_smi_msg(msg);
 }
 
 static void cleanup_smi_msgs(ipmi_smi_t intf)

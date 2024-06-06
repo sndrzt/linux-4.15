@@ -39,6 +39,7 @@
 
 #include <linux/cpufreq.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 #include <linux/ktime.h>
 #include <linux/rwsem.h>
 #include <linux/wait.h>
@@ -49,7 +50,7 @@ struct cppc_pcc_data {
 	struct mbox_chan *pcc_channel;
 	void __iomem *pcc_comm_addr;
 	bool pcc_channel_acquired;
-	ktime_t deadline;
+	unsigned int deadline_us;
 	unsigned int pcc_mpar, pcc_mrtt, pcc_nominal;
 
 	bool pending_pcc_write_cmd;	/* Any pending/batched PCC write cmds? */
@@ -121,23 +122,15 @@ static DEFINE_PER_CPU(struct cpc_desc *, cpc_desc_ptr);
  */
 #define NUM_RETRIES 500
 
-struct cppc_attr {
-	struct attribute attr;
-	ssize_t (*show)(struct kobject *kobj,
-			struct attribute *attr, char *buf);
-	ssize_t (*store)(struct kobject *kobj,
-			struct attribute *attr, const char *c, ssize_t count);
-};
-
 #define define_one_cppc_ro(_name)		\
-static struct cppc_attr _name =			\
+static struct kobj_attribute _name =		\
 __ATTR(_name, 0444, show_##_name, NULL)
 
 #define to_cpc_desc(a) container_of(a, struct cpc_desc, kobj)
 
 #define show_cppc_data(access_fn, struct_name, member_name)		\
 	static ssize_t show_##member_name(struct kobject *kobj,		\
-					struct attribute *attr,	char *buf) \
+				struct kobj_attribute *attr, char *buf)	\
 	{								\
 		struct cpc_desc *cpc_ptr = to_cpc_desc(kobj);		\
 		struct struct_name st_name = {0};			\
@@ -160,7 +153,7 @@ show_cppc_data(cppc_get_perf_ctrs, cppc_perf_fb_ctrs, reference_perf);
 show_cppc_data(cppc_get_perf_ctrs, cppc_perf_fb_ctrs, wraparound_time);
 
 static ssize_t show_feedback_ctrs(struct kobject *kobj,
-		struct attribute *attr, char *buf)
+		struct kobj_attribute *attr, char *buf)
 {
 	struct cpc_desc *cpc_ptr = to_cpc_desc(kobj);
 	struct cppc_perf_fb_ctrs fb_ctrs = {0};
@@ -193,41 +186,31 @@ static struct kobj_type cppc_ktype = {
 
 static int check_pcc_chan(int pcc_ss_id, bool chk_err_bit)
 {
-	int ret = -EIO, status = 0;
+	int ret, status;
 	struct cppc_pcc_data *pcc_ss_data = pcc_data[pcc_ss_id];
 	struct acpi_pcct_shared_memory __iomem *generic_comm_base =
 		pcc_ss_data->pcc_comm_addr;
-	ktime_t next_deadline = ktime_add(ktime_get(),
-					  pcc_ss_data->deadline);
 
 	if (!pcc_ss_data->platform_owns_pcc)
 		return 0;
 
-	/* Retry in case the remote processor was too slow to catch up. */
-	while (!ktime_after(ktime_get(), next_deadline)) {
-		/*
-		 * Per spec, prior to boot the PCC space wil be initialized by
-		 * platform and should have set the command completion bit when
-		 * PCC can be used by OSPM
-		 */
-		status = readw_relaxed(&generic_comm_base->status);
-		if (status & PCC_CMD_COMPLETE_MASK) {
-			ret = 0;
-			if (chk_err_bit && (status & PCC_ERROR_MASK))
-				ret = -EIO;
-			break;
-		}
-		/*
-		 * Reducing the bus traffic in case this loop takes longer than
-		 * a few retries.
-		 */
-		udelay(3);
+	/*
+	 * Poll PCC status register every 3us(delay_us) for maximum of
+	 * deadline_us(timeout_us) until PCC command complete bit is set(cond)
+	 */
+	ret = readw_relaxed_poll_timeout(&generic_comm_base->status, status,
+					status & PCC_CMD_COMPLETE_MASK, 3,
+					pcc_ss_data->deadline_us);
+
+	if (likely(!ret)) {
+		pcc_ss_data->platform_owns_pcc = false;
+		if (chk_err_bit && (status & PCC_ERROR_MASK))
+			ret = -EIO;
 	}
 
-	if (likely(!ret))
-		pcc_ss_data->platform_owns_pcc = false;
-	else
-		pr_err("PCC check channel failed. Status=%x\n", status);
+	if (unlikely(ret))
+		pr_err("PCC check channel failed for ss: %d. ret=%d\n",
+		       pcc_ss_id, ret);
 
 	return ret;
 }
@@ -291,7 +274,8 @@ static int send_pcc_cmd(int pcc_ss_id, u16 cmd)
 			time_delta = ktime_ms_delta(ktime_get(),
 						    pcc_ss_data->last_mpar_reset);
 			if ((time_delta < 60 * MSEC_PER_SEC) && pcc_ss_data->last_mpar_reset) {
-				pr_debug("PCC cmd not sent due to MPAR limit");
+				pr_debug("PCC cmd for subspace %d not sent due to MPAR limit",
+					 pcc_ss_id);
 				ret = -EIO;
 				goto end;
 			}
@@ -312,8 +296,8 @@ static int send_pcc_cmd(int pcc_ss_id, u16 cmd)
 	/* Ring doorbell */
 	ret = mbox_send_message(pcc_ss_data->pcc_channel, &cmd);
 	if (ret < 0) {
-		pr_err("Err sending PCC mbox message. cmd:%d, ret:%d\n",
-				cmd, ret);
+		pr_err("Err sending PCC mbox message. ss: %d cmd:%d, ret:%d\n",
+		       pcc_ss_id, cmd, ret);
 		goto end;
 	}
 
@@ -372,8 +356,10 @@ static int acpi_get_psd(struct cpc_desc *cpc_ptr, acpi_handle handle)
 	union acpi_object  *psd = NULL;
 	struct acpi_psd_package *pdomain;
 
-	status = acpi_evaluate_object_typed(handle, "_PSD", NULL, &buffer,
-			ACPI_TYPE_PACKAGE);
+	status = acpi_evaluate_object_typed(handle, "_PSD", NULL,
+					    &buffer, ACPI_TYPE_PACKAGE);
+	if (status == AE_NOT_FOUND)	/* _PSD is optional */
+		return 0;
 	if (ACPI_FAILURE(status))
 		return -ENODEV;
 
@@ -553,7 +539,8 @@ static int register_pcc_channel(int pcc_ss_idx)
 			pcc_mbox_request_channel(&cppc_mbox_cl,	pcc_ss_idx);
 
 		if (IS_ERR(pcc_data[pcc_ss_idx]->pcc_channel)) {
-			pr_err("Failed to find PCC communication channel\n");
+			pr_err("Failed to find PCC channel for subspace %d\n",
+			       pcc_ss_idx);
 			return -ENODEV;
 		}
 
@@ -566,7 +553,8 @@ static int register_pcc_channel(int pcc_ss_idx)
 		cppc_ss = (pcc_data[pcc_ss_idx]->pcc_channel)->con_priv;
 
 		if (!cppc_ss) {
-			pr_err("No PCC subspace found for CPPC\n");
+			pr_err("No PCC subspace found for %d CPPC\n",
+			       pcc_ss_idx);
 			return -ENODEV;
 		}
 
@@ -576,7 +564,7 @@ static int register_pcc_channel(int pcc_ss_idx)
 		 * So add an arbitrary amount of wait on top of Nominal.
 		 */
 		usecs_lat = NUM_RETRIES * cppc_ss->latency;
-		pcc_data[pcc_ss_idx]->deadline = ns_to_ktime(usecs_lat * NSEC_PER_USEC);
+		pcc_data[pcc_ss_idx]->deadline_us = usecs_lat;
 		pcc_data[pcc_ss_idx]->pcc_mrtt = cppc_ss->min_turnaround_time;
 		pcc_data[pcc_ss_idx]->pcc_mpar = cppc_ss->max_access_rate;
 		pcc_data[pcc_ss_idx]->pcc_nominal = cppc_ss->latency;
@@ -584,7 +572,8 @@ static int register_pcc_channel(int pcc_ss_idx)
 		pcc_data[pcc_ss_idx]->pcc_comm_addr =
 			acpi_os_ioremap(cppc_ss->base_address, cppc_ss->length);
 		if (!pcc_data[pcc_ss_idx]->pcc_comm_addr) {
-			pr_err("Failed to ioremap PCC comm region mem\n");
+			pr_err("Failed to ioremap PCC comm region mem for %d\n",
+			       pcc_ss_idx);
 			return -ENOMEM;
 		}
 
@@ -721,6 +710,11 @@ int acpi_cppc_processor_probe(struct acpi_processor *pr)
 	cpc_obj = &out_obj->package.elements[0];
 	if (cpc_obj->type == ACPI_TYPE_INTEGER)	{
 		num_ent = cpc_obj->integer.value;
+		if (num_ent <= 1) {
+			pr_debug("Unexpected _CPC NumEntries value (%d) for CPU:%d\n",
+				 num_ent, pr->id);
+			goto out_free;
+		}
 	} else {
 		pr_debug("Unexpected entry type(%d) for NumEntries\n",
 				cpc_obj->type);
@@ -838,6 +832,7 @@ int acpi_cppc_processor_probe(struct acpi_processor *pr)
 			"acpi_cppc");
 	if (ret) {
 		per_cpu(cpc_desc_ptr, pr->id) = NULL;
+		kobject_put(&cpc_ptr->kobj);
 		goto out_free;
 	}
 
@@ -878,8 +873,8 @@ void acpi_cppc_processor_exit(struct acpi_processor *pr)
 			pcc_data[pcc_ss_id]->refcount--;
 			if (!pcc_data[pcc_ss_id]->refcount) {
 				pcc_mbox_free_channel(pcc_data[pcc_ss_id]->pcc_channel);
-				pcc_data[pcc_ss_id]->pcc_channel_acquired = 0;
 				kfree(pcc_data[pcc_ss_id]);
+				pcc_data[pcc_ss_id] = NULL;
 			}
 		}
 	}
@@ -973,8 +968,8 @@ static int cpc_read(int cpu, struct cpc_register_resource *reg_res, u64 *val)
 			*val = readq_relaxed(vaddr);
 			break;
 		default:
-			pr_debug("Error: Cannot read %u bit width from PCC\n",
-					reg->bit_width);
+			pr_debug("Error: Cannot read %u bit width from PCC for ss: %d\n",
+				 reg->bit_width, pcc_ss_id);
 			ret_val = -EFAULT;
 	}
 
@@ -1012,8 +1007,8 @@ static int cpc_write(int cpu, struct cpc_register_resource *reg_res, u64 val)
 			writeq_relaxed(val, vaddr);
 			break;
 		default:
-			pr_debug("Error: Cannot write %u bit width to PCC\n",
-					reg->bit_width);
+			pr_debug("Error: Cannot write %u bit width to PCC for ss: %d\n",
+				 reg->bit_width, pcc_ss_id);
 			ret_val = -EFAULT;
 			break;
 	}

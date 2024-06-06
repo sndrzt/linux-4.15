@@ -33,6 +33,7 @@
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/regmap.h>
+#include <linux/if_vlan.h>
 #include <uapi/linux/ppp_defs.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
@@ -835,6 +836,8 @@ enum mvpp2_bm_type {
 
 #define MVPP2_MIB_COUNTERS_STATS_DELAY		(1 * HZ)
 
+#define MVPP2_DESC_DMA_MASK	DMA_BIT_MASK(40)
+
 /* Definitions */
 
 /* Shared Packet Processor resources */
@@ -1330,7 +1333,7 @@ static dma_addr_t mvpp2_txdesc_dma_addr_get(struct mvpp2_port *port,
 	if (port->priv->hw_version == MVPP21)
 		return tx_desc->pp21.buf_dma_addr;
 	else
-		return tx_desc->pp22.buf_dma_addr_ptp & GENMASK_ULL(40, 0);
+		return tx_desc->pp22.buf_dma_addr_ptp & MVPP2_DESC_DMA_MASK;
 }
 
 static void mvpp2_txdesc_dma_addr_set(struct mvpp2_port *port,
@@ -1348,7 +1351,7 @@ static void mvpp2_txdesc_dma_addr_set(struct mvpp2_port *port,
 	} else {
 		u64 val = (u64)addr;
 
-		tx_desc->pp22.buf_dma_addr_ptp &= ~GENMASK_ULL(40, 0);
+		tx_desc->pp22.buf_dma_addr_ptp &= ~MVPP2_DESC_DMA_MASK;
 		tx_desc->pp22.buf_dma_addr_ptp |= val;
 		tx_desc->pp22.packet_offset = offset;
 	}
@@ -1408,7 +1411,7 @@ static dma_addr_t mvpp2_rxdesc_dma_addr_get(struct mvpp2_port *port,
 	if (port->priv->hw_version == MVPP21)
 		return rx_desc->pp21.buf_dma_addr;
 	else
-		return rx_desc->pp22.buf_dma_addr_key_hash & GENMASK_ULL(40, 0);
+		return rx_desc->pp22.buf_dma_addr_key_hash & MVPP2_DESC_DMA_MASK;
 }
 
 static unsigned long mvpp2_rxdesc_cookie_get(struct mvpp2_port *port,
@@ -1417,7 +1420,7 @@ static unsigned long mvpp2_rxdesc_cookie_get(struct mvpp2_port *port,
 	if (port->priv->hw_version == MVPP21)
 		return rx_desc->pp21.buf_cookie;
 	else
-		return rx_desc->pp22.buf_cookie_misc & GENMASK_ULL(40, 0);
+		return rx_desc->pp22.buf_cookie_misc & MVPP2_DESC_DMA_MASK;
 }
 
 static size_t mvpp2_rxdesc_size_get(struct mvpp2_port *port,
@@ -1486,15 +1489,15 @@ static int mvpp2_prs_hw_write(struct mvpp2 *priv, struct mvpp2_prs_entry *pe)
 	/* Clear entry invalidation bit */
 	pe->tcam.word[MVPP2_PRS_TCAM_INV_WORD] &= ~MVPP2_PRS_TCAM_INV_MASK;
 
-	/* Write tcam index - indirect access */
-	mvpp2_write(priv, MVPP2_PRS_TCAM_IDX_REG, pe->index);
-	for (i = 0; i < MVPP2_PRS_TCAM_WORDS; i++)
-		mvpp2_write(priv, MVPP2_PRS_TCAM_DATA_REG(i), pe->tcam.word[i]);
-
 	/* Write sram index - indirect access */
 	mvpp2_write(priv, MVPP2_PRS_SRAM_IDX_REG, pe->index);
 	for (i = 0; i < MVPP2_PRS_SRAM_WORDS; i++)
 		mvpp2_write(priv, MVPP2_PRS_SRAM_DATA_REG(i), pe->sram.word[i]);
+
+	/* Write tcam index - indirect access */
+	mvpp2_write(priv, MVPP2_PRS_TCAM_IDX_REG, pe->index);
+	for (i = 0; i < MVPP2_PRS_TCAM_WORDS; i++)
+		mvpp2_write(priv, MVPP2_PRS_TCAM_DATA_REG(i), pe->tcam.word[i]);
 
 	return 0;
 }
@@ -2038,6 +2041,9 @@ static void mvpp2_prs_dsa_tag_set(struct mvpp2 *priv, int port, bool add,
 			/* Clear all ai bits for next iteration */
 			mvpp2_prs_sram_ai_update(&pe, 0,
 						 MVPP2_PRS_SRAM_AI_MASK);
+			/* Set result info bits to 'single vlan' */
+			mvpp2_prs_sram_ri_update(&pe, MVPP2_PRS_RI_VLAN_SINGLE,
+						 MVPP2_PRS_RI_VLAN_MASK);
 			/* If packet is tagged continue check vlans */
 			mvpp2_prs_sram_next_lu_set(&pe, MVPP2_PRS_LU_VLAN);
 		} else {
@@ -4425,7 +4431,7 @@ static void mvpp22_gop_init_rgmii(struct mvpp2_port *port)
 
 	regmap_read(priv->sysctrl_base, GENCONF_CTRL0, &val);
 	if (port->gop_id == 2)
-		val |= GENCONF_CTRL0_PORT0_RGMII | GENCONF_CTRL0_PORT1_RGMII;
+		val |= GENCONF_CTRL0_PORT0_RGMII;
 	else if (port->gop_id == 3)
 		val |= GENCONF_CTRL0_PORT1_RGMII_MII;
 	regmap_write(priv->sysctrl_base, GENCONF_CTRL0, val);
@@ -4880,8 +4886,8 @@ static void mvpp2_ethtool_get_strings(struct net_device *netdev, u32 sset,
 		int i;
 
 		for (i = 0; i < ARRAY_SIZE(mvpp2_ethtool_regs); i++)
-			memcpy(data + i * ETH_GSTRING_LEN,
-			       &mvpp2_ethtool_regs[i].string, ETH_GSTRING_LEN);
+			strscpy(data + i * ETH_GSTRING_LEN,
+			        mvpp2_ethtool_regs[i].string, ETH_GSTRING_LEN);
 	}
 }
 
@@ -4978,7 +4984,7 @@ static inline void mvpp2_xlg_max_rx_size_set(struct mvpp2_port *port)
 /* Set defaults to the MVPP2 port */
 static void mvpp2_defaults_set(struct mvpp2_port *port)
 {
-	int tx_port_num, val, queue, ptxq, lrxq;
+	int tx_port_num, val, queue, lrxq;
 
 	if (port->priv->hw_version == MVPP21) {
 		/* Configure port to loopback if needed */
@@ -5000,11 +5006,9 @@ static void mvpp2_defaults_set(struct mvpp2_port *port)
 	mvpp2_write(port->priv, MVPP2_TXP_SCHED_CMD_1_REG, 0);
 
 	/* Close bandwidth for all queues */
-	for (queue = 0; queue < MVPP2_MAX_TXQ; queue++) {
-		ptxq = mvpp2_txq_phys(port->id, queue);
+	for (queue = 0; queue < MVPP2_MAX_TXQ; queue++)
 		mvpp2_write(port->priv,
-			    MVPP2_TXQ_SCHED_TOKEN_CNTR_REG(ptxq), 0);
-	}
+			    MVPP2_TXQ_SCHED_TOKEN_CNTR_REG(queue), 0);
 
 	/* Set refill period to 1 usec, refill tokens
 	 * and bucket size to maximum
@@ -5300,7 +5304,7 @@ static void mvpp2_txq_desc_put(struct mvpp2_tx_queue *txq)
 }
 
 /* Set Tx descriptors fields relevant for CSUM calculation */
-static u32 mvpp2_txq_desc_csum(int l3_offs, int l3_proto,
+static u32 mvpp2_txq_desc_csum(int l3_offs, __be16 l3_proto,
 			       int ip_hdr_len, int l4_proto)
 {
 	u32 command;
@@ -5846,7 +5850,7 @@ static void mvpp2_txq_deinit(struct mvpp2_port *port,
 	txq->descs_dma         = 0;
 
 	/* Set minimum bandwidth for disabled TXQs */
-	mvpp2_write(port->priv, MVPP2_TXQ_SCHED_TOKEN_CNTR_REG(txq->id), 0);
+	mvpp2_write(port->priv, MVPP2_TXQ_SCHED_TOKEN_CNTR_REG(txq->log_id), 0);
 
 	/* Set Tx descriptors queue starting address and size */
 	cpu = get_cpu();
@@ -6267,14 +6271,15 @@ static u32 mvpp2_skb_tx_csum(struct mvpp2_port *port, struct sk_buff *skb)
 	if (skb->ip_summed == CHECKSUM_PARTIAL) {
 		int ip_hdr_len = 0;
 		u8 l4_proto;
+		__be16 l3_proto = vlan_get_protocol(skb);
 
-		if (skb->protocol == htons(ETH_P_IP)) {
+		if (l3_proto == htons(ETH_P_IP)) {
 			struct iphdr *ip4h = ip_hdr(skb);
 
 			/* Calculate IPv4 checksum and L4 checksum */
 			ip_hdr_len = ip4h->ihl;
 			l4_proto = ip4h->protocol;
-		} else if (skb->protocol == htons(ETH_P_IPV6)) {
+		} else if (l3_proto == htons(ETH_P_IPV6)) {
 			struct ipv6hdr *ip6h = ipv6_hdr(skb);
 
 			/* Read l4_protocol from one of IPv6 extra headers */
@@ -6286,7 +6291,7 @@ static u32 mvpp2_skb_tx_csum(struct mvpp2_port *port, struct sk_buff *skb)
 		}
 
 		return mvpp2_txq_desc_csum(skb_network_offset(skb),
-				skb->protocol, ip_hdr_len, l4_proto);
+					   l3_proto, ip_hdr_len, l4_proto);
 	}
 
 	return MVPP2_TXD_L4_CSUM_NOT | MVPP2_TXD_IP_CSUM_DISABLE;
@@ -6723,10 +6728,12 @@ static int mvpp2_poll(struct napi_struct *napi, int budget)
 				   cause_rx_tx & ~MVPP2_CAUSE_MISC_SUM_MASK);
 	}
 
-	cause_tx = cause_rx_tx & MVPP2_CAUSE_TXQ_OCCUP_DESC_ALL_MASK;
-	if (cause_tx) {
-		cause_tx >>= MVPP2_CAUSE_TXQ_OCCUP_DESC_ALL_OFFSET;
-		mvpp2_tx_done(port, cause_tx, qv->sw_thread_id);
+	if (port->has_tx_irqs) {
+		cause_tx = cause_rx_tx & MVPP2_CAUSE_TXQ_OCCUP_DESC_ALL_MASK;
+		if (cause_tx) {
+			cause_tx >>= MVPP2_CAUSE_TXQ_OCCUP_DESC_ALL_OFFSET;
+			mvpp2_tx_done(port, cause_tx, qv->sw_thread_id);
+		}
 	}
 
 	/* Process RX packets */
@@ -7127,6 +7134,7 @@ static void mvpp2_set_rx_mode(struct net_device *dev)
 	int id = port->id;
 	bool allmulti = dev->flags & IFF_ALLMULTI;
 
+retry:
 	mvpp2_prs_mac_promisc_set(priv, id, dev->flags & IFF_PROMISC);
 	mvpp2_prs_mac_multi_set(priv, id, MVPP2_PE_MAC_MC_ALL, allmulti);
 	mvpp2_prs_mac_multi_set(priv, id, MVPP2_PE_MAC_MC_IP6, allmulti);
@@ -7134,9 +7142,13 @@ static void mvpp2_set_rx_mode(struct net_device *dev)
 	/* Remove all port->id's mcast enries */
 	mvpp2_prs_mcast_del_all(priv, id);
 
-	if (allmulti && !netdev_mc_empty(dev)) {
-		netdev_for_each_mc_addr(ha, dev)
-			mvpp2_prs_mac_da_accept(priv, id, ha->addr, true);
+	if (!allmulti) {
+		netdev_for_each_mc_addr(ha, dev) {
+			if (mvpp2_prs_mac_da_accept(priv, id, ha->addr, true)) {
+				allmulti = true;
+				goto retry;
+			}
+		}
 	}
 }
 
@@ -7184,6 +7196,7 @@ log_error:
 static int mvpp2_change_mtu(struct net_device *dev, int mtu)
 {
 	struct mvpp2_port *port = netdev_priv(dev);
+	bool running = netif_running(dev);
 	int err;
 
 	if (!IS_ALIGNED(MVPP2_RX_PKT_SIZE(mtu), 8)) {
@@ -7192,40 +7205,24 @@ static int mvpp2_change_mtu(struct net_device *dev, int mtu)
 		mtu = ALIGN(MVPP2_RX_PKT_SIZE(mtu), 8);
 	}
 
-	if (!netif_running(dev)) {
-		err = mvpp2_bm_update_mtu(dev, mtu);
-		if (!err) {
-			port->pkt_size =  MVPP2_RX_PKT_SIZE(mtu);
-			return 0;
-		}
-
-		/* Reconfigure BM to the original MTU */
-		err = mvpp2_bm_update_mtu(dev, dev->mtu);
-		if (err)
-			goto log_error;
-	}
-
-	mvpp2_stop_dev(port);
+	if (running)
+		mvpp2_stop_dev(port);
 
 	err = mvpp2_bm_update_mtu(dev, mtu);
-	if (!err) {
+	if (err) {
+		netdev_err(dev, "failed to change MTU\n");
+		/* Reconfigure BM to the original MTU */
+		mvpp2_bm_update_mtu(dev, dev->mtu);
+	} else {
 		port->pkt_size =  MVPP2_RX_PKT_SIZE(mtu);
-		goto out_start;
 	}
 
-	/* Reconfigure BM to the original MTU */
-	err = mvpp2_bm_update_mtu(dev, dev->mtu);
-	if (err)
-		goto log_error;
+	if (running) {
+		mvpp2_start_dev(port);
+		mvpp2_egress_enable(port);
+		mvpp2_ingress_enable(port);
+	}
 
-out_start:
-	mvpp2_start_dev(port);
-	mvpp2_egress_enable(port);
-	mvpp2_ingress_enable(port);
-
-	return 0;
-log_error:
-	netdev_err(dev, "failed to change MTU\n");
 	return err;
 }
 
@@ -7919,6 +7916,7 @@ static int mvpp2_port_probe(struct platform_device *pdev,
 	dev->min_mtu = ETH_MIN_MTU;
 	/* 9676 == 9700 - 20 and rounding to 8 */
 	dev->max_mtu = 9676;
+	dev->dev.of_node = port_node;
 
 	err = register_netdev(dev);
 	if (err < 0) {
@@ -8273,12 +8271,12 @@ static int mvpp2_probe(struct platform_device *pdev)
 		if (IS_ERR(priv->axi_clk)) {
 			err = PTR_ERR(priv->axi_clk);
 			if (err == -EPROBE_DEFER)
-				goto err_gop_clk;
+				goto err_mg_clk;
 			priv->axi_clk = NULL;
 		} else {
 			err = clk_prepare_enable(priv->axi_clk);
 			if (err < 0)
-				goto err_gop_clk;
+				goto err_mg_clk;
 		}
 	}
 
@@ -8286,9 +8284,9 @@ static int mvpp2_probe(struct platform_device *pdev)
 	priv->tclk = clk_get_rate(priv->pp_clk);
 
 	if (priv->hw_version == MVPP22) {
-		err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(40));
+		err = dma_set_mask(&pdev->dev, MVPP2_DESC_DMA_MASK);
 		if (err)
-			goto err_mg_clk;
+			goto err_axi_clk;
 		/* Sadly, the BM pools all share the same register to
 		 * store the high 32 bits of their address. So they
 		 * must all have the same high 32 bits, which forces
@@ -8296,21 +8294,21 @@ static int mvpp2_probe(struct platform_device *pdev)
 		 */
 		err = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
 		if (err)
-			goto err_mg_clk;
+			goto err_axi_clk;
 	}
 
 	/* Initialize network controller */
 	err = mvpp2_init(pdev, priv);
 	if (err < 0) {
 		dev_err(&pdev->dev, "failed to initialize controller\n");
-		goto err_mg_clk;
+		goto err_axi_clk;
 	}
 
 	priv->port_count = of_get_available_child_count(dn);
 	if (priv->port_count == 0) {
 		dev_err(&pdev->dev, "no ports enabled\n");
 		err = -ENODEV;
-		goto err_mg_clk;
+		goto err_axi_clk;
 	}
 
 	priv->port_list = devm_kcalloc(&pdev->dev, priv->port_count,
@@ -8355,8 +8353,9 @@ err_port_probe:
 			mvpp2_port_remove(priv->port_list[i]);
 		i++;
 	}
-err_mg_clk:
+err_axi_clk:
 	clk_disable_unprepare(priv->axi_clk);
+err_mg_clk:
 	if (priv->hw_version == MVPP22)
 		clk_disable_unprepare(priv->mg_clk);
 err_gop_clk:
@@ -8373,9 +8372,6 @@ static int mvpp2_remove(struct platform_device *pdev)
 	struct device_node *port_node;
 	int i = 0;
 
-	flush_workqueue(priv->stats_queue);
-	destroy_workqueue(priv->stats_queue);
-
 	for_each_available_child_of_node(dn, port_node) {
 		if (priv->port_list[i]) {
 			mutex_destroy(&priv->port_list[i]->gather_stats_lock);
@@ -8383,6 +8379,8 @@ static int mvpp2_remove(struct platform_device *pdev)
 		}
 		i++;
 	}
+
+	destroy_workqueue(priv->stats_queue);
 
 	for (i = 0; i < MVPP2_BM_POOLS_NUM; i++) {
 		struct mvpp2_bm_pool *bm_pool = &priv->bm_pools[i];

@@ -22,6 +22,7 @@
  * Authors: Ben Skeggs
  */
 #include "outp.h"
+#include "dp.h"
 #include "ior.h"
 
 #include <subdev/bios.h>
@@ -93,6 +94,8 @@ nvkm_outp_release(struct nvkm_outp *outp, u8 user)
 	if (ior) {
 		outp->acquired &= ~user;
 		if (!outp->acquired) {
+			if (outp->func->release && outp->ior)
+				outp->func->release(outp);
 			outp->ior->asy.outp = NULL;
 			outp->ior = NULL;
 		}
@@ -127,17 +130,26 @@ nvkm_outp_acquire(struct nvkm_outp *outp, u8 user)
 	if (proto == UNKNOWN)
 		return -ENOSYS;
 
+	/* Deal with panels requiring identity-mapped SOR assignment. */
+	if (outp->identity) {
+		ior = nvkm_ior_find(outp->disp, SOR, ffs(outp->info.or) - 1);
+		if (WARN_ON(!ior))
+			return -ENOSPC;
+		return nvkm_outp_acquire_ior(outp, user, ior);
+	}
+
 	/* First preference is to reuse the OR that is currently armed
 	 * on HW, if any, in order to prevent unnecessary switching.
 	 */
 	list_for_each_entry(ior, &outp->disp->ior, head) {
-		if (!ior->asy.outp && ior->arm.outp == outp)
+		if (!ior->identity && !ior->asy.outp && ior->arm.outp == outp)
 			return nvkm_outp_acquire_ior(outp, user, ior);
 	}
 
 	/* Failing that, a completely unused OR is the next best thing. */
 	list_for_each_entry(ior, &outp->disp->ior, head) {
-		if (!ior->asy.outp && ior->type == type && !ior->arm.outp &&
+		if (!ior->identity &&
+		    !ior->asy.outp && ior->type == type && !ior->arm.outp &&
 		    (ior->func->route.set || ior->id == __ffs(outp->info.or)))
 			return nvkm_outp_acquire_ior(outp, user, ior);
 	}
@@ -146,7 +158,7 @@ nvkm_outp_acquire(struct nvkm_outp *outp, u8 user)
 	 * but will be released during the next modeset.
 	 */
 	list_for_each_entry(ior, &outp->disp->ior, head) {
-		if (!ior->asy.outp && ior->type == type &&
+		if (!ior->identity && !ior->asy.outp && ior->type == type &&
 		    (ior->func->route.set || ior->id == __ffs(outp->info.or)))
 			return nvkm_outp_acquire_ior(outp, user, ior);
 	}
@@ -205,6 +217,14 @@ nvkm_outp_init_route(struct nvkm_outp *outp)
 	if (!ior->arm.head || ior->arm.proto != proto) {
 		OUTP_DBG(outp, "no heads (%x %d %d)", ior->arm.head,
 			 ior->arm.proto, proto);
+
+		/* The EFI GOP driver on Ampere can leave unused DP links routed,
+		 * which we don't expect.  The DisableLT IED script *should* get
+		 * us back to where we need to be.
+		 */
+		if (ior->func->route.get && !ior->arm.head && outp->info.type == DCB_OUTPUT_DP)
+			nvkm_dp_disable(outp, ior);
+
 		return;
 	}
 

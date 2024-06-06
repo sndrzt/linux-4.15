@@ -252,31 +252,25 @@ static void dw8250_set_termios(struct uart_port *p, struct ktermios *termios,
 			       struct ktermios *old)
 {
 	unsigned int baud = tty_termios_baud_rate(termios);
-	unsigned int target_rate, min_rate, max_rate;
 	struct dw8250_data *d = p->private_data;
 	long rate;
-	int i, ret;
+	int ret;
 
-	if (IS_ERR(d->clk) || !old)
+	if (IS_ERR(d->clk))
 		goto out;
 
-	/* Find a clk rate within +/-1.6% of an integer multiple of baudx16 */
-	target_rate = baud * 16;
-	min_rate = target_rate - (target_rate >> 6);
-	max_rate = target_rate + (target_rate >> 6);
-
-	for (i = 1; i <= UART_DIV_MAX; i++) {
-		rate = clk_round_rate(d->clk, i * target_rate);
-		if (rate >= i * min_rate && rate <= i * max_rate)
-			break;
-	}
-	if (i <= UART_DIV_MAX) {
-		clk_disable_unprepare(d->clk);
+	clk_disable_unprepare(d->clk);
+	rate = clk_round_rate(d->clk, baud * 16);
+	if (rate < 0)
+		ret = rate;
+	else if (rate == 0)
+		ret = -ENOENT;
+	else
 		ret = clk_set_rate(d->clk, rate);
-		clk_prepare_enable(d->clk);
-		if (!ret)
-			p->uartclk = rate;
-	}
+	clk_prepare_enable(d->clk);
+
+	if (!ret)
+		p->uartclk = rate;
 
 out:
 	p->status &= ~UPSTAT_AUTOCTS;
@@ -317,7 +311,7 @@ static bool dw8250_fallback_dma_filter(struct dma_chan *chan, void *param)
 
 static bool dw8250_idma_filter(struct dma_chan *chan, void *param)
 {
-	return param == chan->device->dev->parent;
+	return param == chan->device->dev;
 }
 
 static void dw8250_quirks(struct uart_port *p, struct dw8250_data *data)
@@ -358,7 +352,7 @@ static void dw8250_quirks(struct uart_port *p, struct dw8250_data *data)
 		}
 	}
 
-	/* Platforms with iDMA */
+	/* Platforms with iDMA 64-bit */
 	if (platform_get_resource_byname(to_platform_device(p->dev),
 					 IORESOURCE_MEM, "lpss_priv")) {
 		data->dma.rx_param = p->dev->parent;
@@ -515,7 +509,8 @@ static int dw8250_probe(struct platform_device *pdev)
 	/* If no clock rate is defined, fail. */
 	if (!p->uartclk) {
 		dev_err(dev, "clock rate not defined\n");
-		return -EINVAL;
+		err = -EINVAL;
+		goto err_clk;
 	}
 
 	data->pclk = devm_clk_get(dev, "apb_pclk");
@@ -673,6 +668,7 @@ static const struct acpi_device_id dw8250_acpi_match[] = {
 	{ "APMC0D08", 0},
 	{ "AMD0020", 0 },
 	{ "AMDI0020", 0 },
+	{ "BRCM2032", 0 },
 	{ "HISI0031", 0 },
 	{ },
 };
@@ -683,7 +679,7 @@ static struct platform_driver dw8250_platform_driver = {
 		.name		= "dw-apb-uart",
 		.pm		= &dw8250_pm_ops,
 		.of_match_table	= dw8250_of_match,
-		.acpi_match_table = ACPI_PTR(dw8250_acpi_match),
+		.acpi_match_table = dw8250_acpi_match,
 	},
 	.probe			= dw8250_probe,
 	.remove			= dw8250_remove,

@@ -100,6 +100,28 @@ struct ip_tunnel_prl_entry {
 };
 
 struct metadata_dst;
+/* A fan overlay /8 (250.0.0.0/8, for example) maps to exactly one /16
+ * underlay (10.88.0.0/16, for example).  Multiple local addresses within
+ * the /16 may be used, but a particular overlay may not span
+ * multiple underlay subnets.
+ *
+ * We store one underlay, indexed by the overlay's high order octet.
+ */
+#define FAN_OVERLAY_CNT		256
+
+struct ip_fan_map {
+	__be32			underlay;
+	__be32			overlay;
+	u16			underlay_prefix;
+	u16			overlay_prefix;
+	u32			overlay_mask;
+	struct list_head	list;
+	struct rcu_head		rcu;
+};
+
+struct ip_tunnel_fan {
+	struct list_head	fan_maps;
+};
 
 struct ip_tunnel {
 	struct ip_tunnel __rcu	*next;
@@ -134,6 +156,7 @@ struct ip_tunnel {
 #endif
 	struct ip_tunnel_prl_entry __rcu *prl;	/* potential router list */
 	unsigned int		prl_count;	/* # of entries in PRL */
+	struct ip_tunnel_fan	fan;
 	unsigned int		ip_tnl_net_id;
 	struct gro_cells	gro_cells;
 	__u32			fwmark;
@@ -159,6 +182,11 @@ struct ip_tunnel {
 
 #define TUNNEL_OPTIONS_PRESENT \
 		(TUNNEL_GENEVE_OPT | TUNNEL_VXLAN_OPT | TUNNEL_ERSPAN_OPT)
+
+static inline int fan_has_map(const struct ip_tunnel_fan *fan)
+{
+	return !list_empty(&fan->fan_maps);
+}
 
 struct tnl_ptk_info {
 	__be16 flags;
@@ -304,6 +332,26 @@ int ip_tunnel_encap_del_ops(const struct ip_tunnel_encap_ops *op,
 
 int ip_tunnel_encap_setup(struct ip_tunnel *t,
 			  struct ip_tunnel_encap *ipencap);
+
+static inline bool pskb_inet_may_pull(struct sk_buff *skb)
+{
+	int nhlen;
+
+	switch (skb->protocol) {
+#if IS_ENABLED(CONFIG_IPV6)
+	case htons(ETH_P_IPV6):
+		nhlen = sizeof(struct ipv6hdr);
+		break;
+#endif
+	case htons(ETH_P_IP):
+		nhlen = sizeof(struct iphdr);
+		break;
+	default:
+		nhlen = 0;
+	}
+
+	return pskb_network_may_pull(skb, nhlen);
+}
 
 static inline int ip_encap_hlen(struct ip_tunnel_encap *e)
 {

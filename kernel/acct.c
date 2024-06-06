@@ -227,7 +227,7 @@ static int acct_on(struct filename *pathname)
 		filp_close(file, NULL);
 		return PTR_ERR(internal);
 	}
-	err = mnt_want_write(internal);
+	err = __mnt_want_write(internal);
 	if (err) {
 		mntput(internal);
 		kfree(acct);
@@ -252,7 +252,7 @@ static int acct_on(struct filename *pathname)
 	old = xchg(&ns->bacct, &acct->pin);
 	mutex_unlock(&acct->lock);
 	pin_kill(old);
-	mnt_drop_write(mnt);
+	__mnt_drop_write(mnt);
 	mntput(mnt);
 	return 0;
 }
@@ -331,6 +331,8 @@ static comp_t encode_comp_t(unsigned long value)
 		exp++;
 	}
 
+	if (exp > (((comp_t) ~0U) >> MANTSIZE))
+		return (comp_t) ~0U;
 	/*
 	 * Clean it up and polish it off.
 	 */

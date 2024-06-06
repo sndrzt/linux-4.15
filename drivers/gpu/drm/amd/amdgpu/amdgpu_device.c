@@ -526,7 +526,7 @@ static int amdgpu_wb_init(struct amdgpu_device *adev)
 		memset(&adev->wb.used, 0, sizeof(adev->wb.used));
 
 		/* clear wb memory */
-		memset((char *)adev->wb.wb, 0, AMDGPU_MAX_WB * sizeof(uint32_t));
+		memset((char *)adev->wb.wb, 0, AMDGPU_MAX_WB * sizeof(uint32_t) * 8);
 	}
 
 	return 0;
@@ -564,8 +564,9 @@ int amdgpu_wb_get(struct amdgpu_device *adev, u32 *wb)
  */
 void amdgpu_wb_free(struct amdgpu_device *adev, u32 wb)
 {
+	wb >>= 3;
 	if (wb < adev->wb.num_wb)
-		__clear_bit(wb >> 3, adev->wb.used);
+		__clear_bit(wb, adev->wb.used);
 }
 
 /**
@@ -1922,7 +1923,7 @@ static int amdgpu_sriov_reinit_early(struct amdgpu_device *adev)
 		AMD_IP_BLOCK_TYPE_IH,
 	};
 
-	for (i = 0; i < ARRAY_SIZE(ip_order); i++) {
+	for (i = 0; i < adev->num_ip_blocks; i++) {
 		int j;
 		struct amdgpu_ip_block *block;
 
@@ -2052,8 +2053,18 @@ bool amdgpu_device_asic_has_dc_support(enum amd_asic_type asic_type)
 	switch (asic_type) {
 #if defined(CONFIG_DRM_AMD_DC)
 	case CHIP_BONAIRE:
-	case CHIP_HAWAII:
 	case CHIP_KAVERI:
+	case CHIP_KABINI:
+	case CHIP_MULLINS:
+		/*
+		 * We have systems in the wild with these ASICs that require
+		 * LVDS and VGA support which is not supported with DC.
+		 *
+		 * Fallback to the non-DC driver here by default so as not to
+		 * cause regressions.
+		 */
+		return amdgpu_dc > 0;
+	case CHIP_HAWAII:
 	case CHIP_CARRIZO:
 	case CHIP_STONEY:
 	case CHIP_POLARIS11:
@@ -2064,9 +2075,6 @@ bool amdgpu_device_asic_has_dc_support(enum amd_asic_type asic_type)
 #if defined(CONFIG_DRM_AMD_DC_PRE_VEGA)
 		return amdgpu_dc != 0;
 #endif
-	case CHIP_KABINI:
-	case CHIP_MULLINS:
-		return amdgpu_dc > 0;
 	case CHIP_VEGA10:
 #if defined(CONFIG_DRM_AMD_DC_DCN1_0)
 	case CHIP_RAVEN:
@@ -2228,8 +2236,6 @@ int amdgpu_device_init(struct amdgpu_device *adev,
 	 * ignore it */
 	vga_client_register(adev->pdev, adev, NULL, amdgpu_vga_set_decode);
 
-	if (amdgpu_runtime_pm == 1)
-		runtime = true;
 	if (amdgpu_device_is_px(ddev))
 		runtime = true;
 	if (!pci_is_thunderbolt_attached(adev->pdev))

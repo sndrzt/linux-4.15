@@ -233,6 +233,8 @@ static int mwifiex_pcie_probe(struct pci_dev *pdev,
 					const struct pci_device_id *ent)
 {
 	struct pcie_service_card *card;
+	struct mwifiex_private *priv;
+	struct pci_dev *pdev_host;
 	int ret;
 
 	pr_debug("info: vendor=0x%4.04X device=0x%4.04X rev=%d\n",
@@ -271,6 +273,14 @@ static int mwifiex_pcie_probe(struct pci_dev *pdev,
 		return -1;
 	}
 
+	priv = mwifiex_get_priv(card->adapter, MWIFIEX_BSS_ROLE_STA);
+	pdev_host = pci_get_subsys(PCI_ANY_ID, PCI_ANY_ID, 0x1028, 0x0720, NULL);
+	if (!pdev_host)
+		pdev_host = pci_get_subsys(PCI_ANY_ID, PCI_ANY_ID, 0x1028, 0x0733, NULL);
+	if (pdev_host) {
+		priv->is_edge_gateway = true;
+		pci_dev_put(pdev_host);
+	}
 	return 0;
 }
 
@@ -368,6 +378,8 @@ static void mwifiex_pcie_reset_prepare(struct pci_dev *pdev)
 	clear_bit(MWIFIEX_IFACE_WORK_DEVICE_DUMP, &card->work_flags);
 	clear_bit(MWIFIEX_IFACE_WORK_CARD_RESET, &card->work_flags);
 	mwifiex_dbg(adapter, INFO, "%s, successful\n", __func__);
+
+	card->pci_reset_ongoing = true;
 }
 
 /*
@@ -396,6 +408,8 @@ static void mwifiex_pcie_reset_done(struct pci_dev *pdev)
 		dev_err(&pdev->dev, "reinit failed: %d\n", ret);
 	else
 		mwifiex_dbg(adapter, INFO, "%s, successful\n", __func__);
+
+	card->pci_reset_ongoing = false;
 }
 
 static const struct pci_error_handlers mwifiex_pcie_err_handler = {
@@ -677,8 +691,11 @@ static int mwifiex_pcie_init_evt_ring(struct mwifiex_adapter *adapter)
 		skb_put(skb, MAX_EVENT_SIZE);
 
 		if (mwifiex_map_pci_memory(adapter, skb, MAX_EVENT_SIZE,
-					   PCI_DMA_FROMDEVICE))
+					   PCI_DMA_FROMDEVICE)) {
+			kfree_skb(skb);
+			kfree(card->evtbd_ring_vbase);
 			return -1;
+		}
 
 		buf_pa = MWIFIEX_SKB_DMA_ADDR(skb);
 
@@ -1019,8 +1036,10 @@ static int mwifiex_pcie_alloc_cmdrsp_buf(struct mwifiex_adapter *adapter)
 	}
 	skb_put(skb, MWIFIEX_UPLD_SIZE);
 	if (mwifiex_map_pci_memory(adapter, skb, MWIFIEX_UPLD_SIZE,
-				   PCI_DMA_FROMDEVICE))
+				   PCI_DMA_FROMDEVICE)) {
+		kfree_skb(skb);
 		return -1;
+	}
 
 	card->cmdrsp_buf = skb;
 
@@ -1061,7 +1080,7 @@ static int mwifiex_pcie_delete_cmdrsp_buf(struct mwifiex_adapter *adapter)
 static int mwifiex_pcie_alloc_sleep_cookie_buf(struct mwifiex_adapter *adapter)
 {
 	struct pcie_service_card *card = adapter->card;
-	u32 tmp;
+	u32 *cookie;
 
 	card->sleep_cookie_vbase = pci_alloc_consistent(card->dev, sizeof(u32),
 						     &card->sleep_cookie_pbase);
@@ -1070,13 +1089,11 @@ static int mwifiex_pcie_alloc_sleep_cookie_buf(struct mwifiex_adapter *adapter)
 			    "pci_alloc_consistent failed!\n");
 		return -ENOMEM;
 	}
+	cookie = (u32 *)card->sleep_cookie_vbase;
 	/* Init val of Sleep Cookie */
-	tmp = FW_AWAKE_COOKIE;
-	put_unaligned(tmp, card->sleep_cookie_vbase);
+	*cookie = FW_AWAKE_COOKIE;
 
-	mwifiex_dbg(adapter, INFO,
-		    "alloc_scook: sleep cookie=0x%x\n",
-		    get_unaligned(card->sleep_cookie_vbase));
+	mwifiex_dbg(adapter, INFO, "alloc_scook: sleep cookie=0x%x\n", *cookie);
 
 	return 0;
 }
@@ -1309,6 +1326,14 @@ mwifiex_pcie_send_data(struct mwifiex_adapter *adapter, struct sk_buff *skb,
 			ret = -1;
 			goto done_unmap;
 		}
+
+		/* The firmware (latest version 15.68.19.p21) of the 88W8897 PCIe+USB card
+		 * seems to crash randomly after setting the TX ring write pointer when
+		 * ASPM powersaving is enabled. A workaround seems to be keeping the bus
+		 * busy by reading a random register afterwards.
+		 */
+		mwifiex_read_reg(adapter, PCI_VENDOR_ID, &rx_val);
+
 		if ((mwifiex_pcie_txbd_not_full(card)) &&
 		    tx_param->next_pkt_len) {
 			/* have more packets and TxBD still can hold more */
@@ -2781,7 +2806,10 @@ static void mwifiex_pcie_card_reset_work(struct mwifiex_adapter *adapter)
 {
 	struct pcie_service_card *card = adapter->card;
 
-	pci_reset_function(card->dev);
+	/* We can't afford to wait here; remove() might be waiting on us. If we
+	 * can't grab the device lock, maybe we'll get another chance later.
+	 */
+	pci_try_reset_function(card->dev);
 }
 
 static void mwifiex_pcie_work(struct work_struct *work)
@@ -2972,7 +3000,19 @@ static void mwifiex_cleanup_pcie(struct mwifiex_adapter *adapter)
 	int ret;
 	u32 fw_status;
 
-	cancel_work_sync(&card->work);
+	/* Perform the cancel_work_sync() only when we're not resetting
+	 * the card. It's because that function never returns if we're
+	 * in reset path. If we're here when resetting the card, it means
+	 * that we failed to reset the card (reset failure path).
+	 */
+	if (!card->pci_reset_ongoing) {
+		mwifiex_dbg(adapter, MSG, "performing cancel_work_sync()...\n");
+		cancel_work_sync(&card->work);
+		mwifiex_dbg(adapter, MSG, "cancel_work_sync() done\n");
+	} else {
+		mwifiex_dbg(adapter, MSG,
+			    "skipped cancel_work_sync() because we're in card reset failure path\n");
+	}
 
 	ret = mwifiex_read_reg(adapter, reg->fw_status, &fw_status);
 	if (fw_status == FIRMWARE_READY_PCIE) {

@@ -51,6 +51,7 @@ extern struct kmem_cache *btrfs_trans_handle_cachep;
 extern struct kmem_cache *btrfs_bit_radix_cachep;
 extern struct kmem_cache *btrfs_path_cachep;
 extern struct kmem_cache *btrfs_free_space_cachep;
+extern struct kmem_cache *btrfs_free_space_bitmap_cachep;
 struct btrfs_ordered_sum;
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -346,6 +347,12 @@ struct btrfs_path {
 	unsigned int search_commit_root:1;
 	unsigned int need_commit_sem:1;
 	unsigned int skip_release_on_error:1;
+	/*
+	 * Indicate that new item (btrfs_search_slot) is extending already
+	 * existing item and ins_len contains only the data size and not item
+	 * header (ie. sizeof(struct btrfs_item) is not included).
+	 */
+	unsigned int search_for_extension:1;
 };
 #define BTRFS_MAX_EXTENT_ITEM_SIZE(r) ((BTRFS_LEAF_DATA_SIZE(r->fs_info) >> 4) - \
 					sizeof(struct btrfs_item))
@@ -868,14 +875,12 @@ struct btrfs_fs_info {
 	struct list_head delayed_iputs;
 	struct mutex cleaner_delayed_iput_mutex;
 
-	/* this protects tree_mod_seq_list */
-	spinlock_t tree_mod_seq_lock;
 	atomic64_t tree_mod_seq;
-	struct list_head tree_mod_seq_list;
 
-	/* this protects tree_mod_log */
+	/* this protects tree_mod_log and tree_mod_seq_list */
 	rwlock_t tree_mod_log_lock;
 	struct rb_root tree_mod_log;
+	struct list_head tree_mod_seq_list;
 
 	atomic_t async_delalloc_pages;
 	atomic_t open_ioctl_trans;
@@ -1260,6 +1265,7 @@ struct btrfs_root {
 	int send_in_progress;
 	struct btrfs_subvolume_writers *subv_writers;
 	atomic_t will_be_snapshotted;
+	atomic_t snapshot_force_cow;
 
 	/* For qgroup metadata space reserve */
 	atomic64_t qgroup_meta_rsv;
@@ -1437,6 +1443,21 @@ do {                                                                   \
 #define BTRFS_INODE_COMPRESS		(1 << 11)
 
 #define BTRFS_INODE_ROOT_ITEM_INIT	(1 << 31)
+
+#define BTRFS_INODE_FLAG_MASK						\
+	(BTRFS_INODE_NODATASUM |					\
+	 BTRFS_INODE_NODATACOW |					\
+	 BTRFS_INODE_READONLY |						\
+	 BTRFS_INODE_NOCOMPRESS |					\
+	 BTRFS_INODE_PREALLOC |						\
+	 BTRFS_INODE_SYNC |						\
+	 BTRFS_INODE_IMMUTABLE |					\
+	 BTRFS_INODE_APPEND |						\
+	 BTRFS_INODE_NODUMP |						\
+	 BTRFS_INODE_NOATIME |						\
+	 BTRFS_INODE_DIRSYNC |						\
+	 BTRFS_INODE_COMPRESS |						\
+	 BTRFS_INODE_ROOT_ITEM_INIT)
 
 struct btrfs_map_token {
 	const struct extent_buffer *eb;
@@ -2410,32 +2431,6 @@ static inline u32 btrfs_file_extent_inline_item_len(
 	return btrfs_item_size(eb, e) - BTRFS_FILE_EXTENT_INLINE_DATA_START;
 }
 
-/* this returns the number of file bytes represented by the inline item.
- * If an item is compressed, this is the uncompressed size
- */
-static inline u32 btrfs_file_extent_inline_len(const struct extent_buffer *eb,
-					int slot,
-					const struct btrfs_file_extent_item *fi)
-{
-	struct btrfs_map_token token;
-
-	btrfs_init_map_token(&token);
-	/*
-	 * return the space used on disk if this item isn't
-	 * compressed or encoded
-	 */
-	if (btrfs_token_file_extent_compression(eb, fi, &token) == 0 &&
-	    btrfs_token_file_extent_encryption(eb, fi, &token) == 0 &&
-	    btrfs_token_file_extent_other_encoding(eb, fi, &token) == 0) {
-		return btrfs_file_extent_inline_item_len(eb,
-							 btrfs_item_nr(slot));
-	}
-
-	/* otherwise use the ram bytes field */
-	return btrfs_token_file_extent_ram_bytes(eb, fi, &token);
-}
-
-
 /* btrfs_dev_stats_item */
 static inline u64 btrfs_dev_stats_value(const struct extent_buffer *eb,
 					const struct btrfs_dev_stats_item *ptr,
@@ -2578,6 +2573,7 @@ enum btrfs_inline_ref_type {
 int btrfs_get_extent_inline_ref_type(const struct extent_buffer *eb,
 				     struct btrfs_extent_inline_ref *iref,
 				     enum btrfs_inline_ref_type is_data);
+u64 hash_extent_data_ref(u64 root_objectid, u64 owner, u64 offset);
 
 u64 btrfs_csum_bytes_to_leaves(struct btrfs_fs_info *fs_info, u64 csum_bytes);
 
@@ -2975,7 +2971,7 @@ static inline void free_fs_info(struct btrfs_fs_info *fs_info)
 	kfree(fs_info->super_copy);
 	kfree(fs_info->super_for_commit);
 	security_free_mnt_opts(&fs_info->security_opts);
-	kfree(fs_info);
+	kvfree(fs_info);
 }
 
 /* tree mod log functions from ctree.c */
@@ -3109,8 +3105,9 @@ int btrfs_find_name_in_ext_backref(struct btrfs_path *path,
 /* file-item.c */
 struct btrfs_dio_private;
 int btrfs_del_csums(struct btrfs_trans_handle *trans,
-		    struct btrfs_fs_info *fs_info, u64 bytenr, u64 len);
+		    struct btrfs_root *root, u64 bytenr, u64 len);
 blk_status_t btrfs_lookup_bio_sums(struct inode *inode, struct bio *bio, u32 *dst);
+
 blk_status_t btrfs_lookup_bio_sums_dio(struct inode *inode, struct bio *bio,
 			      u64 logical_offset);
 int btrfs_insert_file_extent(struct btrfs_trans_handle *trans,
@@ -3156,6 +3153,8 @@ noinline int can_nocow_extent(struct inode *inode, u64 offset, u64 *len,
 			      u64 *orig_start, u64 *orig_block_len,
 			      u64 *ram_bytes);
 
+void __btrfs_del_delalloc_inode(struct btrfs_root *root,
+				struct btrfs_inode *inode);
 struct inode *btrfs_lookup_dentry(struct inode *dir, struct dentry *dentry);
 int btrfs_set_inode_index(struct btrfs_inode *dir, u64 *index);
 int btrfs_unlink_inode(struct btrfs_trans_handle *trans,
@@ -3226,6 +3225,9 @@ int btrfs_prealloc_file_range_trans(struct inode *inode,
 				    struct btrfs_trans_handle *trans, int mode,
 				    u64 start, u64 num_bytes, u64 min_size,
 				    loff_t actual_len, u64 *alloc_hint);
+int btrfs_run_delalloc_range(void *private_data, struct page *locked_page,
+		u64 start, u64 end, int *page_started, unsigned long *nr_written,
+		struct writeback_control *wbc);
 extern const struct dentry_operations btrfs_dentry_operations;
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
 void btrfs_test_inode_set_ops(struct inode *inode);
@@ -3295,6 +3297,8 @@ ssize_t btrfs_listxattr(struct dentry *dentry, char *buffer, size_t size);
 int btrfs_parse_options(struct btrfs_fs_info *info, char *options,
 			unsigned long new_flags);
 int btrfs_sync_fs(struct super_block *sb, int wait);
+char *btrfs_get_subvol_name_from_objectid(struct btrfs_fs_info *fs_info,
+					  u64 subvol_objectid);
 
 static inline __printf(2, 3)
 void btrfs_no_printk(const struct btrfs_fs_info *fs_info, const char *fmt, ...)

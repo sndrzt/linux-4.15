@@ -54,12 +54,13 @@ bool hns_roce_check_whether_mhop(struct hns_roce_dev *hr_dev, u32 type)
 EXPORT_SYMBOL_GPL(hns_roce_check_whether_mhop);
 
 static bool hns_roce_check_hem_null(struct hns_roce_hem **hem, u64 start_idx,
-			    u32 bt_chunk_num)
+			    u32 bt_chunk_num, u64 hem_max_num)
 {
-	int i;
+	u64 check_max_num = start_idx + bt_chunk_num;
+	u64 i;
 
-	for (i = 0; i < bt_chunk_num; i++)
-		if (hem[start_idx + i])
+	for (i = start_idx; (i < check_max_num) && (i < hem_max_num); i++)
+		if (hem[i])
 			return false;
 
 	return true;
@@ -413,6 +414,12 @@ static int hns_roce_table_mhop_get(struct hns_roce_dev *hr_dev,
 		return -EINVAL;
 	}
 
+	if (unlikely(hem_idx >= table->num_hem)) {
+		dev_err(dev, "Table %d exceed hem limt idx = %llu,max = %lu!\n",
+			     table->type, hem_idx, table->num_hem);
+		return -EINVAL;
+	}
+
 	mutex_lock(&table->mutex);
 
 	if (table->hem[hem_idx]) {
@@ -494,6 +501,9 @@ static int hns_roce_table_mhop_get(struct hns_roce_dev *hr_dev,
 			step_idx = 1;
 		} else if (hop_num == HNS_ROCE_HOP_NUM_0) {
 			step_idx = 0;
+		} else {
+			ret = -EINVAL;
+			goto err_dma_alloc_l1;
 		}
 
 		/* set HEM base address to hardware */
@@ -646,7 +656,7 @@ static void hns_roce_table_mhop_put(struct hns_roce_dev *hr_dev,
 	if (check_whether_bt_num_2(table->type, hop_num)) {
 		start_idx = mhop.l0_idx * chunk_ba_num;
 		if (hns_roce_check_hem_null(table->hem, start_idx,
-					    chunk_ba_num)) {
+					    chunk_ba_num, table->num_hem)) {
 			if (table->type < HEM_TYPE_MTT &&
 			    hr_dev->hw->clear_hem(hr_dev, table, obj, 0))
 				dev_warn(dev, "Clear HEM base address failed.\n");
@@ -660,7 +670,7 @@ static void hns_roce_table_mhop_put(struct hns_roce_dev *hr_dev,
 		start_idx = mhop.l0_idx * chunk_ba_num * chunk_ba_num +
 			    mhop.l1_idx * chunk_ba_num;
 		if (hns_roce_check_hem_null(table->hem, start_idx,
-					    chunk_ba_num)) {
+					    chunk_ba_num, table->num_hem)) {
 			if (hr_dev->hw->clear_hem(hr_dev, table, obj, 1))
 				dev_warn(dev, "Clear HEM base address failed.\n");
 
@@ -742,6 +752,8 @@ void *hns_roce_table_find(struct hns_roce_dev *hr_dev,
 		idx_offset = (obj & (table->num_obj - 1)) % obj_per_chunk;
 		dma_offset = offset = idx_offset * table->obj_size;
 	} else {
+		u32 seg_size = 64; /* 8 bytes per BA and 8 BA per segment */
+
 		hns_roce_calc_hem_mhop(hr_dev, table, &mhop_obj, &mhop);
 		/* mtt mhop */
 		i = mhop.l0_idx;
@@ -753,8 +765,8 @@ void *hns_roce_table_find(struct hns_roce_dev *hr_dev,
 			hem_idx = i;
 
 		hem = table->hem[hem_idx];
-		dma_offset = offset = (obj & (table->num_obj - 1)) *
-				       table->obj_size % mhop.bt_chunk_size;
+		dma_offset = offset = (obj & (table->num_obj - 1)) * seg_size %
+				       mhop.bt_chunk_size;
 		if (mhop.hop_num == 2)
 			dma_offset = offset = 0;
 	}
@@ -912,7 +924,7 @@ int hns_roce_init_hem_table(struct hns_roce_dev *hr_dev,
 		obj_per_chunk = buf_chunk_size / obj_size;
 		num_hem = (nobj + obj_per_chunk - 1) / obj_per_chunk;
 		bt_chunk_num = bt_chunk_size / 8;
-		if (table->type >= HEM_TYPE_MTT)
+		if (type >= HEM_TYPE_MTT)
 			num_bt_l0 = bt_chunk_num;
 
 		table->hem = kcalloc(num_hem, sizeof(*table->hem),
@@ -920,7 +932,7 @@ int hns_roce_init_hem_table(struct hns_roce_dev *hr_dev,
 		if (!table->hem)
 			goto err_kcalloc_hem_buf;
 
-		if (check_whether_bt_num_3(table->type, hop_num)) {
+		if (check_whether_bt_num_3(type, hop_num)) {
 			unsigned long num_bt_l1;
 
 			num_bt_l1 = (num_hem + bt_chunk_num - 1) /
@@ -939,8 +951,8 @@ int hns_roce_init_hem_table(struct hns_roce_dev *hr_dev,
 				goto err_kcalloc_l1_dma;
 		}
 
-		if (check_whether_bt_num_2(table->type, hop_num) ||
-			check_whether_bt_num_3(table->type, hop_num)) {
+		if (check_whether_bt_num_2(type, hop_num) ||
+			check_whether_bt_num_3(type, hop_num)) {
 			table->bt_l0 = kcalloc(num_bt_l0, sizeof(*table->bt_l0),
 					       GFP_KERNEL);
 			if (!table->bt_l0)
@@ -1039,14 +1051,14 @@ void hns_roce_cleanup_hem_table(struct hns_roce_dev *hr_dev,
 void hns_roce_cleanup_hem(struct hns_roce_dev *hr_dev)
 {
 	hns_roce_cleanup_hem_table(hr_dev, &hr_dev->cq_table.table);
-	hns_roce_cleanup_hem_table(hr_dev, &hr_dev->qp_table.irrl_table);
 	if (hr_dev->caps.trrl_entry_sz)
 		hns_roce_cleanup_hem_table(hr_dev,
 					   &hr_dev->qp_table.trrl_table);
+	hns_roce_cleanup_hem_table(hr_dev, &hr_dev->qp_table.irrl_table);
 	hns_roce_cleanup_hem_table(hr_dev, &hr_dev->qp_table.qp_table);
 	hns_roce_cleanup_hem_table(hr_dev, &hr_dev->mr_table.mtpt_table);
-	hns_roce_cleanup_hem_table(hr_dev, &hr_dev->mr_table.mtt_table);
 	if (hns_roce_check_whether_mhop(hr_dev, HEM_TYPE_CQE))
 		hns_roce_cleanup_hem_table(hr_dev,
 					   &hr_dev->mr_table.mtt_cqe_table);
+	hns_roce_cleanup_hem_table(hr_dev, &hr_dev->mr_table.mtt_table);
 }

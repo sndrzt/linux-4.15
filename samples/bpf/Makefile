@@ -143,6 +143,7 @@ HOSTCFLAGS += -I$(srctree)/tools/lib/
 HOSTCFLAGS += -I$(srctree)/tools/testing/selftests/bpf/
 HOSTCFLAGS += -I$(srctree)/tools/lib/ -I$(srctree)/tools/include
 HOSTCFLAGS += -I$(srctree)/tools/perf
+HOSTCFLAGS += -DHAVE_ATTR_TEST=0
 
 HOSTCFLAGS_bpf_load.o += -I$(objtree)/usr/include -Wno-unused-variable
 HOSTLOADLIBES_fds_example += -lelf
@@ -192,12 +193,15 @@ CLANG_ARCH_ARGS = -target $(ARCH)
 endif
 
 # Trick to allow make to be run from this directory
-all:
+all: $(LIBBPF)
 	$(MAKE) -C ../../ $(CURDIR)/
 
 clean:
 	$(MAKE) -C ../../ M=$(CURDIR) clean
-	@rm -f *~
+	@find $(CURDIR) -type f -name '*~' -delete
+
+$(LIBBPF): FORCE
+	$(MAKE) -C $(dir $@) $(notdir $@)
 
 $(obj)/syscall_nrs.s:	$(src)/syscall_nrs.c
 	$(call if_changed_dep,cc_s_c)

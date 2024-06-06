@@ -32,11 +32,6 @@
 
 static struct kmem_cache *userfaultfd_ctx_cachep __read_mostly;
 
-enum userfaultfd_state {
-	UFFD_STATE_WAIT_API,
-	UFFD_STATE_RUNNING,
-};
-
 /*
  * Start with fault_pending_wqh and fault_wqh so they're more likely
  * to be in the same cacheline.
@@ -58,8 +53,6 @@ struct userfaultfd_ctx {
 	unsigned int flags;
 	/* features requested from the userspace */
 	unsigned int features;
-	/* state machine */
-	enum userfaultfd_state state;
 	/* released */
 	bool released;
 	/* mm with one ore more vmas attached to this userfaultfd_ctx */
@@ -90,6 +83,14 @@ struct userfaultfd_wake_range {
 	unsigned long start;
 	unsigned long len;
 };
+
+/* internal indication that UFFD_API ioctl was successfully executed */
+#define UFFD_FEATURE_INITIALIZED		(1u << 31)
+
+static bool userfaultfd_is_initialized(struct userfaultfd_ctx *ctx)
+{
+	return ctx->features & UFFD_FEATURE_INITIALIZED;
+}
 
 static int userfaultfd_wake_function(wait_queue_entry_t *wq, unsigned mode,
 				     int wake_flags, void *key)
@@ -220,24 +221,26 @@ static inline bool userfaultfd_huge_must_wait(struct userfaultfd_ctx *ctx,
 					 unsigned long reason)
 {
 	struct mm_struct *mm = ctx->mm;
-	pte_t *pte;
+	pte_t *ptep, pte;
 	bool ret = true;
 
 	VM_BUG_ON(!rwsem_is_locked(&mm->mmap_sem));
 
-	pte = huge_pte_offset(mm, address, vma_mmu_pagesize(vma));
-	if (!pte)
+	ptep = huge_pte_offset(mm, address, vma_mmu_pagesize(vma));
+
+	if (!ptep)
 		goto out;
 
 	ret = false;
+	pte = huge_ptep_get(ptep);
 
 	/*
 	 * Lockless access: we're in a wait_event so it's ok if it
 	 * changes under us.
 	 */
-	if (huge_pte_none(*pte))
+	if (huge_pte_none(pte))
 		ret = true;
-	if (!huge_pte_write(*pte) && (reason & VM_UFFD_WP))
+	if (!huge_pte_write(pte) && (reason & VM_UFFD_WP))
 		ret = true;
 out:
 	return ret;
@@ -625,9 +628,13 @@ static void userfaultfd_event_wait_completion(struct userfaultfd_ctx *ctx,
 
 		/* the various vma->vm_userfaultfd_ctx still points to it */
 		down_write(&mm->mmap_sem);
+		/* no task can run (and in turn coredump) yet */
+		VM_WARN_ON(!mmget_still_valid(mm));
 		for (vma = mm->mmap; vma; vma = vma->vm_next)
-			if (vma->vm_userfaultfd_ctx.ctx == release_new_ctx)
+			if (vma->vm_userfaultfd_ctx.ctx == release_new_ctx) {
 				vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
+				vma->vm_flags &= ~(VM_UFFD_WP | VM_UFFD_MISSING);
+			}
 		up_write(&mm->mmap_sem);
 
 		userfaultfd_ctx_put(release_new_ctx);
@@ -680,7 +687,6 @@ int dup_userfaultfd(struct vm_area_struct *vma, struct list_head *fcs)
 
 		atomic_set(&ctx->refcount, 1);
 		ctx->flags = octx->flags;
-		ctx->state = UFFD_STATE_RUNNING;
 		ctx->features = octx->features;
 		ctx->released = false;
 		ctx->mm = vma->vm_mm;
@@ -726,9 +732,17 @@ void mremap_userfaultfd_prep(struct vm_area_struct *vma,
 	struct userfaultfd_ctx *ctx;
 
 	ctx = vma->vm_userfaultfd_ctx.ctx;
-	if (ctx && (ctx->features & UFFD_FEATURE_EVENT_REMAP)) {
+
+	if (!ctx)
+		return;
+
+	if (ctx->features & UFFD_FEATURE_EVENT_REMAP) {
 		vm_ctx->ctx = ctx;
 		userfaultfd_ctx_get(ctx);
+	} else {
+		/* Drop uffd context if remap feature not enabled */
+		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
+		vma->vm_flags &= ~(VM_UFFD_WP | VM_UFFD_MISSING);
 	}
 }
 
@@ -848,6 +862,7 @@ static int userfaultfd_release(struct inode *inode, struct file *file)
 	/* len == 0 means wake all */
 	struct userfaultfd_wake_range range = { .len = 0, };
 	unsigned long new_flags;
+	bool still_valid;
 
 	WRITE_ONCE(ctx->released, true);
 
@@ -863,6 +878,7 @@ static int userfaultfd_release(struct inode *inode, struct file *file)
 	 * taking the mmap_sem for writing.
 	 */
 	down_write(&mm->mmap_sem);
+	still_valid = mmget_still_valid(mm);
 	prev = NULL;
 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
 		cond_resched();
@@ -873,15 +889,17 @@ static int userfaultfd_release(struct inode *inode, struct file *file)
 			continue;
 		}
 		new_flags = vma->vm_flags & ~(VM_UFFD_MISSING | VM_UFFD_WP);
-		prev = vma_merge(mm, prev, vma->vm_start, vma->vm_end,
-				 new_flags, vma->anon_vma,
-				 vma->vm_file, vma->vm_pgoff,
-				 vma_policy(vma),
-				 NULL_VM_UFFD_CTX);
-		if (prev)
-			vma = prev;
-		else
-			prev = vma;
+		if (still_valid) {
+			prev = vma_merge(mm, prev, vma->vm_start, vma->vm_end,
+					 new_flags, vma->anon_vma,
+					 vma->vm_file, vma->vm_pgoff,
+					 vma_policy(vma),
+					 NULL_VM_UFFD_CTX);
+			if (prev)
+				vma = prev;
+			else
+				prev = vma;
+		}
 		vma->vm_flags = new_flags;
 		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
 	}
@@ -944,38 +962,33 @@ static unsigned int userfaultfd_poll(struct file *file, poll_table *wait)
 
 	poll_wait(file, &ctx->fd_wqh, wait);
 
-	switch (ctx->state) {
-	case UFFD_STATE_WAIT_API:
+	if (!userfaultfd_is_initialized(ctx))
 		return POLLERR;
-	case UFFD_STATE_RUNNING:
-		/*
-		 * poll() never guarantees that read won't block.
-		 * userfaults can be waken before they're read().
-		 */
-		if (unlikely(!(file->f_flags & O_NONBLOCK)))
-			return POLLERR;
-		/*
-		 * lockless access to see if there are pending faults
-		 * __pollwait last action is the add_wait_queue but
-		 * the spin_unlock would allow the waitqueue_active to
-		 * pass above the actual list_add inside
-		 * add_wait_queue critical section. So use a full
-		 * memory barrier to serialize the list_add write of
-		 * add_wait_queue() with the waitqueue_active read
-		 * below.
-		 */
-		ret = 0;
-		smp_mb();
-		if (waitqueue_active(&ctx->fault_pending_wqh))
-			ret = POLLIN;
-		else if (waitqueue_active(&ctx->event_wqh))
-			ret = POLLIN;
 
-		return ret;
-	default:
-		WARN_ON_ONCE(1);
+	/*
+	 * poll() never guarantees that read won't block.
+	 * userfaults can be waken before they're read().
+	 */
+	if (unlikely(!(file->f_flags & O_NONBLOCK)))
 		return POLLERR;
-	}
+	/*
+	 * lockless access to see if there are pending faults
+	 * __pollwait last action is the add_wait_queue but
+	 * the spin_unlock would allow the waitqueue_active to
+	 * pass above the actual list_add inside
+	 * add_wait_queue critical section. So use a full
+	 * memory barrier to serialize the list_add write of
+	 * add_wait_queue() with the waitqueue_active read
+	 * below.
+	 */
+	ret = 0;
+	smp_mb();
+	if (waitqueue_active(&ctx->fault_pending_wqh))
+		ret = POLLIN;
+	else if (waitqueue_active(&ctx->event_wqh))
+		ret = POLLIN;
+
+	return ret;
 }
 
 static const struct file_operations userfaultfd_fops;
@@ -1179,7 +1192,7 @@ static ssize_t userfaultfd_read(struct file *file, char __user *buf,
 	struct uffd_msg msg;
 	int no_wait = file->f_flags & O_NONBLOCK;
 
-	if (ctx->state == UFFD_STATE_WAIT_API)
+	if (!userfaultfd_is_initialized(ctx))
 		return -EINVAL;
 
 	for (;;) {
@@ -1323,6 +1336,8 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 		goto out;
 
 	down_write(&mm->mmap_sem);
+	if (!mmget_still_valid(mm))
+		goto out_unlock;
 	vma = find_vma_prev(mm, start, &prev);
 	if (!vma)
 		goto out_unlock;
@@ -1358,6 +1373,19 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 		ret = -EINVAL;
 		if (!vma_can_userfault(cur))
 			goto out_unlock;
+
+		/*
+		 * UFFDIO_COPY will fill file holes even without
+		 * PROT_WRITE. This check enforces that if this is a
+		 * MAP_SHARED, the process has write permission to the backing
+		 * file. If VM_MAYWRITE is set it also enforces that on a
+		 * MAP_SHARED vma: there is no F_WRITE_SEAL and no further
+		 * F_WRITE_SEAL can be taken until the vma is destroyed.
+		 */
+		ret = -EPERM;
+		if (unlikely(!(cur->vm_flags & VM_MAYWRITE)))
+			goto out_unlock;
+
 		/*
 		 * If this vma contains ending address, and huge pages
 		 * check alignment.
@@ -1403,6 +1431,7 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 		BUG_ON(!vma_can_userfault(vma));
 		BUG_ON(vma->vm_userfaultfd_ctx.ctx &&
 		       vma->vm_userfaultfd_ctx.ctx != ctx);
+		WARN_ON(!(vma->vm_flags & VM_MAYWRITE));
 
 		/*
 		 * Nothing to do: this vma is already registered into this
@@ -1496,6 +1525,8 @@ static int userfaultfd_unregister(struct userfaultfd_ctx *ctx,
 		goto out;
 
 	down_write(&mm->mmap_sem);
+	if (!mmget_still_valid(mm))
+		goto out_unlock;
 	vma = find_vma_prev(mm, start, &prev);
 	if (!vma)
 		goto out_unlock;
@@ -1556,6 +1587,8 @@ static int userfaultfd_unregister(struct userfaultfd_ctx *ctx,
 		 */
 		if (!vma->vm_userfaultfd_ctx.ctx)
 			goto skip;
+
+		WARN_ON(!(vma->vm_flags & VM_MAYWRITE));
 
 		if (vma->vm_start > start)
 			start = vma->vm_start;
@@ -1752,9 +1785,10 @@ out:
 static inline unsigned int uffd_ctx_features(__u64 user_features)
 {
 	/*
-	 * For the current set of features the bits just coincide
+	 * For the current set of features the bits just coincide. Set
+	 * UFFD_FEATURE_INITIALIZED to mark the features as enabled.
 	 */
-	return (unsigned int)user_features;
+	return (unsigned int)user_features | UFFD_FEATURE_INITIALIZED;
 }
 
 /*
@@ -1767,35 +1801,41 @@ static int userfaultfd_api(struct userfaultfd_ctx *ctx,
 {
 	struct uffdio_api uffdio_api;
 	void __user *buf = (void __user *)arg;
+	unsigned int ctx_features;
 	int ret;
 	__u64 features;
 
-	ret = -EINVAL;
-	if (ctx->state != UFFD_STATE_WAIT_API)
-		goto out;
 	ret = -EFAULT;
 	if (copy_from_user(&uffdio_api, buf, sizeof(uffdio_api)))
 		goto out;
 	features = uffdio_api.features;
-	if (uffdio_api.api != UFFD_API || (features & ~UFFD_API_FEATURES)) {
-		memset(&uffdio_api, 0, sizeof(uffdio_api));
-		if (copy_to_user(buf, &uffdio_api, sizeof(uffdio_api)))
-			goto out;
-		ret = -EINVAL;
-		goto out;
-	}
+	ret = -EINVAL;
+	if (uffdio_api.api != UFFD_API || (features & ~UFFD_API_FEATURES))
+		goto err_out;
+	ret = -EPERM;
+	if ((features & UFFD_FEATURE_EVENT_FORK) && !capable(CAP_SYS_PTRACE))
+		goto err_out;
 	/* report all available features and ioctls to userland */
 	uffdio_api.features = UFFD_API_FEATURES;
 	uffdio_api.ioctls = UFFD_API_IOCTLS;
 	ret = -EFAULT;
 	if (copy_to_user(buf, &uffdio_api, sizeof(uffdio_api)))
 		goto out;
-	ctx->state = UFFD_STATE_RUNNING;
+
 	/* only enable the requested features for this uffd context */
-	ctx->features = uffd_ctx_features(features);
+	ctx_features = uffd_ctx_features(features);
+	ret = -EINVAL;
+	if (cmpxchg(&ctx->features, 0, ctx_features) != 0)
+		goto err_out;
+
 	ret = 0;
 out:
 	return ret;
+err_out:
+	memset(&uffdio_api, 0, sizeof(uffdio_api));
+	if (copy_to_user(buf, &uffdio_api, sizeof(uffdio_api)))
+		ret = -EFAULT;
+	goto out;
 }
 
 static long userfaultfd_ioctl(struct file *file, unsigned cmd,
@@ -1804,7 +1844,7 @@ static long userfaultfd_ioctl(struct file *file, unsigned cmd,
 	int ret = -EINVAL;
 	struct userfaultfd_ctx *ctx = file->private_data;
 
-	if (cmd != UFFDIO_API && ctx->state == UFFD_STATE_WAIT_API)
+	if (cmd != UFFDIO_API && !userfaultfd_is_initialized(ctx))
 		return -EINVAL;
 
 	switch(cmd) {
@@ -1921,7 +1961,6 @@ static struct file *userfaultfd_file_create(int flags)
 	atomic_set(&ctx->refcount, 1);
 	ctx->flags = flags;
 	ctx->features = 0;
-	ctx->state = UFFD_STATE_WAIT_API;
 	ctx->released = false;
 	ctx->mm = current->mm;
 	/* prevent the mm struct to be freed */

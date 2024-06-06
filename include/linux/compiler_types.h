@@ -79,6 +79,18 @@ extern void __chk_io_ptr(const volatile void __iomem *);
 #endif
 
 /*
+ * Some architectures need to provide custom definitions of macros provided
+ * by linux/compiler-*.h, and can do so using asm/compiler.h. We include that
+ * conditionally rather than using an asm-generic wrapper in order to avoid
+ * build failures if any C compilation, which will include this file via an
+ * -include argument in c_flags, occurs prior to the asm-generic wrappers being
+ * generated.
+ */
+#ifdef CONFIG_HAVE_ARCH_COMPILER_H
+#include <asm/compiler.h>
+#endif
+
+/*
  * Generic compiler-dependent macros required for kernel
  * build go below this comment. Actual compiler/compiler version
  * specific implementations come from the above header files
@@ -218,6 +230,10 @@ struct ftrace_likely_data {
 # define __latent_entropy
 #endif
 
+#ifndef __copy
+# define __copy(symbol)
+#endif
+
 #ifndef __randomize_layout
 # define __randomize_layout __designated_init
 #endif
@@ -260,6 +276,10 @@ struct ftrace_likely_data {
 #define __assume_aligned(a, ...)
 #endif
 
+
+#ifndef asm_volatile_goto
+#define asm_volatile_goto(x...) asm goto(x)
+#endif
 
 /* Are two types/vars the same type (ignoring qualifiers)? */
 #ifndef __same_type

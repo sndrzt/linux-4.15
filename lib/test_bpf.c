@@ -83,6 +83,7 @@ struct bpf_test {
 		__u32 result;
 	} test[MAX_SUBTESTS];
 	int (*fill_helper)(struct bpf_test *self);
+	int expected_errcode; /* used when FLAG_EXPECTED_FAIL is set in the aux */
 	__u8 frag_data[MAX_DATA];
 	int stack_depth; /* for eBPF only, since tests don't call verifier */
 };
@@ -2003,10 +2004,14 @@ static struct bpf_test tests[] = {
 		{ { 4, 0 }, { 5, 10 } }
 	},
 	{
-		"INT: DIV by zero",
+		/* This one doesn't go through verifier, but is just raw insn
+		 * as opposed to cBPF tests from here. Thus div by 0 tests are
+		 * done in test_verifier in BPF kselftests.
+		 */
+		"INT: DIV by -1",
 		.u.insns_int = {
 			BPF_ALU64_REG(BPF_MOV, R6, R1),
-			BPF_ALU64_IMM(BPF_MOV, R7, 0),
+			BPF_ALU64_IMM(BPF_MOV, R7, -1),
 			BPF_LD_ABS(BPF_B, 3),
 			BPF_ALU32_REG(BPF_DIV, R0, R7),
 			BPF_EXIT_INSN(),
@@ -2022,7 +2027,9 @@ static struct bpf_test tests[] = {
 		},
 		CLASSIC | FLAG_NO_DATA | FLAG_EXPECTED_FAIL,
 		{ },
-		{ }
+		{ },
+		.fill_helper = NULL,
+		.expected_errcode = -EINVAL,
 	},
 	{
 		"check: div_k_0",
@@ -2032,7 +2039,9 @@ static struct bpf_test tests[] = {
 		},
 		CLASSIC | FLAG_NO_DATA | FLAG_EXPECTED_FAIL,
 		{ },
-		{ }
+		{ },
+		.fill_helper = NULL,
+		.expected_errcode = -EINVAL,
 	},
 	{
 		"check: unknown insn",
@@ -2043,7 +2052,9 @@ static struct bpf_test tests[] = {
 		},
 		CLASSIC | FLAG_EXPECTED_FAIL,
 		{ },
-		{ }
+		{ },
+		.fill_helper = NULL,
+		.expected_errcode = -EINVAL,
 	},
 	{
 		"check: out of range spill/fill",
@@ -2053,7 +2064,9 @@ static struct bpf_test tests[] = {
 		},
 		CLASSIC | FLAG_NO_DATA | FLAG_EXPECTED_FAIL,
 		{ },
-		{ }
+		{ },
+		.fill_helper = NULL,
+		.expected_errcode = -EINVAL,
 	},
 	{
 		"JUMPS + HOLES",
@@ -2145,6 +2158,8 @@ static struct bpf_test tests[] = {
 		CLASSIC | FLAG_NO_DATA | FLAG_EXPECTED_FAIL,
 		{ },
 		{ },
+		.fill_helper = NULL,
+		.expected_errcode = -EINVAL,
 	},
 	{
 		"check: LDX + RET X",
@@ -2155,6 +2170,8 @@ static struct bpf_test tests[] = {
 		CLASSIC | FLAG_NO_DATA | FLAG_EXPECTED_FAIL,
 		{ },
 		{ },
+		.fill_helper = NULL,
+		.expected_errcode = -EINVAL,
 	},
 	{	/* Mainly checking JIT here. */
 		"M[]: alt STX + LDX",
@@ -2329,6 +2346,8 @@ static struct bpf_test tests[] = {
 		CLASSIC | FLAG_NO_DATA | FLAG_EXPECTED_FAIL,
 		{ },
 		{ },
+		.fill_helper = NULL,
+		.expected_errcode = -EINVAL,
 	},
 	{	/* Passes checker but fails during runtime. */
 		"LD [SKF_AD_OFF-1]",
@@ -4415,8 +4434,8 @@ static struct bpf_test tests[] = {
 		.u.insns_int = {
 			BPF_LD_IMM64(R0, 0),
 			BPF_LD_IMM64(R1, 0xffffffffffffffffLL),
-			BPF_STX_MEM(BPF_W, R10, R1, -40),
-			BPF_LDX_MEM(BPF_W, R0, R10, -40),
+			BPF_STX_MEM(BPF_DW, R10, R1, -40),
+			BPF_LDX_MEM(BPF_DW, R0, R10, -40),
 			BPF_EXIT_INSN(),
 		},
 		INTERNAL,
@@ -5391,6 +5410,7 @@ static struct bpf_test tests[] = {
 		{ },
 		{ },
 		.fill_helper = bpf_fill_maxinsns4,
+		.expected_errcode = -EINVAL,
 	},
 	{	/* Mainly checking JIT here. */
 		"BPF_MAXINSNS: Very long jump",
@@ -5403,21 +5423,31 @@ static struct bpf_test tests[] = {
 	{	/* Mainly checking JIT here. */
 		"BPF_MAXINSNS: Ctx heavy transformations",
 		{ },
+#if defined(CONFIG_BPF_JIT_ALWAYS_ON) && defined(CONFIG_S390)
+		CLASSIC | FLAG_EXPECTED_FAIL,
+#else
 		CLASSIC,
+#endif
 		{ },
 		{
 			{  1, !!(SKB_VLAN_TCI & VLAN_TAG_PRESENT) },
 			{ 10, !!(SKB_VLAN_TCI & VLAN_TAG_PRESENT) }
 		},
 		.fill_helper = bpf_fill_maxinsns6,
+		.expected_errcode = -ENOTSUPP,
 	},
 	{	/* Mainly checking JIT here. */
 		"BPF_MAXINSNS: Call heavy transformations",
 		{ },
+#if defined(CONFIG_BPF_JIT_ALWAYS_ON) && defined(CONFIG_S390)
+		CLASSIC | FLAG_NO_DATA | FLAG_EXPECTED_FAIL,
+#else
 		CLASSIC | FLAG_NO_DATA,
+#endif
 		{ },
 		{ { 1, 0 }, { 10, 0 } },
 		.fill_helper = bpf_fill_maxinsns7,
+		.expected_errcode = -ENOTSUPP,
 	},
 	{	/* Mainly checking JIT here. */
 		"BPF_MAXINSNS: Jump heavy test",
@@ -5446,19 +5476,30 @@ static struct bpf_test tests[] = {
 	{
 		"BPF_MAXINSNS: Jump, gap, jump, ...",
 		{ },
+#if defined(CONFIG_BPF_JIT_ALWAYS_ON) && defined(CONFIG_X86)
+		CLASSIC | FLAG_NO_DATA | FLAG_EXPECTED_FAIL,
+#else
 		CLASSIC | FLAG_NO_DATA,
+#endif
 		{ },
 		{ { 0, 0xababcbac } },
 		.fill_helper = bpf_fill_maxinsns11,
+		.expected_errcode = -ENOTSUPP,
 	},
 	{
 		"BPF_MAXINSNS: ld_abs+get_processor_id",
 		{ },
+#if defined(CONFIG_BPF_JIT_ALWAYS_ON) && defined(CONFIG_S390)
+		CLASSIC | FLAG_EXPECTED_FAIL,
+#else
 		CLASSIC,
+#endif
 		{ },
 		{ { 1, 0xbee } },
 		.fill_helper = bpf_fill_ld_abs_get_processor_id,
+		.expected_errcode = -ENOTSUPP,
 	},
+#if !(defined(CONFIG_BPF_JIT_ALWAYS_ON) && defined(CONFIG_S390))
 	{
 		"BPF_MAXINSNS: ld_abs+vlan_push/pop",
 		{ },
@@ -5475,6 +5516,7 @@ static struct bpf_test tests[] = {
 		{ { 2, 10 } },
 		.fill_helper = bpf_fill_jump_around_ld_abs,
 	},
+#endif
 	/*
 	 * LD_IND / LD_ABS on fragmented SKBs
 	 */
@@ -6236,7 +6278,7 @@ static struct bpf_prog *generate_filter(int which, int *err)
 
 		*err = bpf_prog_create(&fp, &fprog);
 		if (tests[which].aux & FLAG_EXPECTED_FAIL) {
-			if (*err == -EINVAL) {
+			if (*err == tests[which].expected_errcode) {
 				pr_cont("PASS\n");
 				/* Verifier rejected filter as expected. */
 				*err = 0;
@@ -6328,7 +6370,14 @@ static int run_one(const struct bpf_prog *fp, struct bpf_test *test)
 		u64 duration;
 		u32 ret;
 
-		if (test->test[i].data_size == 0 &&
+		/*
+		 * NOTE: Several sub-tests may be present, in which case
+		 * a zero {data_size, result} tuple indicates the end of
+		 * the sub-test array. The first test is always run,
+		 * even if both data_size and result happen to be zero.
+		 */
+		if (i > 0 &&
+		    test->test[i].data_size == 0 &&
 		    test->test[i].result == 0)
 			break;
 
@@ -6444,6 +6493,93 @@ static bool exclude_test(int test_id)
 	return test_id < test_range[0] || test_id > test_range[1];
 }
 
+static __init struct sk_buff *build_test_skb(void)
+{
+	u32 headroom = NET_SKB_PAD + NET_IP_ALIGN + ETH_HLEN;
+	struct sk_buff *skb[2];
+	struct page *page[2];
+	int i, data_size = 8;
+
+	for (i = 0; i < 2; i++) {
+		page[i] = alloc_page(GFP_KERNEL);
+		if (!page[i]) {
+			if (i == 0)
+				goto err_page0;
+			else
+				goto err_page1;
+		}
+
+		/* this will set skb[i]->head_frag */
+		skb[i] = dev_alloc_skb(headroom + data_size);
+		if (!skb[i]) {
+			if (i == 0)
+				goto err_skb0;
+			else
+				goto err_skb1;
+		}
+
+		skb_reserve(skb[i], headroom);
+		skb_put(skb[i], data_size);
+		skb[i]->protocol = htons(ETH_P_IP);
+		skb_reset_network_header(skb[i]);
+		skb_set_mac_header(skb[i], -ETH_HLEN);
+
+		skb_add_rx_frag(skb[i], 0, page[i], 0, 64, 64);
+		// skb_headlen(skb[i]): 8, skb[i]->head_frag = 1
+	}
+
+	/* setup shinfo */
+	skb_shinfo(skb[0])->gso_size = 1448;
+	skb_shinfo(skb[0])->gso_type = SKB_GSO_TCPV4;
+	skb_shinfo(skb[0])->gso_type |= SKB_GSO_DODGY;
+	skb_shinfo(skb[0])->gso_segs = 0;
+	skb_shinfo(skb[0])->frag_list = skb[1];
+
+	/* adjust skb[0]'s len */
+	skb[0]->len += skb[1]->len;
+	skb[0]->data_len += skb[1]->data_len;
+	skb[0]->truesize += skb[1]->truesize;
+
+	return skb[0];
+
+err_skb1:
+	__free_page(page[1]);
+err_page1:
+	kfree_skb(skb[0]);
+err_skb0:
+	__free_page(page[0]);
+err_page0:
+	return NULL;
+}
+
+static __init int test_skb_segment(void)
+{
+	netdev_features_t features;
+	struct sk_buff *skb, *segs;
+	int ret = -1;
+
+	features = NETIF_F_SG | NETIF_F_GSO_PARTIAL | NETIF_F_IP_CSUM |
+		   NETIF_F_IPV6_CSUM;
+	features |= NETIF_F_RXCSUM;
+	skb = build_test_skb();
+	if (!skb) {
+		pr_info("%s: failed to build_test_skb", __func__);
+		goto done;
+	}
+
+	segs = skb_segment(skb, features);
+	if (!IS_ERR(segs)) {
+		kfree_skb_list(segs);
+		ret = 0;
+		pr_info("%s: success in skb_segment!", __func__);
+	} else {
+		pr_info("%s: failed in skb_segment!", __func__);
+	}
+	kfree_skb(skb);
+done:
+	return ret;
+}
+
 static __init int test_bpf(void)
 {
 	int i, err_cnt = 0, pass_cnt = 0;
@@ -6501,9 +6637,11 @@ static int __init test_bpf_init(void)
 		return ret;
 
 	ret = test_bpf();
-
 	destroy_bpf_tests();
-	return ret;
+	if (ret)
+		return ret;
+
+	return test_skb_segment();
 }
 
 static void __exit test_bpf_exit(void)

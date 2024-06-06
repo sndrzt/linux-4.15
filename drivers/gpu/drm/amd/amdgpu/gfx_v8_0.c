@@ -1459,10 +1459,11 @@ static const u32 sgpr_init_compute_shader[] =
 static const u32 vgpr_init_regs[] =
 {
 	mmCOMPUTE_STATIC_THREAD_MGMT_SE0, 0xffffffff,
-	mmCOMPUTE_RESOURCE_LIMITS, 0,
+	mmCOMPUTE_RESOURCE_LIMITS, 0x1000000, /* CU_GROUP_COUNT=1 */
 	mmCOMPUTE_NUM_THREAD_X, 256*4,
 	mmCOMPUTE_NUM_THREAD_Y, 1,
 	mmCOMPUTE_NUM_THREAD_Z, 1,
+	mmCOMPUTE_PGM_RSRC1, 0x100004f, /* VGPRS=15 (64 logical VGPRs), SGPRS=1 (16 SGPRs), BULKY=1 */
 	mmCOMPUTE_PGM_RSRC2, 20,
 	mmCOMPUTE_USER_DATA_0, 0xedcedc00,
 	mmCOMPUTE_USER_DATA_1, 0xedcedc01,
@@ -1479,10 +1480,11 @@ static const u32 vgpr_init_regs[] =
 static const u32 sgpr1_init_regs[] =
 {
 	mmCOMPUTE_STATIC_THREAD_MGMT_SE0, 0x0f,
-	mmCOMPUTE_RESOURCE_LIMITS, 0x1000000,
+	mmCOMPUTE_RESOURCE_LIMITS, 0x1000000, /* CU_GROUP_COUNT=1 */
 	mmCOMPUTE_NUM_THREAD_X, 256*5,
 	mmCOMPUTE_NUM_THREAD_Y, 1,
 	mmCOMPUTE_NUM_THREAD_Z, 1,
+	mmCOMPUTE_PGM_RSRC1, 0x240, /* SGPRS=9 (80 GPRS) */
 	mmCOMPUTE_PGM_RSRC2, 20,
 	mmCOMPUTE_USER_DATA_0, 0xedcedc00,
 	mmCOMPUTE_USER_DATA_1, 0xedcedc01,
@@ -1503,6 +1505,7 @@ static const u32 sgpr2_init_regs[] =
 	mmCOMPUTE_NUM_THREAD_X, 256*5,
 	mmCOMPUTE_NUM_THREAD_Y, 1,
 	mmCOMPUTE_NUM_THREAD_Z, 1,
+	mmCOMPUTE_PGM_RSRC1, 0x240, /* SGPRS=9 (80 GPRS) */
 	mmCOMPUTE_PGM_RSRC2, 20,
 	mmCOMPUTE_USER_DATA_0, 0xedcedc00,
 	mmCOMPUTE_USER_DATA_1, 0xedcedc01,
@@ -5568,6 +5571,11 @@ static int gfx_v8_0_set_powergating_state(void *handle,
 	if (amdgpu_sriov_vf(adev))
 		return 0;
 
+	if (adev->pg_flags & (AMD_PG_SUPPORT_GFX_SMG |
+				AMD_PG_SUPPORT_RLC_SMU_HS |
+				AMD_PG_SUPPORT_CP |
+				AMD_PG_SUPPORT_GFX_DMG))
+		adev->gfx.rlc.funcs->enter_safe_mode(adev);
 	switch (adev->asic_type) {
 	case CHIP_CARRIZO:
 	case CHIP_STONEY:
@@ -5616,7 +5624,11 @@ static int gfx_v8_0_set_powergating_state(void *handle,
 	default:
 		break;
 	}
-
+	if (adev->pg_flags & (AMD_PG_SUPPORT_GFX_SMG |
+				AMD_PG_SUPPORT_RLC_SMU_HS |
+				AMD_PG_SUPPORT_CP |
+				AMD_PG_SUPPORT_GFX_DMG))
+		adev->gfx.rlc.funcs->exit_safe_mode(adev);
 	return 0;
 }
 
@@ -6311,7 +6323,23 @@ static void gfx_v8_0_ring_emit_fence_gfx(struct amdgpu_ring *ring, u64 addr,
 	bool write64bit = flags & AMDGPU_FENCE_FLAG_64BIT;
 	bool int_sel = flags & AMDGPU_FENCE_FLAG_INT;
 
-	/* EVENT_WRITE_EOP - flush caches, send int */
+	/* Workaround for cache flush problems. First send a dummy EOP
+	 * event down the pipe with seq one below.
+	 */
+	amdgpu_ring_write(ring, PACKET3(PACKET3_EVENT_WRITE_EOP, 4));
+	amdgpu_ring_write(ring, (EOP_TCL1_ACTION_EN |
+				 EOP_TC_ACTION_EN |
+				 EOP_TC_WB_ACTION_EN |
+				 EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) |
+				 EVENT_INDEX(5)));
+	amdgpu_ring_write(ring, addr & 0xfffffffc);
+	amdgpu_ring_write(ring, (upper_32_bits(addr) & 0xffff) |
+				DATA_SEL(1) | INT_SEL(0));
+	amdgpu_ring_write(ring, lower_32_bits(seq - 1));
+	amdgpu_ring_write(ring, upper_32_bits(seq - 1));
+
+	/* Then send the real EOP event down the pipe:
+	 * EVENT_WRITE_EOP - flush caches, send int */
 	amdgpu_ring_write(ring, PACKET3(PACKET3_EVENT_WRITE_EOP, 4));
 	amdgpu_ring_write(ring, (EOP_TCL1_ACTION_EN |
 				 EOP_TC_ACTION_EN |
@@ -6888,7 +6916,7 @@ static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_gfx = {
 		5 +  /* COND_EXEC */
 		7 +  /* PIPELINE_SYNC */
 		19 + /* VM_FLUSH */
-		8 +  /* FENCE for VM_FLUSH */
+		12 +  /* FENCE for VM_FLUSH */
 		20 + /* GDS switch */
 		4 + /* double SWITCH_BUFFER,
 		       the first COND_EXEC jump to the place just
@@ -6900,7 +6928,7 @@ static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_gfx = {
 		31 + /*	DE_META */
 		3 + /* CNTX_CTRL */
 		5 + /* HDP_INVL */
-		8 + 8 + /* FENCE x2 */
+		12 + 12 + /* FENCE x2 */
 		2, /* SWITCH_BUFFER */
 	.emit_ib_size =	4, /* gfx_v8_0_ring_emit_ib_gfx */
 	.emit_ib = gfx_v8_0_ring_emit_ib_gfx,

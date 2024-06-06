@@ -91,8 +91,8 @@ static void of_device_make_bus_id(struct device *dev)
 		 */
 		reg = of_get_property(node, "reg", NULL);
 		if (reg && (addr = of_translate_address(node, reg)) != OF_BAD_ADDR) {
-			dev_set_name(dev, dev_name(dev) ? "%llx.%s:%s" : "%llx.%s",
-				     (unsigned long long)addr, node->name,
+			dev_set_name(dev, dev_name(dev) ? "%llx.%pOFn:%s" : "%llx.%pOFn",
+				     (unsigned long long)addr, node,
 				     dev_name(dev));
 			return;
 		}
@@ -142,8 +142,8 @@ struct platform_device *of_device_alloc(struct device_node *np,
 			WARN_ON(rc);
 		}
 		if (of_irq_to_resource_table(np, res, num_irq) != num_irq)
-			pr_debug("not all legacy IRQ resources mapped for %s\n",
-				 np->name);
+			pr_debug("not all legacy IRQ resources mapped for %pOFn\n",
+				 np);
 	}
 
 	dev->dev.of_node = of_node_get(np);
@@ -536,6 +536,9 @@ int of_platform_device_destroy(struct device *dev, void *data)
 	if (of_node_check_flag(dev->of_node, OF_POPULATED_BUS))
 		device_for_each_child(dev, NULL, of_platform_device_destroy);
 
+	of_node_clear_flag(dev->of_node, OF_POPULATED);
+	of_node_clear_flag(dev->of_node, OF_POPULATED_BUS);
+
 	if (dev->bus == &platform_bus_type)
 		platform_device_unregister(to_platform_device(dev));
 #ifdef CONFIG_ARM_AMBA
@@ -543,8 +546,6 @@ int of_platform_device_destroy(struct device *dev, void *data)
 		amba_device_unregister(to_amba_device(dev));
 #endif
 
-	of_node_clear_flag(dev->of_node, OF_POPULATED);
-	of_node_clear_flag(dev->of_node, OF_POPULATED_BUS);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(of_platform_device_destroy);

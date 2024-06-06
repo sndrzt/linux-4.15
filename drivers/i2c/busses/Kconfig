@@ -77,6 +77,16 @@ config I2C_AMD8111
 	  This driver can also be built as a module.  If so, the module
 	  will be called i2c-amd8111.
 
+config I2C_AMD_MP2
+	tristate "AMD MP2 PCIe"
+	depends on PCI && ACPI
+	help
+	  If you say yes to this option, support will be included for the AMD
+	  MP2 PCIe I2C adapter.
+
+	  This driver can also be built as modules.  If so, the modules will
+	  be called i2c-amd-mp2-pci and i2c-amd-mp2-plat.
+
 config I2C_HIX5HD2
 	tristate "Hix5hd2 high-speed I2C driver"
 	depends on ARCH_HISI || ARCH_HIX5HD2 || COMPILE_TEST
@@ -132,6 +142,7 @@ config I2C_I801
 	    Cannon Lake-H (PCH)
 	    Cannon Lake-LP (PCH)
 	    Cedar Fork (PCH)
+	    Comet Lake (PCH)
 
 	  This driver can also be built as a module.  If so, the module
 	  will be called i2c-i801.
@@ -434,12 +445,13 @@ config I2C_BCM_KONA
 	  If you do not need KONA I2C interface, say N.
 
 config I2C_BRCMSTB
-	tristate "BRCM Settop I2C controller"
-	depends on ARCH_BRCMSTB || BMIPS_GENERIC || COMPILE_TEST
+	tristate "BRCM Settop/DSL I2C controller"
+	depends on ARCH_BRCMSTB || BMIPS_GENERIC || ARCH_BCM_63XX || \
+		   COMPILE_TEST
 	default y
 	help
 	  If you say yes to this option, support will be included for the
-	  I2C interface on the Broadcom Settop SoCs.
+	  I2C interface on the Broadcom Settop/DSL SoCs.
 
 	  If you do not need I2C interface, say N.
 
@@ -463,7 +475,7 @@ config I2C_BLACKFIN_TWI_CLK_KHZ
 
 config I2C_CADENCE
 	tristate "Cadence I2C Controller"
-	depends on ARCH_ZYNQ || ARM64 || XTENSA
+	depends on ARCH_ZYNQ || ARM64 || XTENSA || COMPILE_TEST
 	help
 	  Say yes here to select Cadence I2C Host Controller. This controller is
 	  e.g. used by Xilinx Zynq.
@@ -764,7 +776,7 @@ config I2C_OCORES
 
 config I2C_OMAP
 	tristate "OMAP I2C adapter"
-	depends on ARCH_OMAP
+	depends on ARCH_OMAP || ARCH_K3
 	default y if MACH_OMAP_H3 || MACH_OMAP_OSK
 	help
 	  If you say yes to this option, support will be included for the
@@ -838,9 +850,19 @@ config I2C_PXA_SLAVE
 	  is necessary for systems where the PXA may be a target on the
 	  I2C bus.
 
+config I2C_QCOM_CCI
+	tristate "Qualcomm Camera Control Interface"
+	depends on ARCH_QCOM
+	help
+	  If you say yes to this option, support will be included for the
+	  built-in camera control interface on the Qualcomm SoCs.
+
+	  This driver can also be built as a module.  If so, the module
+	  will be called i2c-qcom-cci.
+
 config I2C_QUP
 	tristate "Qualcomm QUP based I2C controller"
-	depends on ARCH_QCOM
+	depends on ARCH_QCOM || COMPILE_TEST
 	help
 	  If you say yes to this option, support will be included for the
 	  built-in I2C interface on the Qualcomm SoCs.
@@ -1099,6 +1121,7 @@ config I2C_RCAR
 	depends on HAS_DMA
 	depends on ARCH_RENESAS || COMPILE_TEST
 	select I2C_SLAVE
+	select RESET_CONTROLLER if ARCH_RCAR_GEN3
 	help
 	  If you say yes to this option, support will be included for the
 	  R-Car I2C controller.

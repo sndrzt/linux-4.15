@@ -52,6 +52,9 @@ MODULE_FIRMWARE("amdgpu/tonga_mc.bin");
 MODULE_FIRMWARE("amdgpu/polaris11_mc.bin");
 MODULE_FIRMWARE("amdgpu/polaris10_mc.bin");
 MODULE_FIRMWARE("amdgpu/polaris12_mc.bin");
+MODULE_FIRMWARE("amdgpu/polaris11_k_mc.bin");
+MODULE_FIRMWARE("amdgpu/polaris10_k_mc.bin");
+MODULE_FIRMWARE("amdgpu/polaris12_k_mc.bin");
 
 static const u32 golden_settings_tonga_a11[] =
 {
@@ -219,13 +222,39 @@ static int gmc_v8_0_init_microcode(struct amdgpu_device *adev)
 		chip_name = "tonga";
 		break;
 	case CHIP_POLARIS11:
-		chip_name = "polaris11";
+		if (((adev->pdev->device == 0x67ef) &&
+		     ((adev->pdev->revision == 0xe0) ||
+		      (adev->pdev->revision == 0xe5))) ||
+		    ((adev->pdev->device == 0x67ff) &&
+		     ((adev->pdev->revision == 0xcf) ||
+		      (adev->pdev->revision == 0xef) ||
+		      (adev->pdev->revision == 0xff))))
+			chip_name = "polaris11_k";
+		else if ((adev->pdev->device == 0x67ef) &&
+			 (adev->pdev->revision == 0xe2))
+			chip_name = "polaris11_k";
+		else
+			chip_name = "polaris11";
 		break;
 	case CHIP_POLARIS10:
-		chip_name = "polaris10";
+		if ((adev->pdev->device == 0x67df) &&
+		    ((adev->pdev->revision == 0xe1) ||
+		     (adev->pdev->revision == 0xf7)))
+			chip_name = "polaris10_k";
+		else
+			chip_name = "polaris10";
 		break;
 	case CHIP_POLARIS12:
-		chip_name = "polaris12";
+		if (((adev->pdev->device == 0x6987) &&
+		     ((adev->pdev->revision == 0xc0) ||
+		      (adev->pdev->revision == 0xc3))) ||
+		    ((adev->pdev->device == 0x6981) &&
+		     ((adev->pdev->revision == 0x00) ||
+		      (adev->pdev->revision == 0x01) ||
+		      (adev->pdev->revision == 0x10))))
+			chip_name = "polaris12_k";
+		else
+			chip_name = "polaris12";
 		break;
 	case CHIP_FIJI:
 	case CHIP_CARRIZO:
@@ -331,7 +360,7 @@ static int gmc_v8_0_polaris_mc_load_microcode(struct amdgpu_device *adev)
 	const struct mc_firmware_header_v1_0 *hdr;
 	const __le32 *fw_data = NULL;
 	const __le32 *io_mc_regs = NULL;
-	u32 data, vbios_version;
+	u32 data;
 	int i, ucode_size, regs_size;
 
 	/* Skip MC ucode loading on SR-IOV capable boards.
@@ -340,13 +369,6 @@ static int gmc_v8_0_polaris_mc_load_microcode(struct amdgpu_device *adev)
 	 * for this adaptor.
 	 */
 	if (amdgpu_sriov_bios(adev))
-		return 0;
-
-	WREG32(mmMC_SEQ_IO_DEBUG_INDEX, 0x9F);
-	data = RREG32(mmMC_SEQ_IO_DEBUG_DATA);
-	vbios_version = data & 0xf;
-
-	if (vbios_version == 0)
 		return 0;
 
 	if (!adev->mc.fw)
@@ -1028,10 +1050,31 @@ static int gmc_v8_0_late_init(void *handle)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 
+	amdgpu_bo_late_init(adev);
+
 	if (amdgpu_vm_fault_stop != AMDGPU_VM_FAULT_STOP_ALWAYS)
 		return amdgpu_irq_get(adev, &adev->mc.vm_fault, 0);
 	else
 		return 0;
+}
+
+static unsigned gmc_v8_0_get_vbios_fb_size(struct amdgpu_device *adev)
+{
+	u32 d1vga_control = RREG32(mmD1VGA_CONTROL);
+	unsigned size;
+
+	if (REG_GET_FIELD(d1vga_control, D1VGA_CONTROL, D1VGA_MODE_ENABLE)) {
+		size = 9 * 1024 * 1024; /* reserve 8MB for vga emulator and 1 MB for FB */
+	} else {
+		u32 viewport = RREG32(mmVIEWPORT_SIZE);
+		size = (REG_GET_FIELD(viewport, VIEWPORT_SIZE, VIEWPORT_HEIGHT) *
+			REG_GET_FIELD(viewport, VIEWPORT_SIZE, VIEWPORT_WIDTH) *
+			4);
+	}
+	/* return 0 if the pre-OS buffer uses up most of vram */
+	if ((adev->mc.real_vram_size - size) < (8 * 1024 * 1024))
+		return 0;
+	return size;
 }
 
 #define mmMC_SEQ_MISC0_FIJI 0xA71
@@ -1076,8 +1119,6 @@ static int gmc_v8_0_sw_init(void *handle)
 	 */
 	adev->mc.mc_mask = 0xffffffffffULL; /* 40 bit MC */
 
-	adev->mc.stolen_size = 256 * 1024;
-
 	/* set DMA mask + need_dma32 flags.
 	 * PCIE - can handle 40-bits.
 	 * IGP - can handle 40-bits
@@ -1106,6 +1147,8 @@ static int gmc_v8_0_sw_init(void *handle)
 	r = gmc_v8_0_mc_init(adev);
 	if (r)
 		return r;
+
+	adev->mc.stolen_size = gmc_v8_0_get_vbios_fb_size(adev);
 
 	/* Memory manager */
 	r = amdgpu_bo_init(adev);

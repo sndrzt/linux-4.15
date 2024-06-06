@@ -144,7 +144,9 @@ power9_restore_additional_sprs:
 	mtspr	SPRN_MMCR1, r4
 
 	ld	r3, STOP_MMCR2(r13)
+	ld	r4, PACA_SPRG_VDSO(r13)
 	mtspr	SPRN_MMCR2, r3
+	mtspr	SPRN_SPRG3, r4
 	blr
 
 /*
@@ -165,6 +167,12 @@ core_idle_lock_held:
 	andis.	r9,r15,PNV_CORE_IDLE_LOCK_BIT@h
 	bne-	core_idle_lock_held
 	blr
+
+/* Reuse some unused pt_regs slots for AMR/IAMR/UAMOR/UAMOR */
+#define PNV_POWERSAVE_AMR	_TRAP
+#define PNV_POWERSAVE_IAMR	_DAR
+#define PNV_POWERSAVE_UAMOR	_DSISR
+#define PNV_POWERSAVE_AMOR	RESULT
 
 /*
  * Pass requested state in r3:
@@ -196,6 +204,20 @@ pnv_powersave_common:
 	/* Continue saving state */
 	SAVE_GPR(2, r1)
 	SAVE_NVGPRS(r1)
+
+BEGIN_FTR_SECTION
+	mfspr	r4, SPRN_AMR
+	mfspr	r5, SPRN_IAMR
+	mfspr	r6, SPRN_UAMOR
+	std	r4, PNV_POWERSAVE_AMR(r1)
+	std	r5, PNV_POWERSAVE_IAMR(r1)
+	std	r6, PNV_POWERSAVE_UAMOR(r1)
+BEGIN_FTR_SECTION_NESTED(42)
+	mfspr	r7, SPRN_AMOR
+	std	r7, PNV_POWERSAVE_AMOR(r1)
+END_FTR_SECTION_NESTED_IFSET(CPU_FTR_HVMODE, 42)
+END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+
 	mfcr	r5
 	std	r5,_CCR(r1)
 	std	r1,PACAR1(r13)
@@ -339,6 +361,7 @@ power_enter_stop:
 	bne	 .Lhandle_esl_ec_set
 	PPC_STOP
 	li	r3,0  /* Since we didn't lose state, return 0 */
+	std	r3, PACA_REQ_PSSCR(r13)
 
 	/*
 	 * pnv_wakeup_noloss() expects r12 to contain the SRR1 value so
@@ -429,11 +452,29 @@ ALT_FTR_SECTION_END_NESTED_IFSET(CPU_FTR_ARCH_207S, 66);		\
  * r3 contains desired PSSCR register value.
  */
 _GLOBAL(power9_idle_stop)
+BEGIN_FTR_SECTION
+	lwz	r5, PACA_DONT_STOP(r13)
+	cmpwi	r5, 0
+	bne	1f
 	std	r3, PACA_REQ_PSSCR(r13)
+	sync
+	lwz	r5, PACA_DONT_STOP(r13)
+	cmpwi	r5, 0
+	bne	1f
+END_FTR_SECTION_IFSET(CPU_FTR_P9_TM_XER_SO_BUG)
 	mtspr 	SPRN_PSSCR,r3
 	LOAD_REG_ADDR(r4,power_enter_stop)
 	b	pnv_powersave_common
 	/* No return */
+1:
+	/*
+	 * We get here when TM / thread reconfiguration bug workaround
+	 * code wants to get the CPU into SMT4 mode, and therefore
+	 * we are being asked not to stop.
+	 */
+	li	r3, 0
+	std	r3, PACA_REQ_PSSCR(r13)
+	blr		/* return 0 for wakeup cause / SRR1 value */
 
 /*
  * On waking up from stop 0,1,2 with ESL=1 on POWER9 DD1,
@@ -584,6 +625,8 @@ FTR_SECTION_ELSE_NESTED(71)
 	mfspr	r5, SPRN_PSSCR
 	rldicl  r5,r5,4,60
 ALT_FTR_SECTION_END_NESTED_IFSET(CPU_FTR_POWER9_DD1, 71)
+	li	r0, 0		/* clear requested_psscr to say we're awake */
+	std	r0, PACA_REQ_PSSCR(r13)
 	cmpd	cr4,r5,r4
 	bge	cr4,pnv_wakeup_tb_loss /* returns to caller */
 
@@ -834,6 +877,8 @@ BEGIN_FTR_SECTION
 	mtspr	SPRN_PTCR,r4
 	ld	r4,_RPR(r1)
 	mtspr	SPRN_RPR,r4
+	ld	r4,_AMOR(r1)
+	mtspr	SPRN_AMOR,r4
 END_FTR_SECTION_IFSET(CPU_FTR_ARCH_300)
 
 	ld	r4,_TSCR(r1)
@@ -932,6 +977,25 @@ BEGIN_FTR_SECTION
 END_FTR_SECTION_IFSET(CPU_FTR_HVMODE)
 	REST_NVGPRS(r1)
 	REST_GPR(2, r1)
+
+BEGIN_FTR_SECTION
+	/* These regs were saved in pnv_powersave_common() */
+	ld	r4, PNV_POWERSAVE_AMR(r1)
+	ld	r5, PNV_POWERSAVE_IAMR(r1)
+	ld	r6, PNV_POWERSAVE_UAMOR(r1)
+	mtspr	SPRN_AMR, r4
+	mtspr	SPRN_IAMR, r5
+	mtspr	SPRN_UAMOR, r6
+BEGIN_FTR_SECTION_NESTED(42)
+	ld	r7, PNV_POWERSAVE_AMOR(r1)
+	mtspr	SPRN_AMOR, r7
+END_FTR_SECTION_NESTED_IFSET(CPU_FTR_HVMODE, 42)
+	/*
+	 * We don't need an isync here after restoring IAMR because the upcoming
+	 * mtmsrd is execution synchronizing.
+	 */
+END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+
 	ld	r4,PACAKMSR(r13)
 	ld	r5,_LINK(r1)
 	ld	r6,_CCR(r1)

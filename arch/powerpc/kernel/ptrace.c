@@ -33,6 +33,7 @@
 #include <linux/hw_breakpoint.h>
 #include <linux/perf_event.h>
 #include <linux/context_tracking.h>
+#include <linux/nospec.h>
 
 #include <linux/uaccess.h>
 #include <asm/page.h>
@@ -272,6 +273,8 @@ static int set_user_trap(struct task_struct *task, unsigned long trap)
  */
 int ptrace_get_reg(struct task_struct *task, int regno, unsigned long *data)
 {
+	unsigned int regs_max;
+
 	if ((task->thread.regs == NULL) || !data)
 		return -EIO;
 
@@ -283,7 +286,9 @@ int ptrace_get_reg(struct task_struct *task, int regno, unsigned long *data)
 	if (regno == PT_DSCR)
 		return get_user_dscr(task, data);
 
-	if (regno < (sizeof(struct pt_regs) / sizeof(unsigned long))) {
+	regs_max = sizeof(struct pt_regs) / sizeof(unsigned long);
+	if (regno < regs_max) {
+		regno = array_index_nospec(regno, regs_max);
 		*data = ((unsigned long *)task->thread.regs)[regno];
 		return 0;
 	}
@@ -307,6 +312,7 @@ int ptrace_put_reg(struct task_struct *task, int regno, unsigned long data)
 		return set_user_dscr(task, data);
 
 	if (regno <= PT_MAX_PUT_REG) {
+		regno = array_index_nospec(regno, PT_MAX_PUT_REG + 1);
 		((unsigned long *)task->thread.regs)[regno] = data;
 		return 0;
 	}
@@ -547,6 +553,7 @@ static int vr_get(struct task_struct *target, const struct user_regset *regset,
 		/*
 		 * Copy out only the low-order word of vrsave.
 		 */
+		int start, end;
 		union {
 			elf_vrreg_t reg;
 			u32 word;
@@ -555,8 +562,10 @@ static int vr_get(struct task_struct *target, const struct user_regset *regset,
 
 		vrsave.word = target->thread.vrsave;
 
+		start = 33 * sizeof(vector128);
+		end = start + sizeof(vrsave);
 		ret = user_regset_copyout(&pos, &count, &kbuf, &ubuf, &vrsave,
-					  33 * sizeof(vector128), -1);
+					  start, end);
 	}
 
 	return ret;
@@ -594,6 +603,7 @@ static int vr_set(struct task_struct *target, const struct user_regset *regset,
 		/*
 		 * We use only the first word of vrsave.
 		 */
+		int start, end;
 		union {
 			elf_vrreg_t reg;
 			u32 word;
@@ -602,8 +612,10 @@ static int vr_set(struct task_struct *target, const struct user_regset *regset,
 
 		vrsave.word = target->thread.vrsave;
 
+		start = 33 * sizeof(vector128);
+		end = start + sizeof(vrsave);
 		ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &vrsave,
-					 33 * sizeof(vector128), -1);
+					 start, end);
 		if (!ret)
 			target->thread.vrsave = vrsave.word;
 	}
@@ -2362,6 +2374,7 @@ static int ptrace_set_debugreg(struct task_struct *task, unsigned long addr,
 	/* Create a new breakpoint request if one doesn't exist already */
 	hw_breakpoint_init(&attr);
 	attr.bp_addr = hw_brk.address;
+	attr.bp_len = 8;
 	arch_bp_generic_fields(hw_brk.type,
 			       &attr.bp_type);
 
@@ -2913,8 +2926,13 @@ long arch_ptrace(struct task_struct *child, long request,
 
 			flush_fp_to_thread(child);
 			if (fpidx < (PT_FPSCR - PT_FPR0))
-				memcpy(&tmp, &child->thread.TS_FPR(fpidx),
-				       sizeof(long));
+				if (IS_ENABLED(CONFIG_PPC32)) {
+					// On 32-bit the index we are passed refers to 32-bit words
+					tmp = ((u32 *)child->thread.fp_state.fpr)[fpidx];
+				} else {
+					memcpy(&tmp, &child->thread.TS_FPR(fpidx),
+					       sizeof(long));
+				}
 			else
 				tmp = child->thread.fp_state.fpscr;
 		}
@@ -2946,8 +2964,13 @@ long arch_ptrace(struct task_struct *child, long request,
 
 			flush_fp_to_thread(child);
 			if (fpidx < (PT_FPSCR - PT_FPR0))
-				memcpy(&child->thread.TS_FPR(fpidx), &data,
-				       sizeof(long));
+				if (IS_ENABLED(CONFIG_PPC32)) {
+					// On 32-bit the index we are passed refers to 32-bit words
+					((u32 *)child->thread.fp_state.fpr)[fpidx] = data;
+				} else {
+					memcpy(&child->thread.TS_FPR(fpidx), &data,
+					       sizeof(long));
+				}
 			else
 				child->thread.fp_state.fpscr = data;
 			ret = 0;

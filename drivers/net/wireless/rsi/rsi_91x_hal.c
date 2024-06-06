@@ -196,7 +196,7 @@ static int rsi_prepare_data_desc(struct rsi_common *common, struct sk_buff *skb)
 		wh->frame_control |= cpu_to_le16(RSI_SET_PS_ENABLE);
 
 	if ((!(info->flags & IEEE80211_TX_INTFL_DONT_ENCRYPT)) &&
-	    (common->secinfo.security_enable)) {
+	    tx_params->have_key) {
 		if (rsi_is_cipher_wep(common))
 			ieee80211_size += 4;
 		else
@@ -207,15 +207,17 @@ static int rsi_prepare_data_desc(struct rsi_common *common, struct sk_buff *skb)
 			RSI_WIFI_DATA_Q);
 	data_desc->header_len = ieee80211_size;
 
-	if (common->min_rate != RSI_RATE_AUTO) {
+	if (common->rate_config[common->band].fixed_enabled) {
 		/* Send fixed rate */
+		u16 fixed_rate = common->rate_config[common->band].fixed_hw_rate;
+
 		data_desc->frame_info = cpu_to_le16(RATE_INFO_ENABLE);
-		data_desc->rate_info = cpu_to_le16(common->min_rate);
+		data_desc->rate_info = cpu_to_le16(fixed_rate);
 
 		if (conf_is_ht40(&common->priv->hw->conf))
 			data_desc->bbp_info = cpu_to_le16(FULL40M_ENABLE);
 
-		if ((common->vif_info[0].sgi) && (common->min_rate & 0x100)) {
+		if (common->vif_info[0].sgi && (fixed_rate & 0x100)) {
 		       /* Only MCS rates */
 			data_desc->rate_info |=
 				cpu_to_le16(ENABLE_SHORTGI_RATE);
@@ -403,9 +405,9 @@ int rsi_prepare_beacon(struct rsi_common *common, struct sk_buff *skb)
 	}
 
 	if (common->band == NL80211_BAND_2GHZ)
-		bcn_frm->bbp_info |= cpu_to_le16(RSI_RATE_1);
+		bcn_frm->rate_info |= cpu_to_le16(RSI_RATE_1);
 	else
-		bcn_frm->bbp_info |= cpu_to_le16(RSI_RATE_6);
+		bcn_frm->rate_info |= cpu_to_le16(RSI_RATE_6);
 
 	if (mac_bcn->data[tim_offset + 2] == 0)
 		bcn_frm->frame_info |= cpu_to_le16(RSI_DATA_DESC_DTIM_BEACON);
@@ -556,6 +558,7 @@ static int bl_cmd(struct rsi_hw *adapter, u8 cmd, u8 exp_resp, char *str)
 	bl_start_cmd_timer(adapter, timeout);
 	status = bl_write_cmd(adapter, cmd, exp_resp, &regout_val);
 	if (status < 0) {
+		bl_stop_cmd_timer(adapter);
 		rsi_dbg(ERR_ZONE,
 			"%s: Command %s (%0x) writing failed..\n",
 			__func__, str, cmd);
@@ -572,28 +575,32 @@ static int bl_write_header(struct rsi_hw *adapter, u8 *flash_content,
 			   u32 content_size)
 {
 	struct rsi_host_intf_ops *hif_ops = adapter->host_intf_ops;
-	struct bl_header bl_hdr;
+	struct bl_header *bl_hdr;
 	u32 write_addr, write_len;
 	int status;
 
-	bl_hdr.flags = 0;
-	bl_hdr.image_no = cpu_to_le32(adapter->priv->coex_mode);
-	bl_hdr.check_sum = cpu_to_le32(
-				*(u32 *)&flash_content[CHECK_SUM_OFFSET]);
-	bl_hdr.flash_start_address = cpu_to_le32(
-					*(u32 *)&flash_content[ADDR_OFFSET]);
-	bl_hdr.flash_len = cpu_to_le32(*(u32 *)&flash_content[LEN_OFFSET]);
+	bl_hdr = kzalloc(sizeof(*bl_hdr), GFP_KERNEL);
+	if (!bl_hdr)
+		return -ENOMEM;
+
+	bl_hdr->flags = 0;
+	bl_hdr->image_no = cpu_to_le32(adapter->priv->coex_mode);
+	bl_hdr->check_sum =
+		cpu_to_le32(*(u32 *)&flash_content[CHECK_SUM_OFFSET]);
+	bl_hdr->flash_start_address =
+		cpu_to_le32(*(u32 *)&flash_content[ADDR_OFFSET]);
+	bl_hdr->flash_len = cpu_to_le32(*(u32 *)&flash_content[LEN_OFFSET]);
 	write_len = sizeof(struct bl_header);
 
 	if (adapter->rsi_host_intf == RSI_HOST_INTF_USB) {
 		write_addr = PING_BUFFER_ADDRESS;
 		status = hif_ops->write_reg_multiple(adapter, write_addr,
-						 (u8 *)&bl_hdr, write_len);
+						 (u8 *)bl_hdr, write_len);
 		if (status < 0) {
 			rsi_dbg(ERR_ZONE,
 				"%s: Failed to load Version/CRC structure\n",
 				__func__);
-			return status;
+			goto fail;
 		}
 	} else {
 		write_addr = PING_BUFFER_ADDRESS >> 16;
@@ -602,20 +609,23 @@ static int bl_write_header(struct rsi_hw *adapter, u8 *flash_content,
 			rsi_dbg(ERR_ZONE,
 				"%s: Unable to set ms word to common reg\n",
 				__func__);
-			return status;
+			goto fail;
 		}
 		write_addr = RSI_SD_REQUEST_MASTER |
 			     (PING_BUFFER_ADDRESS & 0xFFFF);
 		status = hif_ops->write_reg_multiple(adapter, write_addr,
-						 (u8 *)&bl_hdr, write_len);
+						 (u8 *)bl_hdr, write_len);
 		if (status < 0) {
 			rsi_dbg(ERR_ZONE,
 				"%s: Failed to load Version/CRC structure\n",
 				__func__);
-			return status;
+			goto fail;
 		}
 	}
-	return 0;
+	status = 0;
+fail:
+	kfree(bl_hdr);
+	return status;
 }
 
 static u32 read_flash_capacity(struct rsi_hw *adapter)
@@ -664,10 +674,9 @@ static int ping_pong_write(struct rsi_hw *adapter, u8 cmd, u8 *addr, u32 size)
 	}
 
 	status = bl_cmd(adapter, cmd_req, cmd_resp, str);
-	if (status) {
-		bl_stop_cmd_timer(adapter);
+	if (status)
 		return status;
-	}
+
 	return 0;
 }
 
@@ -757,10 +766,9 @@ static int auto_fw_upgrade(struct rsi_hw *adapter, u8 *flash_content,
 
 	status = bl_cmd(adapter, EOF_REACHED, FW_LOADING_SUCCESSFUL,
 			"EOF_REACHED");
-	if (status) {
-		bl_stop_cmd_timer(adapter);
+	if (status)
 		return status;
-	}
+
 	rsi_dbg(INFO_ZONE, "FW loading is done and FW is running..\n");
 	return 0;
 }
@@ -782,6 +790,7 @@ static int rsi_load_firmware(struct rsi_hw *adapter)
 		status = hif_ops->master_reg_read(adapter, SWBL_REGOUT,
 					      &regout_val, 2);
 		if (status < 0) {
+			bl_stop_cmd_timer(adapter);
 			rsi_dbg(ERR_ZONE,
 				"%s: REGOUT read failed\n", __func__);
 			return status;

@@ -174,15 +174,12 @@ static blk_status_t nvme_loop_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (ret)
 		return ret;
 
+	blk_mq_start_request(req);
 	iod->cmd.common.flags |= NVME_CMD_SGL_METABUF;
 	iod->req.port = nvmet_loop_port;
 	if (!nvmet_req_init(&iod->req, &queue->nvme_cq,
-			&queue->nvme_sq, &nvme_loop_ops)) {
-		nvme_cleanup_cmd(req);
-		blk_mq_start_request(req);
-		nvme_loop_queue_response(&iod->req);
+			&queue->nvme_sq, &nvme_loop_ops))
 		return BLK_STS_OK;
-	}
 
 	if (blk_rq_bytes(req)) {
 		iod->sg_table.sgl = iod->first_sgl;
@@ -195,8 +192,6 @@ static blk_status_t nvme_loop_queue_rq(struct blk_mq_hw_ctx *hctx,
 		iod->req.sg_cnt = blk_rq_map_sg(req->q, req, iod->sg_table.sgl);
 		iod->req.transfer_len = blk_rq_bytes(req);
 	}
-
-	blk_mq_start_request(req);
 
 	schedule_work(&iod->work);
 	return BLK_STS_OK;
@@ -284,7 +279,8 @@ static const struct blk_mq_ops nvme_loop_admin_mq_ops = {
 
 static void nvme_loop_destroy_admin_queue(struct nvme_loop_ctrl *ctrl)
 {
-	clear_bit(NVME_LOOP_Q_LIVE, &ctrl->queues[0].flags);
+	if (!test_and_clear_bit(NVME_LOOP_Q_LIVE, &ctrl->queues[0].flags))
+		return;
 	nvmet_sq_destroy(&ctrl->queues[0].nvme_sq);
 	blk_cleanup_queue(ctrl->ctrl.admin_q);
 	blk_mq_free_tag_set(&ctrl->admin_tag_set);
@@ -319,6 +315,7 @@ static void nvme_loop_destroy_io_queues(struct nvme_loop_ctrl *ctrl)
 		clear_bit(NVME_LOOP_Q_LIVE, &ctrl->queues[i].flags);
 		nvmet_sq_destroy(&ctrl->queues[i].nvme_sq);
 	}
+	ctrl->ctrl.queue_count = 1;
 }
 
 static int nvme_loop_init_io_queues(struct nvme_loop_ctrl *ctrl)
@@ -427,6 +424,7 @@ static int nvme_loop_configure_admin_queue(struct nvme_loop_ctrl *ctrl)
 	return 0;
 
 out_cleanup_queue:
+	clear_bit(NVME_LOOP_Q_LIVE, &ctrl->queues[0].flags);
 	blk_cleanup_queue(ctrl->ctrl.admin_q);
 out_free_tagset:
 	blk_mq_free_tag_set(&ctrl->admin_tag_set);
@@ -686,6 +684,7 @@ static struct nvmet_fabrics_ops nvme_loop_ops = {
 
 static struct nvmf_transport_ops nvme_loop_transport = {
 	.name		= "loop",
+	.module		= THIS_MODULE,
 	.create_ctrl	= nvme_loop_create_ctrl,
 };
 

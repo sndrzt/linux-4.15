@@ -63,6 +63,7 @@ static int red_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 {
 	struct red_sched_data *q = qdisc_priv(sch);
 	struct Qdisc *child = q->qdisc;
+	unsigned int len;
 	int ret;
 
 	q->vars.qavg = red_calc_qavg(&q->parms,
@@ -98,9 +99,10 @@ static int red_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		break;
 	}
 
+	len = qdisc_pkt_len(skb);
 	ret = qdisc_enqueue(skb, child, to_free);
 	if (likely(ret == NET_XMIT_SUCCESS)) {
-		qdisc_qstats_backlog_inc(sch, skb);
+		sch->qstats.backlog += len;
 		sch->q.qlen++;
 	} else if (net_xmit_drop_count(ret)) {
 		q->stats.pdrop++;
@@ -157,7 +159,6 @@ static int red_offload(struct Qdisc *sch, bool enable)
 		.handle = sch->handle,
 		.parent = sch->parent,
 	};
-	int err;
 
 	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
 		return -EOPNOTSUPP;
@@ -172,14 +173,7 @@ static int red_offload(struct Qdisc *sch, bool enable)
 		opt.command = TC_RED_DESTROY;
 	}
 
-	err = dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_RED, &opt);
-
-	if (!err && enable)
-		sch->flags |= TCQ_F_OFFLOADED;
-	else
-		sch->flags &= ~TCQ_F_OFFLOADED;
-
-	return err;
+	return dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_RED, &opt);
 }
 
 static void red_destroy(struct Qdisc *sch)
@@ -205,6 +199,7 @@ static int red_change(struct Qdisc *sch, struct nlattr *opt)
 	struct Qdisc *child = NULL;
 	int err;
 	u32 max_P;
+	u8 *stab;
 
 	if (opt == NULL)
 		return -EINVAL;
@@ -220,17 +215,20 @@ static int red_change(struct Qdisc *sch, struct nlattr *opt)
 	max_P = tb[TCA_RED_MAX_P] ? nla_get_u32(tb[TCA_RED_MAX_P]) : 0;
 
 	ctl = nla_data(tb[TCA_RED_PARMS]);
-	if (!red_check_params(ctl->qth_min, ctl->qth_max, ctl->Wlog))
+	stab = nla_data(tb[TCA_RED_STAB]);
+	if (!red_check_params(ctl->qth_min, ctl->qth_max, ctl->Wlog,
+			      ctl->Scell_log, stab))
 		return -EINVAL;
 
 	if (ctl->limit > 0) {
 		child = fifo_create_dflt(sch, &bfifo_qdisc_ops, ctl->limit);
 		if (IS_ERR(child))
 			return PTR_ERR(child);
+
+		/* child is fifo, no need to check for noop_qdisc */
+		qdisc_hash_add(child, true);
 	}
 
-	if (child != &noop_qdisc)
-		qdisc_hash_add(child, true);
 	sch_tree_lock(sch);
 	q->flags = ctl->flags;
 	q->limit = ctl->limit;
@@ -244,7 +242,7 @@ static int red_change(struct Qdisc *sch, struct nlattr *opt)
 	red_set_parms(&q->parms,
 		      ctl->qth_min, ctl->qth_max, ctl->Wlog,
 		      ctl->Plog, ctl->Scell_log,
-		      nla_data(tb[TCA_RED_STAB]),
+		      stab,
 		      max_P);
 	red_set_vars(&q->vars);
 
@@ -294,12 +292,22 @@ static int red_dump_offload_stats(struct Qdisc *sch, struct tc_red_qopt *opt)
 			.stats.qstats = &sch->qstats,
 		},
 	};
+	int err;
 
-	if (!(sch->flags & TCQ_F_OFFLOADED))
+	sch->flags &= ~TCQ_F_OFFLOADED;
+
+	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
 		return 0;
 
-	return dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_RED,
-					     &hw_stats);
+	err = dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_RED,
+					    &hw_stats);
+	if (err == -EOPNOTSUPP)
+		return 0;
+
+	if (!err)
+		sch->flags |= TCQ_F_OFFLOADED;
+
+	return err;
 }
 
 static int red_dump(struct Qdisc *sch, struct sk_buff *skb)

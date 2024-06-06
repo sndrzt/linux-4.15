@@ -607,6 +607,14 @@ static int hctx_active_show(void *data, struct seq_file *m)
 	return 0;
 }
 
+static int hctx_dispatch_busy_show(void *data, struct seq_file *m)
+{
+	struct blk_mq_hw_ctx *hctx = data;
+
+	seq_printf(m, "%u\n", hctx->dispatch_busy);
+	return 0;
+}
+
 static void *ctx_rq_list_start(struct seq_file *m, loff_t *pos)
 	__acquires(&ctx->lock)
 {
@@ -703,7 +711,11 @@ static ssize_t blk_mq_debugfs_write(struct file *file, const char __user *buf,
 	const struct blk_mq_debugfs_attr *attr = m->private;
 	void *data = d_inode(file->f_path.dentry->d_parent)->i_private;
 
-	if (!attr->write)
+	/*
+	 * Attributes that only implement .seq_ops are read-only and 'attr' is
+	 * the same with 'data' in this case.
+	 */
+	if (attr == data || !attr->write)
 		return -EPERM;
 
 	return attr->write(data, buf, count, ppos);
@@ -772,6 +784,7 @@ static const struct blk_mq_debugfs_attr blk_mq_debugfs_hctx_attrs[] = {
 	{"queued", 0600, hctx_queued_show, hctx_queued_write},
 	{"run", 0600, hctx_run_show, hctx_run_write},
 	{"active", 0400, hctx_active_show},
+	{"dispatch_busy", 0400, hctx_dispatch_busy_show},
 	{},
 };
 

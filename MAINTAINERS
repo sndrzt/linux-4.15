@@ -765,6 +765,14 @@ F:	drivers/gpu/drm/amd/include/kgd_kfd_interface.h
 F:	drivers/gpu/drm/amd/include/vi_structs.h
 F:	include/uapi/linux/kfd_ioctl.h
 
+AMD MP2 I2C DRIVER
+M:	Elie Morisse <syniurge@gmail.com>
+M:	Nehal Shah <nehal-bakulchandra.shah@amd.com>
+M:	Shyam Sundar S K <shyam-sundar.s-k@amd.com>
+L:	linux-i2c@vger.kernel.org
+S:	Maintained
+F:	drivers/i2c/busses/i2c-amd-mp2*
+
 AMD SEATTLE DEVICE TREE SUPPORT
 M:	Brijesh Singh <brijeshkumar.singh@amd.com>
 M:	Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
@@ -2486,6 +2494,19 @@ F:	include/linux/audit.h
 F:	include/uapi/linux/audit.h
 F:	kernel/audit*
 
+AUFS (advanced multi layered unification filesystem) FILESYSTEM
+M:	"J. R. Okajima" <hooanon05g@gmail.com>
+L:	linux-unionfs@vger.kernel.org
+L:	aufs-users@lists.sourceforge.net (members only)
+W:	http://aufs.sourceforge.net
+T:	git://github.com/sfjro/aufs4-linux.git
+S:	Supported
+F:	Documentation/filesystems/aufs/
+F:	Documentation/ABI/testing/debugfs-aufs
+F:	Documentation/ABI/testing/sysfs-aufs
+F:	fs/aufs/
+F:	include/uapi/linux/aufs_type.h
+
 AUXILIARY DISPLAY DRIVERS
 M:	Miguel Ojeda Sandonis <miguel.ojeda.sandonis@gmail.com>
 W:	http://miguelojeda.es/auxdisplay.htm
@@ -3484,6 +3505,15 @@ M:	Christian Benvenuti <benve@cisco.com>
 M:	Dave Goodell <dgoodell@cisco.com>
 S:	Supported
 F:	drivers/infiniband/hw/usnic/
+
+CLANG/LLVM BUILD SUPPORT
+L:	clang-built-linux@googlegroups.com
+W:	https://clangbuiltlinux.github.io/
+B:	https://github.com/ClangBuiltLinux/linux/issues
+C:	irc://chat.freenode.net/clangbuiltlinux
+S:	Supported
+K:	\b(?i:clang|llvm)\b
+F:	Documentation/kbuild/llvm.rst
 
 CLEANCACHE API
 M:	Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
@@ -6340,6 +6370,13 @@ W:	http://www.hisilicon.com
 S:	Maintained
 F:	drivers/net/ethernet/hisilicon/hns3/
 
+HISILICON LPC BUS DRIVER
+M:	john.garry@huawei.com
+W:	http://www.hisilicon.com
+S:	Maintained
+F:	drivers/bus/hisi_lpc.c
+F:	Documentation/devicetree/bindings/arm/hisilicon/hisilicon-low-pin-count.txt
+
 HISILICON NETWORK SUBSYSTEM DRIVER
 M:	Yisen Zhuang <yisen.zhuang@huawei.com>
 M:	Salil Mehta <salil.mehta@huawei.com>
@@ -6964,6 +7001,12 @@ F:	sound/soc/intel/common/sst-firmware.c
 F:	sound/soc/intel/boards/broadwell.c
 F:	sound/soc/intel/haswell/
 
+INTEL ATOMISP2 DUMMY / POWER-MANAGEMENT DRIVER
+M:	Hans de Goede <hdegoede@redhat.com>
+L:	platform-driver-x86@vger.kernel.org
+S:	Maintained
+F:	drivers/platform/x86/intel_atomisp2_pm.c
+
 INTEL C600 SERIES SAS CONTROLLER DRIVER
 M:	Intel SCU Linux support <intel-linux-scu@intel.com>
 M:	Artur Paszkiewicz <artur.paszkiewicz@intel.com>
@@ -6978,7 +7021,7 @@ M:	Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
 M:	Rodrigo Vivi <rodrigo.vivi@intel.com>
 L:	intel-gfx@lists.freedesktop.org
 W:	https://01.org/linuxgraphics/
-B:	https://01.org/linuxgraphics/documentation/how-report-bugs
+B:	https://gitlab.freedesktop.org/drm/intel/-/wikis/How-to-file-i915-bugs
 C:	irc://chat.freenode.net/intel-gfx
 Q:	http://patchwork.freedesktop.org/project/intel-gfx/
 T:	git git://anongit.freedesktop.org/drm-intel
@@ -9107,6 +9150,7 @@ MIPS GENERIC PLATFORM
 M:	Paul Burton <paul.burton@mips.com>
 L:	linux-mips@linux-mips.org
 S:	Supported
+F:	Documentation/devicetree/bindings/power/mti,mips-cpc.txt
 F:	arch/mips/generic/
 F:	arch/mips/tools/generic-board-config.sh
 
@@ -9815,6 +9859,18 @@ OBJTOOL
 M:	Josh Poimboeuf <jpoimboe@redhat.com>
 S:	Supported
 F:	tools/objtool/
+
+OCXL (Open Coherent Accelerator Processor Interface OpenCAPI) DRIVER
+M:	Frederic Barrat <fbarrat@linux.vnet.ibm.com>
+M:	Andrew Donnellan <andrew.donnellan@au1.ibm.com>
+L:	linuxppc-dev@lists.ozlabs.org
+S:	Supported
+F:	arch/powerpc/platforms/powernv/ocxl.c
+F:	arch/powerpc/include/asm/pnv-ocxl.h
+F:	drivers/misc/ocxl/
+F:	include/misc/ocxl*
+F:	include/uapi/misc/ocxl.h
+F:	Documentation/accelerators/ocxl.txt
 
 OMAP AUDIO SUPPORT
 M:	Peter Ujfalusi <peter.ujfalusi@ti.com>
@@ -11301,6 +11357,13 @@ W:	http://wireless.kernel.org/en/users/Drivers/ath9k
 S:	Supported
 F:	drivers/net/wireless/ath/ath9k/
 
+QUALCOMM CAMERA CONTROL INTERFACE DRIVER
+M:	Todor Tomov <todor.tomov@linaro.org>
+L:	linux-i2c@vger.kernel.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/i2c/i2c-qcom-cci.txt
+F:	drivers/i2c/busses/i2c-qcom-cci.c
+
 QUALCOMM CAMERA SUBSYSTEM DRIVER
 M:	Todor Tomov <todor.tomov@linaro.org>
 L:	linux-media@vger.kernel.org
@@ -11434,6 +11497,7 @@ F:	drivers/block/brd.c
 
 RANDOM NUMBER DRIVER
 M:	"Theodore Ts'o" <tytso@mit.edu>
+M:	Jason A. Donenfeld <Jason@zx2c4.com>
 S:	Maintained
 F:	drivers/char/random.c
 
@@ -11871,6 +11935,18 @@ L:	linux-s390@vger.kernel.org
 W:	http://www.ibm.com/developerworks/linux/linux390/
 S:	Supported
 F:	drivers/s390/crypto/
+
+S390 VFIO AP DRIVER
+M:	Tony Krowiak <akrowiak@linux.ibm.com>
+M:	Pierre Morel <pmorel@linux.ibm.com>
+M:	Halil Pasic <pasic@linux.ibm.com>
+L:	linux-s390@vger.kernel.org
+W:	http://www.ibm.com/developerworks/linux/linux390/
+S:	Supported
+F:	drivers/s390/crypto/vfio_ap_drv.c
+F:	drivers/s390/crypto/vfio_ap_private.h
+F:	drivers/s390/crypto/vfio_ap_ops.c
+F:	Documentation/s390/vfio-ap.txt
 
 S390 ZFCP DRIVER
 M:	Steffen Maier <maier@linux.vnet.ibm.com>
@@ -12614,6 +12690,15 @@ L:	linux-media@vger.kernel.org
 S:	Supported
 F:	drivers/media/pci/solo6x10/
 
+SOFTWARE DELEGATED EXCEPTION INTERFACE (SDEI)
+M:	James Morse <james.morse@arm.com>
+L:	linux-arm-kernel@lists.infradead.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/arm/firmware/sdei.txt
+F:	drivers/firmware/arm_sdei.c
+F:	include/linux/sdei.h
+F:	include/uapi/linux/sdei.h
+
 SOFTWARE RAID (Multiple Disks) SUPPORT
 M:	Shaohua Li <shli@kernel.org>
 L:	linux-raid@vger.kernel.org
@@ -12836,6 +12921,7 @@ F:	arch/alpha/kernel/srm_env.c
 
 STABLE BRANCH
 M:	Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+M:	Sasha Levin <sashal@kernel.org>
 L:	stable@vger.kernel.org
 S:	Supported
 F:	Documentation/process/stable-kernel-rules.rst
@@ -14088,13 +14174,6 @@ L:	netdev@vger.kernel.org
 W:	http://www.linux-usb.org/usbnet
 S:	Maintained
 F:	drivers/net/usb/dm9601.c
-
-USB DIAMOND RIO500 DRIVER
-M:	Cesar Miquel <miquel@df.uba.ar>
-L:	rio500-users@lists.sourceforge.net
-W:	http://rio500.sourceforge.net
-S:	Maintained
-F:	drivers/usb/misc/rio500*
 
 USB EHCI DRIVER
 M:	Alan Stern <stern@rowland.harvard.edu>

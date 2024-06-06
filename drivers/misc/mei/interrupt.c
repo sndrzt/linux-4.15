@@ -220,6 +220,9 @@ static int mei_cl_irq_read(struct mei_cl *cl, struct mei_cl_cb *cb,
 		return ret;
 	}
 
+	pm_runtime_mark_last_busy(dev->dev);
+	pm_request_autosuspend(dev->dev);
+
 	list_move_tail(&cb->list, &cl->rd_pending);
 
 	return 0;
@@ -310,8 +313,11 @@ int mei_irq_read_handler(struct mei_device *dev,
 	if (&cl->link == &dev->file_list) {
 		/* A message for not connected fixed address clients
 		 * should be silently discarded
+		 * On power down client may be force cleaned,
+		 * silently discard such messages
 		 */
-		if (hdr_is_fixed(mei_hdr)) {
+		if (hdr_is_fixed(mei_hdr) ||
+		    dev->dev_state == MEI_DEV_POWER_DOWN) {
 			mei_irq_discard_msg(dev, mei_hdr);
 			ret = 0;
 			goto reset_slots;

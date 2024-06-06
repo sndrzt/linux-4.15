@@ -159,6 +159,9 @@ static void dev_map_free(struct bpf_map *map)
 
 	synchronize_rcu();
 
+	/* Make sure prior __dev_map_entry_free() have completed. */
+	rcu_barrier();
+
 	/* To ensure all pending flush operations have completed wait for flush
 	 * bitmap to indicate all flush_needed bits to be zero on _all_ cpus.
 	 * Because the above synchronize_rcu() ensures the map is disconnected
@@ -235,10 +238,11 @@ void __dev_map_flush(struct bpf_map *map)
 		if (unlikely(!dev))
 			continue;
 
-		__clear_bit(bit, bitmap);
 		netdev = dev->dev;
 		if (likely(netdev->netdev_ops->ndo_xdp_flush))
 			netdev->netdev_ops->ndo_xdp_flush(netdev);
+
+		__clear_bit(bit, bitmap);
 	}
 }
 
@@ -388,8 +392,7 @@ static int dev_map_notification(struct notifier_block *notifier,
 				struct bpf_dtab_netdev *dev, *odev;
 
 				dev = READ_ONCE(dtab->netdev_map[i]);
-				if (!dev ||
-				    dev->dev->ifindex != netdev->ifindex)
+				if (!dev || netdev != dev->dev)
 					continue;
 				odev = cmpxchg(&dtab->netdev_map[i], dev, NULL);
 				if (dev == odev)

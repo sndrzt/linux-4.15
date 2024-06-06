@@ -44,14 +44,16 @@
 /* DM_CM_RST */
 #define RST_DTRANRST1		BIT(9)
 #define RST_DTRANRST0		BIT(8)
-#define RST_RESERVED_BITS	GENMASK_ULL(32, 0)
+#define RST_RESERVED_BITS	GENMASK_ULL(31, 0)
 
 /* DM_CM_INFO1 and DM_CM_INFO1_MASK */
 #define INFO1_CLEAR		0
+#define INFO1_MASK_CLEAR	GENMASK_ULL(31, 0)
 #define INFO1_DTRANEND1		BIT(17)
 #define INFO1_DTRANEND0		BIT(16)
 
 /* DM_CM_INFO2 and DM_CM_INFO2_MASK */
+#define INFO2_MASK_CLEAR	GENMASK_ULL(31, 0)
 #define INFO2_DTRANERR1		BIT(17)
 #define INFO2_DTRANERR0		BIT(16)
 
@@ -146,8 +148,8 @@ renesas_sdhi_internal_dmac_start_dma(struct tmio_mmc_host *host,
 	/* This DMAC cannot handle if sg_len is not 1 */
 	WARN_ON(host->sg_len > 1);
 
-	/* This DMAC cannot handle if buffer is not 8-bytes alignment */
-	if (!IS_ALIGNED(sg->offset, 8))
+	/* This DMAC cannot handle if buffer is not 128-bytes alignment */
+	if (!IS_ALIGNED(sg->offset, 128))
 		goto force_pio;
 
 	if (data->flags & MMC_DATA_READ) {
@@ -193,15 +195,12 @@ static void renesas_sdhi_internal_dmac_issue_tasklet_fn(unsigned long arg)
 					    DTRAN_CTRL_DM_START);
 }
 
-static void renesas_sdhi_internal_dmac_complete_tasklet_fn(unsigned long arg)
+static bool renesas_sdhi_internal_dmac_complete(struct tmio_mmc_host *host)
 {
-	struct tmio_mmc_host *host = (struct tmio_mmc_host *)arg;
 	enum dma_data_direction dir;
 
-	spin_lock_irq(&host->lock);
-
 	if (!host->data)
-		goto out;
+		return false;
 
 	if (host->data->flags & MMC_DATA_READ)
 		dir = DMA_FROM_DEVICE;
@@ -210,6 +209,17 @@ static void renesas_sdhi_internal_dmac_complete_tasklet_fn(unsigned long arg)
 
 	renesas_sdhi_internal_dmac_enable_dma(host, false);
 	dma_unmap_sg(&host->pdev->dev, host->sg_ptr, host->sg_len, dir);
+
+	return true;
+}
+
+static void renesas_sdhi_internal_dmac_complete_tasklet_fn(unsigned long arg)
+{
+	struct tmio_mmc_host *host = (struct tmio_mmc_host *)arg;
+
+	spin_lock_irq(&host->lock);
+	if (!renesas_sdhi_internal_dmac_complete(host))
+		goto out;
 
 	tmio_mmc_do_data_irq(host);
 out:
@@ -220,6 +230,12 @@ static void
 renesas_sdhi_internal_dmac_request_dma(struct tmio_mmc_host *host,
 				       struct tmio_mmc_data *pdata)
 {
+	/* Disable DMAC interrupts, we don't use them */
+	renesas_sdhi_internal_dmac_dm_write(host, DM_CM_INFO1_MASK,
+					    INFO1_MASK_CLEAR);
+	renesas_sdhi_internal_dmac_dm_write(host, DM_CM_INFO2_MASK,
+					    INFO2_MASK_CLEAR);
+
 	/* Each value is set to non-zero to assume "enabling" each DMA */
 	host->chan_rx = host->chan_tx = (void *)0xdeadbeaf;
 
@@ -260,8 +276,17 @@ static const struct soc_device_attribute gen3_soc_whitelist[] = {
 
 static int renesas_sdhi_internal_dmac_probe(struct platform_device *pdev)
 {
+	struct device *dev = &pdev->dev;
+
 	if (!soc_device_match(gen3_soc_whitelist))
 		return -ENODEV;
+
+	dev->dma_parms = devm_kzalloc(dev, sizeof(*dev->dma_parms), GFP_KERNEL);
+	if (!dev->dma_parms)
+		return -ENOMEM;
+
+	/* value is max of SD_SECCNT. Confirmed by HW engineers */
+	dma_set_max_seg_size(dev, 0xffffffff);
 
 	return renesas_sdhi_probe(pdev, &renesas_sdhi_internal_dmac_dma_ops);
 }

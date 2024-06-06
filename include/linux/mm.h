@@ -154,7 +154,9 @@ extern int overcommit_kbytes_handler(struct ctl_table *, int, void __user *,
  * mmap() functions).
  */
 
-extern struct kmem_cache *vm_area_cachep;
+struct vm_area_struct *vm_area_alloc(struct mm_struct *);
+struct vm_area_struct *vm_area_dup(struct vm_area_struct *);
+void vm_area_free(struct vm_area_struct *);
 
 #ifndef CONFIG_MMU
 extern struct rb_root nommu_region_tree;
@@ -558,12 +560,13 @@ static inline void *kvmalloc_array(size_t n, size_t size, gfp_t flags)
 }
 
 extern void kvfree(const void *addr);
+extern void kvfree_sensitive(const void *addr, size_t len);
 
-static inline atomic_t *compound_mapcount_ptr(struct page *page)
-{
-	return &page[1].compound_mapcount;
-}
-
+/*
+ * Mapcount of compound page as a whole, does not include mapped sub-pages.
+ *
+ * Must be called only for compound pages or any their tail sub-pages.
+ */
 static inline int compound_mapcount(struct page *page)
 {
 	VM_BUG_ON_PAGE(!PageCompound(page), page);
@@ -583,10 +586,16 @@ static inline void page_mapcount_reset(struct page *page)
 
 int __page_mapcount(struct page *page);
 
+/*
+ * Mapcount of 0-order page; when compound sub-page, includes
+ * compound_mapcount().
+ *
+ * Result is undefined for pages which cannot be mapped into userspace.
+ * For example SLAB or special types of pages. See function page_has_type().
+ * They use this place in struct page differently.
+ */
 static inline int page_mapcount(struct page *page)
 {
-	VM_BUG_ON_PAGE(PageSlab(page), page);
-
 	if (unlikely(PageCompound(page)))
 		return __page_mapcount(page);
 	return atomic_read(&page->_mapcount) + 1;
@@ -834,6 +843,10 @@ static inline bool is_device_public_page(const struct page *page)
 #endif /* CONFIG_DEVICE_PRIVATE || CONFIG_DEVICE_PUBLIC */
 
 
+/* 127: arbitrary random number, small enough to assemble well */
+#define page_ref_zero_or_close_to_overflow(page) \
+	((unsigned int) page_ref_count(page) + 127u <= 127u)
+
 static inline void get_page(struct page *page)
 {
 	page = compound_head(page);
@@ -841,8 +854,17 @@ static inline void get_page(struct page *page)
 	 * Getting a normal page or the head of a compound page
 	 * requires to already have an elevated page->_refcount.
 	 */
-	VM_BUG_ON_PAGE(page_ref_count(page) <= 0, page);
+	VM_BUG_ON_PAGE(page_ref_zero_or_close_to_overflow(page), page);
 	page_ref_inc(page);
+}
+
+static inline __must_check bool try_get_page(struct page *page)
+{
+	page = compound_head(page);
+	if (WARN_ON_ONCE(page_ref_count(page) <= 0))
+		return false;
+	page_ref_inc(page);
+	return true;
 }
 
 static inline void put_page(struct page *page)
@@ -1362,6 +1384,28 @@ static inline int fixup_user_fault(struct task_struct *tsk,
 }
 #endif
 
+extern void vma_do_file_update_time(struct vm_area_struct *, const char[], int);
+extern struct file *vma_do_pr_or_file(struct vm_area_struct *, const char[],
+				      int);
+extern void vma_do_get_file(struct vm_area_struct *, const char[], int);
+extern void vma_do_fput(struct vm_area_struct *, const char[], int);
+
+#define vma_file_update_time(vma)	vma_do_file_update_time(vma, __func__, \
+								__LINE__)
+#define vma_pr_or_file(vma)		vma_do_pr_or_file(vma, __func__, \
+							  __LINE__)
+#define vma_get_file(vma)		vma_do_get_file(vma, __func__, __LINE__)
+#define vma_fput(vma)			vma_do_fput(vma, __func__, __LINE__)
+
+#ifndef CONFIG_MMU
+extern struct file *vmr_do_pr_or_file(struct vm_region *, const char[], int);
+extern void vmr_do_fput(struct vm_region *, const char[], int);
+
+#define vmr_pr_or_file(region)		vmr_do_pr_or_file(region, __func__, \
+							  __LINE__)
+#define vmr_fput(region)		vmr_do_fput(region, __func__, __LINE__)
+#endif /* !CONFIG_MMU */
+
 extern int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, int len,
 		unsigned int gup_flags);
 extern int access_remote_vm(struct mm_struct *mm, unsigned long addr,
@@ -1645,11 +1689,15 @@ int __pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long address);
 
 static inline void mm_inc_nr_puds(struct mm_struct *mm)
 {
+	if (mm_pud_folded(mm))
+		return;
 	atomic_long_add(PTRS_PER_PUD * sizeof(pud_t), &mm->pgtables_bytes);
 }
 
 static inline void mm_dec_nr_puds(struct mm_struct *mm)
 {
+	if (mm_pud_folded(mm))
+		return;
 	atomic_long_sub(PTRS_PER_PUD * sizeof(pud_t), &mm->pgtables_bytes);
 }
 #endif
@@ -1669,11 +1717,15 @@ int __pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address);
 
 static inline void mm_inc_nr_pmds(struct mm_struct *mm)
 {
+	if (mm_pmd_folded(mm))
+		return;
 	atomic_long_add(PTRS_PER_PMD * sizeof(pmd_t), &mm->pgtables_bytes);
 }
 
 static inline void mm_dec_nr_pmds(struct mm_struct *mm)
 {
+	if (mm_pmd_folded(mm))
+		return;
 	atomic_long_sub(PTRS_PER_PMD * sizeof(pmd_t), &mm->pgtables_bytes);
 }
 #endif
@@ -2062,7 +2114,7 @@ extern int __meminit __early_pfn_to_nid(unsigned long pfn,
 					struct mminit_pfnnid_cache *state);
 #endif
 
-#ifdef CONFIG_HAVE_MEMBLOCK
+#if defined(CONFIG_HAVE_MEMBLOCK) && !defined(CONFIG_FLAT_NODE_MEM_MAP)
 void zero_resv_unavail(void);
 #else
 static inline void zero_resv_unavail(void) {}
@@ -2195,6 +2247,8 @@ extern struct vm_area_struct *_install_special_mapping(struct mm_struct *mm,
 extern int install_special_mapping(struct mm_struct *mm,
 				   unsigned long addr, unsigned long len,
 				   unsigned long flags, struct page **pages);
+
+unsigned long randomize_page(unsigned long start, unsigned long range);
 
 extern unsigned long get_unmapped_area(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
 
@@ -2374,6 +2428,12 @@ static inline struct vm_area_struct *find_exact_vma(struct mm_struct *mm,
 	return vma;
 }
 
+static inline bool range_in_vma(struct vm_area_struct *vma,
+				unsigned long start, unsigned long end)
+{
+	return (vma && vma->vm_start <= start && end <= vma->vm_end);
+}
+
 #ifdef CONFIG_MMU
 pgprot_t vm_get_page_prot(unsigned long vm_flags);
 void vma_set_page_prot(struct vm_area_struct *vma);
@@ -2435,6 +2495,7 @@ static inline struct page *follow_page(struct vm_area_struct *vma,
 #define FOLL_MLOCK	0x1000	/* lock present pages */
 #define FOLL_REMOTE	0x2000	/* we are working on non-current tsk/mm */
 #define FOLL_COW	0x4000	/* internal GUP flag */
+#define FOLL_ANON	0x8000	/* don't do file mappings */
 
 static inline int vm_fault_to_errno(int vm_fault, int foll_flags)
 {
@@ -2446,6 +2507,15 @@ static inline int vm_fault_to_errno(int vm_fault, int foll_flags)
 		return -EFAULT;
 	return 0;
 }
+
+#ifndef io_remap_pfn_range
+static inline int io_remap_pfn_range(struct vm_area_struct *vma,
+				     unsigned long addr, unsigned long pfn,
+				     unsigned long size, pgprot_t prot)
+{
+	return remap_pfn_range(vma, addr, pfn, size, pgprot_decrypted(prot));
+}
+#endif
 
 typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
 			void *data);
@@ -2600,6 +2670,7 @@ enum mf_action_page_type {
 	MF_MSG_POISONED_HUGE,
 	MF_MSG_HUGE,
 	MF_MSG_FREE_HUGE,
+	MF_MSG_NON_PMD_HUGE,
 	MF_MSG_UNMAP_FAILED,
 	MF_MSG_DIRTY_SWAPCACHE,
 	MF_MSG_CLEAN_SWAPCACHE,

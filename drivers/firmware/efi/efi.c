@@ -52,6 +52,9 @@ struct efi __read_mostly efi = {
 	.properties_table	= EFI_INVALID_TABLE_ADDR,
 	.mem_attr_table		= EFI_INVALID_TABLE_ADDR,
 	.rng_seed		= EFI_INVALID_TABLE_ADDR,
+#ifdef CONFIG_LOAD_UEFI_KEYS
+	.mokvar_table		= EFI_INVALID_TABLE_ADDR,
+#endif
 };
 EXPORT_SYMBOL(efi);
 
@@ -72,6 +75,9 @@ static unsigned long *efi_tables[] = {
 	&efi.esrt,
 	&efi.properties_table,
 	&efi.mem_attr_table,
+#ifdef CONFIG_LOAD_UEFI_KEYS
+	&efi.mokvar_table,
+#endif
 };
 
 static bool disable_runtime;
@@ -223,16 +229,21 @@ static void generic_ops_unregister(void)
 	efivars_unregister(&generic_efivars);
 }
 
-#if IS_ENABLED(CONFIG_ACPI)
+#ifdef CONFIG_EFI_CUSTOM_SSDT_OVERLAYS
 #define EFIVAR_SSDT_NAME_MAX	16
 static char efivar_ssdt[EFIVAR_SSDT_NAME_MAX] __initdata;
 static int __init efivar_ssdt_setup(char *str)
 {
+	bool locked_down = kernel_is_locked_down("modifying ACPI tables");
+
+	if (locked_down)
+		return -EPERM;
+
 	if (strlen(str) < sizeof(efivar_ssdt))
 		memcpy(efivar_ssdt, str, strlen(str));
 	else
 		pr_warn("efivar_ssdt: name too long: %s\n", str);
-	return 0;
+	return 1;
 }
 __setup("efivar_ssdt=", efivar_ssdt_setup);
 
@@ -267,6 +278,9 @@ static __init int efivar_ssdt_load(void)
 	unsigned long size;
 	void *data;
 	int ret;
+
+	if (!efivar_ssdt[0])
+		return 0;
 
 	ret = efivar_init(efivar_ssdt_iter, &entries, true, &entries);
 
@@ -464,6 +478,9 @@ static __initdata efi_config_table_type_t common_tables[] = {
 	{EFI_PROPERTIES_TABLE_GUID, "PROP", &efi.properties_table},
 	{EFI_MEMORY_ATTRIBUTES_TABLE_GUID, "MEMATTR", &efi.mem_attr_table},
 	{LINUX_EFI_RANDOM_SEED_TABLE_GUID, "RNG", &efi.rng_seed},
+#ifdef CONFIG_LOAD_UEFI_KEYS
+	{LINUX_EFI_MOK_VARIABLE_TABLE_GUID, "MOKvar", &efi.mokvar_table},
+#endif
 	{NULL_GUID, NULL, NULL},
 };
 
@@ -531,7 +548,7 @@ int __init efi_config_parse_tables(void *config_tables, int count, int sz,
 
 		seed = early_memremap(efi.rng_seed, sizeof(*seed));
 		if (seed != NULL) {
-			size = seed->size;
+			size = min(seed->size, EFI_RANDOM_SEED_SIZE);
 			early_memunmap(seed, sizeof(*seed));
 		} else {
 			pr_err("Could not map UEFI random seed!\n");
@@ -540,7 +557,7 @@ int __init efi_config_parse_tables(void *config_tables, int count, int sz,
 			seed = early_memremap(efi.rng_seed,
 					      sizeof(*seed) + size);
 			if (seed != NULL) {
-				add_device_randomness(seed->bits, seed->size);
+				add_device_randomness(seed->bits, size);
 				early_memunmap(seed, sizeof(*seed) + size);
 				pr_notice("seeding entropy pool\n");
 			} else {
@@ -549,7 +566,7 @@ int __init efi_config_parse_tables(void *config_tables, int count, int sz,
 		}
 	}
 
-	if (efi_enabled(EFI_MEMMAP))
+	if (!IS_ENABLED(CONFIG_X86_32) && efi_enabled(EFI_MEMMAP))
 		efi_memattr_init();
 
 	/* Parse the EFI Properties table if it exists */

@@ -414,7 +414,8 @@ static inline void dsgl_walk_init(struct dsgl_walk *walk,
 	walk->to = (struct phys_sge_pairs *)(dsgl + 1);
 }
 
-static inline void dsgl_walk_end(struct dsgl_walk *walk, unsigned short qid)
+static inline void dsgl_walk_end(struct dsgl_walk *walk, unsigned short qid,
+				 int pci_chan_id)
 {
 	struct cpl_rx_phys_dsgl *phys_cpl;
 
@@ -432,6 +433,7 @@ static inline void dsgl_walk_end(struct dsgl_walk *walk, unsigned short qid)
 	phys_cpl->rss_hdr_int.opcode = CPL_RX_PHYS_ADDR;
 	phys_cpl->rss_hdr_int.qid = htons(qid);
 	phys_cpl->rss_hdr_int.hash_val = 0;
+	phys_cpl->rss_hdr_int.channel = pci_chan_id;
 }
 
 static inline void dsgl_walk_add_page(struct dsgl_walk *walk,
@@ -737,7 +739,7 @@ static inline void create_wreq(struct chcr_context *ctx,
 		FILL_WR_RX_Q_ID(ctx->dev->rx_channel_id, qid,
 				!!lcb, ctx->tx_qidx);
 
-	chcr_req->ulptx.cmd_dest = FILL_ULPTX_CMD_DEST(ctx->dev->tx_channel_id,
+	chcr_req->ulptx.cmd_dest = FILL_ULPTX_CMD_DEST(ctx->tx_chan_id,
 						       qid);
 	chcr_req->ulptx.len = htonl((DIV_ROUND_UP(len16, 16) -
 				     ((sizeof(chcr_req->wreq)) >> 4)));
@@ -1366,16 +1368,23 @@ static int chcr_device_init(struct chcr_context *ctx)
 				    adap->vres.ncrypto_fc);
 		rxq_perchan = u_ctx->lldi.nrxq / u_ctx->lldi.nchan;
 		txq_perchan = ntxq / u_ctx->lldi.nchan;
-		rxq_idx = ctx->dev->tx_channel_id * rxq_perchan;
-		rxq_idx += id % rxq_perchan;
-		txq_idx = ctx->dev->tx_channel_id * txq_perchan;
-		txq_idx += id % txq_perchan;
 		spin_lock(&ctx->dev->lock_chcr_dev);
-		ctx->rx_qidx = rxq_idx;
-		ctx->tx_qidx = txq_idx;
+		ctx->tx_chan_id = ctx->dev->tx_channel_id;
 		ctx->dev->tx_channel_id = !ctx->dev->tx_channel_id;
 		ctx->dev->rx_channel_id = 0;
 		spin_unlock(&ctx->dev->lock_chcr_dev);
+		rxq_idx = ctx->tx_chan_id * rxq_perchan;
+		rxq_idx += id % rxq_perchan;
+		txq_idx = ctx->tx_chan_id * txq_perchan;
+		txq_idx += id % txq_perchan;
+		ctx->rx_qidx = rxq_idx;
+		ctx->tx_qidx = txq_idx;
+		/* Channel Id used by SGE to forward packet to Host.
+		 * Same value should be used in cpl_fw6_pld RSS_CH field
+		 * by FW. Driver programs PCI channel ID to be used in fw
+		 * at the time of queue allocation with value "pi->tx_chan"
+		 */
+		ctx->pci_chan_id = txq_idx / txq_perchan;
 	}
 out:
 	return err;
@@ -2318,6 +2327,7 @@ static inline void chcr_add_aead_dst_ent(struct aead_request *req,
 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
 	struct dsgl_walk dsgl_walk;
 	unsigned int authsize = crypto_aead_authsize(tfm);
+	struct chcr_context *ctx = a_ctx(tfm);
 	u32 temp;
 
 	dsgl_walk_init(&dsgl_walk, phys_cpl);
@@ -2327,7 +2337,7 @@ static inline void chcr_add_aead_dst_ent(struct aead_request *req,
 	dsgl_walk_add_page(&dsgl_walk, IV, &reqctx->iv_dma);
 	temp = req->cryptlen + (op_type ? -authsize : authsize);
 	dsgl_walk_add_sg(&dsgl_walk, req->dst, temp, req->assoclen);
-	dsgl_walk_end(&dsgl_walk, qid);
+	dsgl_walk_end(&dsgl_walk, qid, ctx->pci_chan_id);
 }
 
 static inline void chcr_add_cipher_src_ent(struct ablkcipher_request *req,
@@ -2361,6 +2371,8 @@ static inline void chcr_add_cipher_dst_ent(struct ablkcipher_request *req,
 					   unsigned short qid)
 {
 	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
+	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(wrparam->req);
+	struct chcr_context *ctx = c_ctx(tfm);
 	struct dsgl_walk dsgl_walk;
 
 	dsgl_walk_init(&dsgl_walk, phys_cpl);
@@ -2370,7 +2382,7 @@ static inline void chcr_add_cipher_dst_ent(struct ablkcipher_request *req,
 	reqctx->dstsg = dsgl_walk.last_sg;
 	reqctx->dst_ofst = dsgl_walk.last_sg_len;
 
-	dsgl_walk_end(&dsgl_walk, qid);
+	dsgl_walk_end(&dsgl_walk, qid, ctx->pci_chan_id);
 }
 
 static inline void chcr_add_hash_src_ent(struct ahash_request *req,
@@ -2414,7 +2426,7 @@ static inline int chcr_hash_dma_map(struct device *dev,
 	error = dma_map_sg(dev, req->src, sg_nents(req->src),
 			   DMA_TO_DEVICE);
 	if (!error)
-		return error;
+		return -ENOMEM;
 	req_ctx->is_sg_map = 1;
 	return 0;
 }
@@ -2579,7 +2591,7 @@ static void fill_sec_cpl_for_aead(struct cpl_tx_sec_pdu *sec_cpl,
 	unsigned int mac_mode = CHCR_SCMD_AUTH_MODE_CBCMAC;
 	unsigned int c_id = a_ctx(tfm)->dev->rx_channel_id;
 	unsigned int ccm_xtra;
-	unsigned char tag_offset = 0, auth_offset = 0;
+	unsigned int tag_offset = 0, auth_offset = 0;
 	unsigned int assoclen;
 
 	if (get_aead_subtype(tfm) == CRYPTO_ALG_SUB_TYPE_AEAD_RFC4309)
@@ -2979,9 +2991,6 @@ static int chcr_gcm_setauthsize(struct crypto_aead *tfm, unsigned int authsize)
 		aeadctx->mayverify = VERIFY_SW;
 		break;
 	default:
-
-		  crypto_tfm_set_flags((struct crypto_tfm *) tfm,
-			CRYPTO_TFM_RES_BAD_KEY_LEN);
 		return -EINVAL;
 	}
 	return crypto_aead_setauthsize(aeadctx->sw_cipher, authsize);
@@ -3006,8 +3015,6 @@ static int chcr_4106_4309_setauthsize(struct crypto_aead *tfm,
 		aeadctx->mayverify = VERIFY_HW;
 		break;
 	default:
-		crypto_tfm_set_flags((struct crypto_tfm *)tfm,
-				     CRYPTO_TFM_RES_BAD_KEY_LEN);
 		return -EINVAL;
 	}
 	return crypto_aead_setauthsize(aeadctx->sw_cipher, authsize);
@@ -3048,8 +3055,6 @@ static int chcr_ccm_setauthsize(struct crypto_aead *tfm,
 		aeadctx->mayverify = VERIFY_HW;
 		break;
 	default:
-		crypto_tfm_set_flags((struct crypto_tfm *)tfm,
-				     CRYPTO_TFM_RES_BAD_KEY_LEN);
 		return -EINVAL;
 	}
 	return crypto_aead_setauthsize(aeadctx->sw_cipher, authsize);
@@ -3075,8 +3080,7 @@ static int chcr_ccm_common_setkey(struct crypto_aead *aead,
 		ck_size = CHCR_KEYCTX_CIPHER_KEY_SIZE_256;
 		mk_size = CHCR_KEYCTX_MAC_KEY_SIZE_256;
 	} else {
-		crypto_tfm_set_flags((struct crypto_tfm *)aead,
-				     CRYPTO_TFM_RES_BAD_KEY_LEN);
+		crypto_aead_set_flags(aead, CRYPTO_TFM_RES_BAD_KEY_LEN);
 		aeadctx->enckey_len = 0;
 		return	-EINVAL;
 	}
@@ -3114,8 +3118,7 @@ static int chcr_aead_rfc4309_setkey(struct crypto_aead *aead, const u8 *key,
 	int error;
 
 	if (keylen < 3) {
-		crypto_tfm_set_flags((struct crypto_tfm *)aead,
-				     CRYPTO_TFM_RES_BAD_KEY_LEN);
+		crypto_aead_set_flags(aead, CRYPTO_TFM_RES_BAD_KEY_LEN);
 		aeadctx->enckey_len = 0;
 		return	-EINVAL;
 	}
@@ -3165,8 +3168,7 @@ static int chcr_gcm_setkey(struct crypto_aead *aead, const u8 *key,
 	} else if (keylen == AES_KEYSIZE_256) {
 		ck_size = CHCR_KEYCTX_CIPHER_KEY_SIZE_256;
 	} else {
-		crypto_tfm_set_flags((struct crypto_tfm *)aead,
-				     CRYPTO_TFM_RES_BAD_KEY_LEN);
+		crypto_aead_set_flags(aead, CRYPTO_TFM_RES_BAD_KEY_LEN);
 		pr_err("GCM: Invalid key length %d\n", keylen);
 		ret = -EINVAL;
 		goto out;

@@ -231,6 +231,8 @@ int amdgpu_vce_suspend(struct amdgpu_device *adev)
 {
 	int i;
 
+	cancel_delayed_work_sync(&adev->vce.idle_work);
+
 	if (adev->vce.vcpu_bo == NULL)
 		return 0;
 
@@ -241,7 +243,6 @@ int amdgpu_vce_suspend(struct amdgpu_device *adev)
 	if (i == AMDGPU_MAX_VCE_HANDLES)
 		return 0;
 
-	cancel_delayed_work_sync(&adev->vce.idle_work);
 	/* TODO: suspending running encoding sessions isn't supported */
 	return -EINVAL;
 }
@@ -930,7 +931,7 @@ void amdgpu_vce_ring_emit_fence(struct amdgpu_ring *ring, u64 addr, u64 seq,
 int amdgpu_vce_ring_test_ring(struct amdgpu_ring *ring)
 {
 	struct amdgpu_device *adev = ring->adev;
-	uint32_t rptr = amdgpu_ring_get_rptr(ring);
+	uint32_t rptr;
 	unsigned i;
 	int r, timeout = adev->usec_timeout;
 
@@ -944,6 +945,9 @@ int amdgpu_vce_ring_test_ring(struct amdgpu_ring *ring)
 			  ring->idx, r);
 		return r;
 	}
+
+	rptr = amdgpu_ring_get_rptr(ring);
+
 	amdgpu_ring_write(ring, VCE_CMD_END);
 	amdgpu_ring_commit(ring);
 

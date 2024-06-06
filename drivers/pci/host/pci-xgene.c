@@ -431,7 +431,7 @@ static int xgene_pcie_map_ranges(struct xgene_pcie_port *port,
 		case IORESOURCE_IO:
 			xgene_pcie_setup_ob_reg(port, res, OMR3BARL, io_base,
 						res->start - window->offset);
-			ret = pci_remap_iospace(res, io_base);
+			ret = devm_pci_remap_iospace(dev, res, io_base);
 			if (ret < 0)
 				return ret;
 			break;
@@ -668,7 +668,6 @@ static int xgene_pcie_probe(struct platform_device *pdev)
 
 	bus = bridge->bus;
 
-	pci_scan_child_bus(bus);
 	pci_assign_unassigned_bus_resources(bus);
 	list_for_each_entry(child, &bus->children, node)
 		pcie_bus_configure_settings(child);

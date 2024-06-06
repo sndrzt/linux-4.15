@@ -339,6 +339,57 @@ static void pci_read_bases(struct pci_dev *dev, unsigned int howmany, int rom)
 	}
 }
 
+static void pci_read_bridge_windows(struct pci_dev *bridge)
+{
+	u16 io;
+	u32 pmem, tmp;
+
+	pci_read_config_word(bridge, PCI_IO_BASE, &io);
+	if (!io) {
+		pci_write_config_word(bridge, PCI_IO_BASE, 0xe0f0);
+		pci_read_config_word(bridge, PCI_IO_BASE, &io);
+		pci_write_config_word(bridge, PCI_IO_BASE, 0x0);
+	}
+	if (io)
+		bridge->io_window = 1;
+
+	/*
+	 * DECchip 21050 pass 2 errata: the bridge may miss an address
+	 * disconnect boundary by one PCI data phase.  Workaround: do not
+	 * use prefetching on this device.
+	 */
+	if (bridge->vendor == PCI_VENDOR_ID_DEC && bridge->device == 0x0001)
+		return;
+
+	pci_read_config_dword(bridge, PCI_PREF_MEMORY_BASE, &pmem);
+	if (!pmem) {
+		pci_write_config_dword(bridge, PCI_PREF_MEMORY_BASE,
+					       0xffe0fff0);
+		pci_read_config_dword(bridge, PCI_PREF_MEMORY_BASE, &pmem);
+		pci_write_config_dword(bridge, PCI_PREF_MEMORY_BASE, 0x0);
+	}
+	if (!pmem)
+		return;
+
+	bridge->pref_window = 1;
+
+	if ((pmem & PCI_PREF_RANGE_TYPE_MASK) == PCI_PREF_RANGE_TYPE_64) {
+
+		/*
+		 * Bridge claims to have a 64-bit prefetchable memory
+		 * window; verify that the upper bits are actually
+		 * writable.
+		 */
+		pci_read_config_dword(bridge, PCI_PREF_BASE_UPPER32, &pmem);
+		pci_write_config_dword(bridge, PCI_PREF_BASE_UPPER32,
+				       0xffffffff);
+		pci_read_config_dword(bridge, PCI_PREF_BASE_UPPER32, &tmp);
+		pci_write_config_dword(bridge, PCI_PREF_BASE_UPPER32, pmem);
+		if (tmp)
+			bridge->pref_64_window = 1;
+	}
+}
+
 static void pci_read_bridge_io(struct pci_bus *child)
 {
 	struct pci_dev *dev = child->self;
@@ -516,12 +567,14 @@ static void devm_pci_release_host_bridge_dev(struct device *dev)
 
 	if (bridge->release_fn)
 		bridge->release_fn(bridge);
+
+	pci_free_resource_list(&bridge->windows);
 }
 
 static void pci_release_host_bridge_dev(struct device *dev)
 {
 	devm_pci_release_host_bridge_dev(dev);
-	pci_free_host_bridge(to_pci_host_bridge(dev));
+	kfree(to_pci_host_bridge(dev));
 }
 
 struct pci_host_bridge *pci_alloc_host_bridge(size_t priv)
@@ -587,7 +640,7 @@ const unsigned char pcie_link_speed[] = {
 	PCIE_SPEED_2_5GT,		/* 1 */
 	PCIE_SPEED_5_0GT,		/* 2 */
 	PCIE_SPEED_8_0GT,		/* 3 */
-	PCI_SPEED_UNKNOWN,		/* 4 */
+	PCIE_SPEED_16_0GT,		/* 4 */
 	PCI_SPEED_UNKNOWN,		/* 5 */
 	PCI_SPEED_UNKNOWN,		/* 6 */
 	PCI_SPEED_UNKNOWN,		/* 7 */
@@ -790,9 +843,10 @@ static int pci_register_host_bridge(struct pci_host_bridge *bridge)
 		goto free;
 
 	err = device_register(&bridge->dev);
-	if (err)
+	if (err) {
 		put_device(&bridge->dev);
-
+		goto free;
+	}
 	bus->bridge = get_device(&bridge->dev);
 	device_enable_async_suspend(bus->bridge);
 	pci_set_bus_of_node(bus);
@@ -1294,6 +1348,19 @@ static void set_pcie_thunderbolt(struct pci_dev *dev)
 	}
 }
 
+static void set_pcie_untrusted(struct pci_dev *dev)
+{
+	struct pci_dev *parent;
+
+	/*
+	 * If the upstream bridge is untrusted we treat this device
+	 * untrusted as well.
+	 */
+	parent = pci_upstream_bridge(dev);
+	if (parent && parent->untrusted)
+		dev->untrusted = true;
+}
+
 /**
  * pci_ext_cfg_is_aliased - is ext config space just an alias of std config?
  * @dev: PCI device
@@ -1477,6 +1544,8 @@ int pci_setup_device(struct pci_dev *dev)
 	/* need to have dev->cfg_size ready */
 	set_pcie_thunderbolt(dev);
 
+	set_pcie_untrusted(dev);
+
 	/* "Unknown power state" */
 	dev->current_state = PCI_UNKNOWN;
 
@@ -1485,7 +1554,7 @@ int pci_setup_device(struct pci_dev *dev)
 	/* device class may be changed after fixup */
 	class = dev->class >> 8;
 
-	if (dev->non_compliant_bars) {
+	if (dev->non_compliant_bars && !dev->mmio_always_on) {
 		pci_read_config_word(dev, PCI_COMMAND, &cmd);
 		if (cmd & (PCI_COMMAND_IO | PCI_COMMAND_MEMORY)) {
 			dev_info(&dev->dev, "device has non-compliant BARs; disabling IO/MEM decoding\n");
@@ -1559,6 +1628,7 @@ int pci_setup_device(struct pci_dev *dev)
 		pci_read_irq(dev);
 		dev->transparent = ((dev->class & 0xff) == 1);
 		pci_read_bases(dev, 2, PCI_ROM_ADDRESS1);
+		pci_read_bridge_windows(dev);
 		set_pcie_hotplug_bridge(dev);
 		pos = pci_find_capability(dev, PCI_CAP_ID_SSVID);
 		if (pos) {
@@ -1594,9 +1664,33 @@ int pci_setup_device(struct pci_dev *dev)
 static void pci_configure_mps(struct pci_dev *dev)
 {
 	struct pci_dev *bridge = pci_upstream_bridge(dev);
-	int mps, p_mps, rc;
+	int mps, mpss, p_mps, rc;
 
-	if (!pci_is_pcie(dev) || !bridge || !pci_is_pcie(bridge))
+	if (!pci_is_pcie(dev))
+		return;
+
+	/* MPS and MRRS fields are of type 'RsvdP' for VFs, short-circuit out */
+	if (dev->is_virtfn)
+		return;
+
+	/*
+	 * For Root Complex Integrated Endpoints, program the maximum
+	 * supported value unless limited by the PCIE_BUS_PEER2PEER case.
+	 */
+	if (pci_pcie_type(dev) == PCI_EXP_TYPE_RC_END) {
+		if (pcie_bus_config == PCIE_BUS_PEER2PEER)
+			mps = 128;
+		else
+			mps = 128 << dev->pcie_mpss;
+		rc = pcie_set_mps(dev, mps);
+		if (rc) {
+			pci_warn(dev, "can't set Max Payload Size to %d; if necessary, use \"pci=pcie_bus_safe\" and report a bug\n",
+				 mps);
+		}
+		return;
+	}
+
+	if (!bridge || !pci_is_pcie(bridge))
 		return;
 
 	mps = pcie_get_mps(dev);
@@ -1618,6 +1712,14 @@ static void pci_configure_mps(struct pci_dev *dev)
 	if (pcie_bus_config != PCIE_BUS_DEFAULT)
 		return;
 
+	mpss = 128 << dev->pcie_mpss;
+	if (mpss < p_mps && pci_pcie_type(bridge) == PCI_EXP_TYPE_ROOT_PORT) {
+		pcie_set_mps(bridge, mpss);
+		pci_info(dev, "Upstream bridge's Max Payload Size set to %d (was %d, max %d)\n",
+			 mpss, p_mps, 128 << bridge->pcie_mpss);
+		p_mps = pcie_get_mps(bridge);
+	}
+
 	rc = pcie_set_mps(dev, p_mps);
 	if (rc) {
 		dev_warn(&dev->dev, "can't set Max Payload Size to %d; if necessary, use \"pci=pcie_bus_safe\" and report a bug\n",
@@ -1626,7 +1728,7 @@ static void pci_configure_mps(struct pci_dev *dev)
 	}
 
 	dev_info(&dev->dev, "Max Payload Size set to %d (was %d, max %d)\n",
-		 p_mps, mps, 128 << dev->pcie_mpss);
+		 p_mps, mps, mpss);
 }
 
 static struct hpp_type0 pci_default_type0 = {
@@ -1875,6 +1977,38 @@ static void pci_configure_relaxed_ordering(struct pci_dev *dev)
 	}
 }
 
+static void pci_configure_ltr(struct pci_dev *dev)
+{
+#ifdef CONFIG_PCIEASPM
+	u32 cap;
+	struct pci_dev *bridge;
+
+	if (!pci_is_pcie(dev))
+		return;
+
+	pcie_capability_read_dword(dev, PCI_EXP_DEVCAP2, &cap);
+	if (!(cap & PCI_EXP_DEVCAP2_LTR))
+		return;
+
+	/*
+	 * Software must not enable LTR in an Endpoint unless the Root
+	 * Complex and all intermediate Switches indicate support for LTR.
+	 * PCIe r3.1, sec 6.18.
+	 */
+	if (pci_pcie_type(dev) == PCI_EXP_TYPE_ROOT_PORT)
+		dev->ltr_path = 1;
+	else {
+		bridge = pci_upstream_bridge(dev);
+		if (bridge && bridge->ltr_path)
+			dev->ltr_path = 1;
+	}
+
+	if (dev->ltr_path)
+		pcie_capability_set_word(dev, PCI_EXP_DEVCTL2,
+					 PCI_EXP_DEVCTL2_LTR_EN);
+#endif
+}
+
 static void pci_configure_device(struct pci_dev *dev)
 {
 	struct hotplug_params hpp;
@@ -1883,6 +2017,7 @@ static void pci_configure_device(struct pci_dev *dev)
 	pci_configure_mps(dev);
 	pci_configure_extended_tags(dev, NULL);
 	pci_configure_relaxed_ordering(dev);
+	pci_configure_ltr(dev);
 
 	memset(&hpp, 0, sizeof(hpp));
 	ret = pci_get_hp_params(dev, &hpp);
@@ -2028,6 +2163,7 @@ static struct pci_dev *pci_scan_device(struct pci_bus *bus, int devfn)
 	pci_set_of_node(dev);
 
 	if (pci_setup_device(dev)) {
+		pci_release_of_node(dev);
 		pci_bus_put(dev->bus);
 		kfree(dev);
 		return NULL;
@@ -2215,22 +2351,27 @@ static unsigned next_fn(struct pci_bus *bus, struct pci_dev *dev, unsigned fn)
 
 static int only_one_child(struct pci_bus *bus)
 {
-	struct pci_dev *parent = bus->self;
-
-	if (!parent || !pci_is_pcie(parent))
-		return 0;
-	if (pci_pcie_type(parent) == PCI_EXP_TYPE_ROOT_PORT)
-		return 1;
+	struct pci_dev *bridge = bus->self;
 
 	/*
-	 * PCIe downstream ports are bridges that normally lead to only a
-	 * device 0, but if PCI_SCAN_ALL_PCIE_DEVS is set, scan all
-	 * possible devices, not just device 0.  See PCIe spec r3.0,
-	 * sec 7.3.1.
+	 * Systems with unusual topologies set PCI_SCAN_ALL_PCIE_DEVS so
+	 * we scan for all possible devices, not just Device 0.
 	 */
-	if (parent->has_secondary_link &&
-	    !pci_has_flag(PCI_SCAN_ALL_PCIE_DEVS))
+	if (pci_has_flag(PCI_SCAN_ALL_PCIE_DEVS))
+		return 0;
+
+	/*
+	 * A PCIe Downstream Port normally leads to a Link with only Device
+	 * 0 on it (PCIe spec r3.1, sec 7.3.1).  As an optimization, scan
+	 * only for Device 0 in that situation.
+	 *
+	 * Checking has_secondary_link is a hack to identify Downstream
+	 * Ports because sometimes Switches are configured such that the
+	 * PCIe Port Type labels are backwards.
+	 */
+	if (bridge && pci_is_pcie(bridge) && bridge->has_secondary_link)
 		return 1;
+
 	return 0;
 }
 
@@ -2498,7 +2639,14 @@ static unsigned int pci_scan_child_bus_extend(struct pci_bus *bus,
 	for_each_pci_bridge(dev, bus) {
 		cmax = max;
 		max = pci_scan_bridge_extend(bus, dev, max, 0, 0);
-		used_buses += cmax - max;
+
+		/*
+		 * Reserve one bus for each bridge now to avoid extending
+		 * hotplug bridges too much during the second scan below.
+		 */
+		used_buses++;
+		if (cmax - max > 1)
+			used_buses += cmax - max - 1;
 	}
 
 	/* Scan bridges that need to be reconfigured */
@@ -2519,12 +2667,14 @@ static unsigned int pci_scan_child_bus_extend(struct pci_bus *bus,
 			 * bridges if any.
 			 */
 			buses = available_buses / hotplug_bridges;
-			buses = min(buses, available_buses - used_buses);
+			buses = min(buses, available_buses - used_buses + 1);
 		}
 
 		cmax = max;
 		max = pci_scan_bridge_extend(bus, dev, cmax, buses, 1);
-		used_buses += max - cmax;
+		/* One bus is already accounted so don't add it again */
+		if (max - cmax > 1)
+			used_buses += max - cmax - 1;
 	}
 
 	/*

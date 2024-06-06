@@ -142,9 +142,20 @@ static void __iomem *ring_options_base(struct tb_ring *ring)
 	return io;
 }
 
-static void ring_iowrite16desc(struct tb_ring *ring, u32 value, u32 offset)
+static void ring_iowrite_cons(struct tb_ring *ring, u16 cons)
 {
-	iowrite16(value, ring_desc_base(ring) + offset);
+	/*
+	 * The other 16-bits in the register is read-only and writes to it
+	 * are ignored by the hardware so we can save one ioread32() by
+	 * filling the read-only bits with zeroes.
+	 */
+	iowrite32(cons, ring_desc_base(ring) + 8);
+}
+
+static void ring_iowrite_prod(struct tb_ring *ring, u16 prod)
+{
+	/* See ring_iowrite_cons() above for explanation */
+	iowrite32(prod << 16, ring_desc_base(ring) + 8);
 }
 
 static void ring_iowrite32desc(struct tb_ring *ring, u32 value, u32 offset)
@@ -196,7 +207,10 @@ static void ring_write_descriptors(struct tb_ring *ring)
 			descriptor->sof = frame->sof;
 		}
 		ring->head = (ring->head + 1) % ring->size;
-		ring_iowrite16desc(ring, ring->head, ring->is_tx ? 10 : 8);
+		if (ring->is_tx)
+			ring_iowrite_prod(ring, ring->head);
+		else
+			ring_iowrite_cons(ring, ring->head);
 	}
 }
 
@@ -394,12 +408,23 @@ static int ring_request_msix(struct tb_ring *ring, bool no_suspend)
 
 	ring->vector = ret;
 
-	ring->irq = pci_irq_vector(ring->nhi->pdev, ring->vector);
-	if (ring->irq < 0)
-		return ring->irq;
+	ret = pci_irq_vector(ring->nhi->pdev, ring->vector);
+	if (ret < 0)
+		goto err_ida_remove;
+
+	ring->irq = ret;
 
 	irqflags = no_suspend ? IRQF_NO_SUSPEND : 0;
-	return request_irq(ring->irq, ring_msix, irqflags, "thunderbolt", ring);
+	ret = request_irq(ring->irq, ring_msix, irqflags, "thunderbolt", ring);
+	if (ret)
+		goto err_ida_remove;
+
+	return 0;
+
+err_ida_remove:
+	ida_simple_remove(&nhi->msix_ida, ring->vector);
+
+	return ret;
 }
 
 static void ring_release_msix(struct tb_ring *ring)
@@ -660,7 +685,7 @@ void tb_ring_stop(struct tb_ring *ring)
 
 	ring_iowrite32options(ring, 0, 0);
 	ring_iowrite64desc(ring, 0, 0);
-	ring_iowrite16desc(ring, 0, ring->is_tx ? 10 : 8);
+	ring_iowrite32desc(ring, 0, 8);
 	ring_iowrite32desc(ring, 0, 12);
 	ring->head = 0;
 	ring->tail = 0;
@@ -900,7 +925,32 @@ static void nhi_complete(struct device *dev)
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct tb *tb = pci_get_drvdata(pdev);
 
-	tb_domain_complete(tb);
+	/*
+	 * If we were runtime suspended when system suspend started,
+	 * schedule runtime resume now. It should bring the domain back
+	 * to functional state.
+	 */
+	if (pm_runtime_suspended(&pdev->dev))
+		pm_runtime_resume(&pdev->dev);
+	else
+		tb_domain_complete(tb);
+}
+
+static int nhi_runtime_suspend(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct tb *tb = pci_get_drvdata(pdev);
+
+	return tb_domain_runtime_suspend(tb);
+}
+
+static int nhi_runtime_resume(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct tb *tb = pci_get_drvdata(pdev);
+
+	nhi_enable_int_throttling(tb->nhi);
+	return tb_domain_runtime_resume(tb);
 }
 
 static void nhi_shutdown(struct tb_nhi *nhi)
@@ -1015,6 +1065,14 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	spin_lock_init(&nhi->lock);
 
+	res = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	if (res)
+		res = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+	if (res) {
+		dev_err(&pdev->dev, "failed to set DMA mask\n");
+		return res;
+	}
+
 	pci_set_master(pdev);
 
 	tb = icm_probe(nhi);
@@ -1036,9 +1094,14 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		 */
 		tb_domain_put(tb);
 		nhi_shutdown(nhi);
-		return -EIO;
+		return res;
 	}
 	pci_set_drvdata(pdev, tb);
+
+	pm_runtime_allow(&pdev->dev);
+	pm_runtime_set_autosuspend_delay(&pdev->dev, TB_AUTOSUSPEND_DELAY);
+	pm_runtime_use_autosuspend(&pdev->dev);
+	pm_runtime_put_autosuspend(&pdev->dev);
 
 	return 0;
 }
@@ -1047,6 +1110,10 @@ static void nhi_remove(struct pci_dev *pdev)
 {
 	struct tb *tb = pci_get_drvdata(pdev);
 	struct tb_nhi *nhi = tb->nhi;
+
+	pm_runtime_get_sync(&pdev->dev);
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
+	pm_runtime_forbid(&pdev->dev);
 
 	tb_domain_remove(tb);
 	nhi_shutdown(nhi);
@@ -1064,11 +1131,14 @@ static const struct dev_pm_ops nhi_pm_ops = {
 					    * we just disable hotplug, the
 					    * pci-tunnels stay alive.
 					    */
+	.thaw_noirq = nhi_resume_noirq,
 	.restore_noirq = nhi_resume_noirq,
 	.suspend = nhi_suspend,
 	.freeze = nhi_suspend,
 	.poweroff = nhi_suspend,
 	.complete = nhi_complete,
+	.runtime_suspend = nhi_runtime_suspend,
+	.runtime_resume = nhi_runtime_resume,
 };
 
 static struct pci_device_id nhi_ids[] = {
@@ -1110,6 +1180,8 @@ static struct pci_device_id nhi_ids[] = {
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_C_2C_NHI) },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_C_4C_NHI) },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_C_USBONLY_NHI) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_TITAN_RIDGE_2C_NHI) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_TITAN_RIDGE_4C_NHI) },
 
 	{ 0,}
 };
@@ -1144,5 +1216,5 @@ static void __exit nhi_unload(void)
 	tb_domain_exit();
 }
 
-fs_initcall(nhi_init);
+rootfs_initcall(nhi_init);
 module_exit(nhi_unload);

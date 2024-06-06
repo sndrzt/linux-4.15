@@ -342,7 +342,8 @@ static enum tcpm_state tcpm_default_state(struct tcpm_port *port)
 			return SNK_UNATTACHED;
 		else if (port->try_role == TYPEC_SOURCE)
 			return SRC_UNATTACHED;
-		else if (port->tcpc->config->default_role == TYPEC_SINK)
+		else if (port->tcpc->config &&
+			 port->tcpc->config->default_role == TYPEC_SINK)
 			return SNK_UNATTACHED;
 		/* Fall through to return SRC_UNATTACHED */
 	} else if (port->port_type == TYPEC_PORT_UFP) {
@@ -386,16 +387,17 @@ static void _tcpm_log(struct tcpm_port *port, const char *fmt, va_list args)
 	u64 ts_nsec = local_clock();
 	unsigned long rem_nsec;
 
+	mutex_lock(&port->logbuffer_lock);
 	if (!port->logbuffer[port->logbuffer_head]) {
 		port->logbuffer[port->logbuffer_head] =
 				kzalloc(LOG_BUFFER_ENTRY_SIZE, GFP_KERNEL);
-		if (!port->logbuffer[port->logbuffer_head])
+		if (!port->logbuffer[port->logbuffer_head]) {
+			mutex_unlock(&port->logbuffer_lock);
 			return;
+		}
 	}
 
 	vsnprintf(tmpbuffer, sizeof(tmpbuffer), fmt, args);
-
-	mutex_lock(&port->logbuffer_lock);
 
 	if (tcpm_log_full(port)) {
 		port->logbuffer_head = max(port->logbuffer_head - 1, 0);
@@ -554,7 +556,20 @@ static int tcpm_debugfs_init(struct tcpm_port *port)
 
 static void tcpm_debugfs_exit(struct tcpm_port *port)
 {
+	int i;
+
+	mutex_lock(&port->logbuffer_lock);
+	for (i = 0; i < LOG_BUFFER_ENTRIES; i++) {
+		kfree(port->logbuffer[i]);
+		port->logbuffer[i] = NULL;
+	}
+	mutex_unlock(&port->logbuffer_lock);
+
 	debugfs_remove(port->dentry);
+	if (list_empty(&rootdir->d_subdirs)) {
+		debugfs_remove(rootdir);
+		rootdir = NULL;
+	}
 }
 
 #else
@@ -1993,11 +2008,11 @@ static void tcpm_reset_port(struct tcpm_port *port)
 
 static void tcpm_detach(struct tcpm_port *port)
 {
-	if (!port->attached)
-		return;
-
 	if (tcpm_port_is_disconnected(port))
 		port->hard_reset_count = 0;
+
+	if (!port->attached)
+		return;
 
 	tcpm_reset_port(port);
 }
@@ -2347,11 +2362,7 @@ static void run_state_machine(struct tcpm_port *port)
 				       tcpm_try_src(port) ? SRC_TRY
 							  : SNK_ATTACHED,
 				       0);
-		else
-			/* Wait for VBUS, but not forever */
-			tcpm_set_state(port, PORT_RESET, PD_T_PS_SOURCE_ON);
 		break;
-
 	case SRC_TRY:
 		port->try_src_count++;
 		tcpm_set_cc(port, tcpm_rp_cc(port));
@@ -2439,7 +2450,8 @@ static void run_state_machine(struct tcpm_port *port)
 		    tcpm_port_is_sink(port) &&
 		    time_is_after_jiffies(port->delayed_runtime)) {
 			tcpm_set_state(port, SNK_DISCOVERY,
-				       port->delayed_runtime - jiffies);
+				       jiffies_to_msecs(port->delayed_runtime -
+							jiffies));
 			break;
 		}
 		tcpm_set_state(port, unattached_state(port), 0);
@@ -2540,7 +2552,8 @@ static void run_state_machine(struct tcpm_port *port)
 		break;
 	case SNK_HARD_RESET_SINK_OFF:
 		tcpm_set_vconn(port, false);
-		tcpm_set_charge(port, false);
+		if (port->pd_capable)
+			tcpm_set_charge(port, false);
 		tcpm_set_roles(port, false, TYPEC_SINK, TYPEC_DEVICE);
 		/*
 		 * VBUS may or may not toggle, depending on the adapter.
@@ -2571,6 +2584,12 @@ static void run_state_machine(struct tcpm_port *port)
 		 * Similar, dual-mode ports in source mode should transition
 		 * to PE_SNK_Transition_to_default.
 		 */
+		if (port->pd_capable) {
+			tcpm_set_current_limit(port,
+					       tcpm_get_current_limit(port),
+					       5000);
+			tcpm_set_charge(port, true);
+		}
 		tcpm_set_attached_state(port, true);
 		tcpm_set_state(port, SNK_STARTUP, 0);
 		break;
@@ -2700,7 +2719,7 @@ static void run_state_machine(struct tcpm_port *port)
 		 */
 		tcpm_set_pwr_role(port, TYPEC_SOURCE);
 		tcpm_pd_send_control(port, PD_CTRL_PS_RDY);
-		tcpm_set_state(port, SRC_STARTUP, 0);
+		tcpm_set_state(port, SRC_STARTUP, PD_T_SWAP_SRC_START);
 		break;
 
 	case VCONN_SWAP_ACCEPT:
@@ -3066,7 +3085,8 @@ static void _tcpm_pd_vbus_off(struct tcpm_port *port)
 	case SNK_TRYWAIT_DEBOUNCE:
 		break;
 	case SNK_ATTACH_WAIT:
-		tcpm_set_state(port, SNK_UNATTACHED, 0);
+	case SNK_DEBOUNCED:
+		/* Do nothing, as TCPM is still waiting for vbus to reaach VSAFE5V to connect */
 		break;
 
 	case SNK_NEGOTIATE_CAPABILITIES:
@@ -3332,7 +3352,7 @@ static int tcpm_try_role(const struct typec_capability *cap, int role)
 	mutex_lock(&port->lock);
 	if (tcpc->try_role)
 		ret = tcpc->try_role(tcpc, role);
-	if (!ret && !tcpc->config->try_role_hw)
+	if (!ret && (!tcpc->config || !tcpc->config->try_role_hw))
 		port->try_role = role;
 	port->try_src_count = 0;
 	port->try_snk_count = 0;

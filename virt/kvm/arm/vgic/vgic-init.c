@@ -64,7 +64,7 @@ void kvm_vgic_early_init(struct kvm *kvm)
 	struct vgic_dist *dist = &kvm->arch.vgic;
 
 	INIT_LIST_HEAD(&dist->lpi_list_head);
-	spin_lock_init(&dist->lpi_list_lock);
+	raw_spin_lock_init(&dist->lpi_list_lock);
 }
 
 /**
@@ -276,6 +276,10 @@ int vgic_init(struct kvm *kvm)
 
 	if (vgic_initialized(kvm))
 		return 0;
+
+	/* Are we also in the middle of creating a VCPU? */
+	if (kvm->created_vcpus != atomic_read(&kvm->online_vcpus))
+		return -EBUSY;
 
 	/* freeze the number of spis */
 	if (!dist->nr_spis)

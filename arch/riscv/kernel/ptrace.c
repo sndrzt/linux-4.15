@@ -50,7 +50,7 @@ static int riscv_gpr_set(struct task_struct *target,
 	struct pt_regs *regs;
 
 	regs = task_pt_regs(target);
-	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &regs, 0, -1);
+	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, regs, 0, -1);
 	return ret;
 }
 
@@ -120,6 +120,6 @@ void do_syscall_trace_exit(struct pt_regs *regs)
 
 #ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
 	if (test_thread_flag(TIF_SYSCALL_TRACEPOINT))
-		trace_sys_exit(regs, regs->regs[0]);
+		trace_sys_exit(regs, regs_return_value(regs));
 #endif
 }

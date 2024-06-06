@@ -228,7 +228,7 @@ struct qdio_buffer {
  * @sbal: absolute SBAL address
  */
 struct sl_element {
-	unsigned long sbal;
+	u64 sbal;
 } __attribute__ ((packed));
 
 /**
@@ -262,7 +262,6 @@ struct qdio_outbuf_state {
 	void *user;
 };
 
-#define QDIO_OUTBUF_STATE_FLAG_NONE	0x00
 #define QDIO_OUTBUF_STATE_FLAG_PENDING	0x01
 
 #define CHSC_AC1_INITIATE_INPUTQ	0x80

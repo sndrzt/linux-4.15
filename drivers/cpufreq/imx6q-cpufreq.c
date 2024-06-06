@@ -136,8 +136,13 @@ static int imx6q_set_target(struct cpufreq_policy *policy, unsigned int index)
 	/* Ensure the arm clock divider is what we expect */
 	ret = clk_set_rate(arm_clk, new_freq * 1000);
 	if (ret) {
+		int ret1;
+
 		dev_err(cpu_dev, "failed to set clock rate: %d\n", ret);
-		regulator_set_voltage_tol(arm_reg, volt_old, 0);
+		ret1 = regulator_set_voltage_tol(arm_reg, volt_old, 0);
+		if (ret1)
+			dev_warn(cpu_dev,
+				 "failed to restore vddarm voltage: %d\n", ret1);
 		return ret;
 	}
 
@@ -473,6 +478,7 @@ static struct platform_driver imx6q_cpufreq_platdrv = {
 };
 module_platform_driver(imx6q_cpufreq_platdrv);
 
+MODULE_ALIAS("platform:imx6q-cpufreq");
 MODULE_AUTHOR("Shawn Guo <shawn.guo@linaro.org>");
 MODULE_DESCRIPTION("Freescale i.MX6Q cpufreq driver");
 MODULE_LICENSE("GPL");

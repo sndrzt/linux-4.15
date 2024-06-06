@@ -38,6 +38,7 @@
 
 #include <asm/atomic.h>
 #include <asm/bug.h>
+#include <asm/cpufeature.h>
 #include <asm/daifflags.h>
 #include <asm/debug-monitors.h>
 #include <asm/esr.h>
@@ -57,7 +58,7 @@ static const char *handler[]= {
 	"Error"
 };
 
-int show_unhandled_signals = 1;
+int show_unhandled_signals = 0;
 
 static void dump_backtrace_entry(unsigned long where)
 {
@@ -100,9 +101,15 @@ static void dump_instr(const char *lvl, struct pt_regs *regs)
 void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 {
 	struct stackframe frame;
-	int skip;
+	int skip = 0;
 
 	pr_debug("%s(regs = %p tsk = %p)\n", __func__, regs, tsk);
+
+	if (regs) {
+		if (user_mode(regs))
+			return;
+		skip = 1;
+	}
 
 	if (!tsk)
 		tsk = current;
@@ -124,7 +131,6 @@ void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 	frame.graph = tsk->curr_ret_stack;
 #endif
 
-	skip = !!regs;
 	printk("Call trace:\n");
 	do {
 		/* skip until specified stack frame */
@@ -174,15 +180,13 @@ static int __die(const char *str, int err, struct pt_regs *regs)
 		return ret;
 
 	print_modules();
-	__show_regs(regs);
 	pr_emerg("Process %.*s (pid: %d, stack limit = 0x%p)\n",
 		 TASK_COMM_LEN, tsk->comm, task_pid_nr(tsk),
 		 end_of_stack(tsk));
+	show_regs(regs);
 
-	if (!user_mode(regs)) {
-		dump_backtrace(regs, tsk);
+	if (!user_mode(regs))
 		dump_instr(KERN_EMERG, regs);
-	}
 
 	return ret;
 }
@@ -220,7 +224,7 @@ void die(const char *str, struct pt_regs *regs, int err)
 	raw_spin_unlock_irqrestore(&die_lock, flags);
 
 	if (ret != NOTIFY_STOP)
-		do_exit(SIGSEGV);
+		make_task_dead(SIGSEGV);
 }
 
 void arm64_notify_die(const char *str, struct pt_regs *regs,
@@ -243,7 +247,8 @@ void arm64_skip_faulting_instruction(struct pt_regs *regs, unsigned long size)
 	 * If we were single stepping, we want to get the step exception after
 	 * we return from the trap.
 	 */
-	user_fastforward_single_step(current);
+	if (user_mode(regs))
+		user_fastforward_single_step(current);
 }
 
 static LIST_HEAD(undef_hook);
@@ -275,10 +280,12 @@ static int call_undef_hook(struct pt_regs *regs)
 	int (*fn)(struct pt_regs *regs, u32 instr) = NULL;
 	void __user *pc = (void __user *)instruction_pointer(regs);
 
-	if (!user_mode(regs))
-		return 1;
-
-	if (compat_thumb_mode(regs)) {
+	if (!user_mode(regs)) {
+		__le32 instr_le;
+		if (probe_kernel_address((__force __le32 *)pc, instr_le))
+			goto exit;
+		instr = le32_to_cpu(instr_le);
+	} else if (compat_thumb_mode(regs)) {
 		/* 16-bit Thumb instruction */
 		__le16 instr_le;
 		if (get_user(instr_le, (__le16 __user *)pc))
@@ -372,12 +379,12 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 		return;
 
 	force_signal_inject(SIGILL, ILL_ILLOPC, regs, 0);
+	BUG_ON(!user_mode(regs));
 }
 
-int cpu_enable_cache_maint_trap(void *__unused)
+void cpu_enable_cache_maint_trap(const struct arm64_cpu_capabilities *__unused)
 {
 	config_sctlr_el1(SCTLR_EL1_UCI, 0);
-	return 0;
 }
 
 #define __user_cache_maint(insn, address, res)			\
@@ -526,14 +533,6 @@ asmlinkage long do_ni_syscall(struct pt_regs *regs)
 	}
 #endif
 
-	if (show_unhandled_signals_ratelimited()) {
-		pr_info("%s[%d]: syscall %d\n", current->comm,
-			task_pid_nr(current), regs->syscallno);
-		dump_instr("", regs);
-		if (user_mode(regs))
-			__show_regs(regs);
-	}
-
 	return sys_ni_syscall();
 }
 
@@ -595,7 +594,6 @@ asmlinkage void bad_mode(struct pt_regs *regs, int reason, unsigned int esr)
 		handler[reason], smp_processor_id(), esr,
 		esr_get_class_string(esr));
 
-	die("Oops - bad mode", regs, 0);
 	local_daif_mask();
 	panic("bad mode");
 }
@@ -662,17 +660,58 @@ asmlinkage void handle_bad_stack(struct pt_regs *regs)
 }
 #endif
 
-asmlinkage void do_serror(struct pt_regs *regs, unsigned int esr)
+void __noreturn arm64_serror_panic(struct pt_regs *regs, u32 esr)
 {
-	nmi_enter();
-
 	console_verbose();
 
 	pr_crit("SError Interrupt on CPU%d, code 0x%08x -- %s\n",
 		smp_processor_id(), esr, esr_get_class_string(esr));
-	__show_regs(regs);
+	if (regs)
+		__show_regs(regs);
 
-	panic("Asynchronous SError Interrupt");
+	nmi_panic(regs, "Asynchronous SError Interrupt");
+
+	cpu_park_loop();
+	unreachable();
+}
+
+bool arm64_is_fatal_ras_serror(struct pt_regs *regs, unsigned int esr)
+{
+	u32 aet = arm64_ras_serror_get_severity(esr);
+
+	switch (aet) {
+	case ESR_ELx_AET_CE:	/* corrected error */
+	case ESR_ELx_AET_UEO:	/* restartable, not yet consumed */
+		/*
+		 * The CPU can make progress. We may take UEO again as
+		 * a more severe error.
+		 */
+		return false;
+
+	case ESR_ELx_AET_UEU:	/* Uncorrected Unrecoverable */
+	case ESR_ELx_AET_UER:	/* Uncorrected Recoverable */
+		/*
+		 * The CPU can't make progress. The exception may have
+		 * been imprecise.
+		 */
+		return true;
+
+	case ESR_ELx_AET_UC:	/* Uncontainable or Uncategorized error */
+	default:
+		/* Error has been silently propagated */
+		arm64_serror_panic(regs, esr);
+	}
+}
+
+asmlinkage void do_serror(struct pt_regs *regs, unsigned int esr)
+{
+	nmi_enter();
+
+	/* non-RAS errors are not containable */
+	if (!arm64_is_ras_serror(esr) || arm64_is_fatal_ras_serror(regs, esr))
+		arm64_serror_panic(regs, esr);
+
+	nmi_exit();
 }
 
 void __pte_error(const char *file, int line, unsigned long val)

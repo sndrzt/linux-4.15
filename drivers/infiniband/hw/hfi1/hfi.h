@@ -155,6 +155,8 @@ struct hfi1_ib_stats {
 extern struct hfi1_ib_stats hfi1_stats;
 extern const struct pci_error_handlers hfi1_pci_err_handler;
 
+extern int num_driver_cntrs;
+
 /*
  * First-cut criterion for "device is active" is
  * two thousand dwords combined Tx, Rx traffic per
@@ -1044,6 +1046,8 @@ struct hfi1_devdata {
 
 	char *boardname; /* human readable board info */
 
+	u64 ctx0_seq_drop;
+
 	/* reset value */
 	u64 z_int_counter;
 	u64 z_rcv_limit;
@@ -1353,10 +1357,13 @@ struct mmu_rb_handler;
 
 /* Private data for file operations */
 struct hfi1_filedata {
+	struct srcu_struct pq_srcu;
 	struct hfi1_devdata *dd;
 	struct hfi1_ctxtdata *uctxt;
 	struct hfi1_user_sdma_comp_q *cq;
-	struct hfi1_user_sdma_pkt_q *pq;
+	/* update side lock for SRCU */
+	spinlock_t pq_rcu_lock;
+	struct hfi1_user_sdma_pkt_q __rcu *pq;
 	u16 subctxt;
 	/* for cpu affinity; -1 if none */
 	int rec_cpu_num;
@@ -1402,7 +1409,7 @@ void hfi1_init_pportdata(struct pci_dev *pdev, struct hfi1_pportdata *ppd,
 			 struct hfi1_devdata *dd, u8 hw_pidx, u8 port);
 void hfi1_free_ctxtdata(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd);
 int hfi1_rcd_put(struct hfi1_ctxtdata *rcd);
-void hfi1_rcd_get(struct hfi1_ctxtdata *rcd);
+int hfi1_rcd_get(struct hfi1_ctxtdata *rcd);
 struct hfi1_ctxtdata *hfi1_rcd_get_by_index_safe(struct hfi1_devdata *dd,
 						 u16 ctxt);
 struct hfi1_ctxtdata *hfi1_rcd_get_by_index(struct hfi1_devdata *dd, u16 ctxt);
@@ -1531,13 +1538,13 @@ void set_link_ipg(struct hfi1_pportdata *ppd);
 void process_becn(struct hfi1_pportdata *ppd, u8 sl, u32 rlid, u32 lqpn,
 		  u32 rqpn, u8 svc_type);
 void return_cnp(struct hfi1_ibport *ibp, struct rvt_qp *qp, u32 remote_qpn,
-		u32 pkey, u32 slid, u32 dlid, u8 sc5,
+		u16 pkey, u32 slid, u32 dlid, u8 sc5,
 		const struct ib_grh *old_grh);
 void return_cnp_16B(struct hfi1_ibport *ibp, struct rvt_qp *qp,
-		    u32 remote_qpn, u32 pkey, u32 slid, u32 dlid,
+		    u32 remote_qpn, u16 pkey, u32 slid, u32 dlid,
 		    u8 sc5, const struct ib_grh *old_grh);
 typedef void (*hfi1_handle_cnp)(struct hfi1_ibport *ibp, struct rvt_qp *qp,
-				u32 remote_qpn, u32 pkey, u32 slid, u32 dlid,
+				u32 remote_qpn, u16 pkey, u32 slid, u32 dlid,
 				u8 sc5, const struct ib_grh *old_grh);
 
 #define PKEY_CHECK_INVALID -1
@@ -1774,16 +1781,23 @@ static inline struct hfi1_ibport *rcd_to_iport(struct hfi1_ctxtdata *rcd)
 	return &rcd->ppd->ibport_data;
 }
 
-void hfi1_process_ecn_slowpath(struct rvt_qp *qp, struct hfi1_packet *pkt,
-			       bool do_cnp);
-static inline bool process_ecn(struct rvt_qp *qp, struct hfi1_packet *pkt,
-			       bool do_cnp)
+/**
+ * hfi1_may_ecn - Check whether FECN or BECN processing should be done
+ * @pkt: the packet to be evaluated
+ *
+ * Check whether the FECN or BECN bits in the packet's header are
+ * enabled, depending on packet type.
+ *
+ * This function only checks for FECN and BECN bits. Additional checks
+ * are done in the slowpath (hfi1_process_ecn_slowpath()) in order to
+ * ensure correct handling.
+ */
+static inline bool hfi1_may_ecn(struct hfi1_packet *pkt)
 {
 	struct ib_other_headers *ohdr = pkt->ohdr;
 
 	u32 bth1;
-	bool becn = false;
-	bool fecn = false;
+	bool fecn, becn;
 
 	if (pkt->etype == RHF_RCV_TYPE_BYPASS) {
 		fecn = hfi1_16B_get_fecn(pkt->hdr);
@@ -1793,10 +1807,18 @@ static inline bool process_ecn(struct rvt_qp *qp, struct hfi1_packet *pkt,
 		fecn = bth1 & IB_FECN_SMASK;
 		becn = bth1 & IB_BECN_SMASK;
 	}
-	if (unlikely(fecn || becn)) {
-		hfi1_process_ecn_slowpath(qp, pkt, do_cnp);
-		return fecn;
-	}
+	return fecn || becn;
+}
+
+bool hfi1_process_ecn_slowpath(struct rvt_qp *qp, struct hfi1_packet *pkt,
+			       bool prescan);
+static inline bool process_ecn(struct rvt_qp *qp, struct hfi1_packet *pkt)
+{
+	bool do_work;
+
+	do_work = hfi1_may_ecn(pkt);
+	if (unlikely(do_work))
+		return hfi1_process_ecn_slowpath(qp, pkt, false);
 	return false;
 }
 
@@ -1854,6 +1876,7 @@ struct cc_state *get_cc_state_protected(struct hfi1_pportdata *ppd)
 #define HFI1_HAS_SDMA_TIMEOUT  0x8
 #define HFI1_HAS_SEND_DMA      0x10   /* Supports Send DMA */
 #define HFI1_FORCED_FREEZE     0x80   /* driver forced freeze mode */
+#define HFI1_SHUTDOWN          0x100  /* device is shutting down */
 
 /* IB dword length mask in PBC (lower 11 bits); same for all chips */
 #define HFI1_PBC_LENGTH_MASK                     ((1 << 11) - 1)
@@ -1957,6 +1980,7 @@ void hfi1_verbs_unregister_sysfs(struct hfi1_devdata *dd);
 int qsfp_dump(struct hfi1_pportdata *ppd, char *buf, int len);
 
 int hfi1_pcie_init(struct pci_dev *pdev, const struct pci_device_id *ent);
+void hfi1_clean_up_interrupts(struct hfi1_devdata *dd);
 void hfi1_pcie_cleanup(struct pci_dev *pdev);
 int hfi1_pcie_ddinit(struct hfi1_devdata *dd, struct pci_dev *pdev);
 void hfi1_pcie_ddcleanup(struct hfi1_devdata *);
@@ -2433,7 +2457,7 @@ static inline void hfi1_make_16b_hdr(struct hfi1_16b_header *hdr,
 		((slid >> OPA_16B_SLID_SHIFT) << OPA_16B_SLID_HIGH_SHIFT);
 	lrh2 = (lrh2 & ~OPA_16B_DLID_MASK) |
 		((dlid >> OPA_16B_DLID_SHIFT) << OPA_16B_DLID_HIGH_SHIFT);
-	lrh2 = (lrh2 & ~OPA_16B_PKEY_MASK) | (pkey << OPA_16B_PKEY_SHIFT);
+	lrh2 = (lrh2 & ~OPA_16B_PKEY_MASK) | ((u32)pkey << OPA_16B_PKEY_SHIFT);
 	lrh2 = (lrh2 & ~OPA_16B_L4_MASK) | l4;
 
 	hdr->lrh[0] = lrh0;

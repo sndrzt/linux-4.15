@@ -134,6 +134,9 @@ static const struct {
 /* HDMI N/CTS table */
 #define TMDS_297M 297000
 #define TMDS_296M 296703
+#define TMDS_594M 594000
+#define TMDS_593M 593407
+
 static const struct {
 	int sample_rate;
 	int clock;
@@ -154,6 +157,20 @@ static const struct {
 	{ 176400, TMDS_297M, 18816, 247500 },
 	{ 192000, TMDS_296M, 23296, 281250 },
 	{ 192000, TMDS_297M, 20480, 247500 },
+	{ 44100, TMDS_593M, 8918, 937500 },
+	{ 44100, TMDS_594M, 9408, 990000 },
+	{ 48000, TMDS_593M, 5824, 562500 },
+	{ 48000, TMDS_594M, 6144, 594000 },
+	{ 32000, TMDS_593M, 5824, 843750 },
+	{ 32000, TMDS_594M, 3072, 445500 },
+	{ 88200, TMDS_593M, 17836, 937500 },
+	{ 88200, TMDS_594M, 18816, 990000 },
+	{ 96000, TMDS_593M, 11648, 562500 },
+	{ 96000, TMDS_594M, 12288, 594000 },
+	{ 176400, TMDS_593M, 35672, 937500 },
+	{ 176400, TMDS_594M, 37632, 990000 },
+	{ 192000, TMDS_593M, 23296, 562500 },
+	{ 192000, TMDS_594M, 24576, 594000 },
 };
 
 /* get AUD_CONFIG_PIXEL_CLOCK_HDMI_* value for mode */
@@ -688,13 +705,70 @@ void intel_init_audio_hooks(struct drm_i915_private *dev_priv)
 	}
 }
 
+static void glk_force_audio_cdclk(struct drm_i915_private *dev_priv,
+				  bool enable)
+{
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_atomic_state *state;
+	int ret;
+
+	drm_modeset_acquire_init(&ctx, 0);
+	state = drm_atomic_state_alloc(&dev_priv->drm);
+	if (WARN_ON(!state))
+		return;
+
+	state->acquire_ctx = &ctx;
+
+ retry:
+	to_intel_atomic_state(state)->cdclk.force_min_cdclk_changed = true;
+	to_intel_atomic_state(state)->cdclk.force_min_cdclk =
+		enable ? 2 * 96000 : 0;
+
+	/*
+	 * Protects dev_priv->cdclk.force_min_cdclk
+	 * Need to lock this here in case we have no active pipes
+	 * and thus wouldn't lock it during the commit otherwise.
+	 */
+	ret = drm_modeset_lock(&dev_priv->drm.mode_config.connection_mutex,
+			       &ctx);
+	if (!ret)
+		ret = drm_atomic_commit(state);
+
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
+
+	WARN_ON(ret);
+
+	drm_atomic_state_put(state);
+
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+}
+
 static void i915_audio_component_get_power(struct device *kdev)
 {
+	struct drm_i915_private *dev_priv = kdev_to_i915(kdev);
 	intel_display_power_get(kdev_to_i915(kdev), POWER_DOMAIN_AUDIO);
+
+	/* Force CDCLK to 2*BCLK as long as we need audio to be powered. */
+	if (dev_priv->audio_power_refcount++ == 0)
+		if (IS_CANNONLAKE(dev_priv) || IS_GEMINILAKE(dev_priv))
+			glk_force_audio_cdclk(dev_priv, true);
+
 }
 
 static void i915_audio_component_put_power(struct device *kdev)
 {
+	struct drm_i915_private *dev_priv = kdev_to_i915(kdev);
+
+	/* Stop forcing CDCLK to 2*BCLK if no need for audio to be powered. */
+	if (--dev_priv->audio_power_refcount == 0)
+		if (IS_CANNONLAKE(dev_priv) || IS_GEMINILAKE(dev_priv))
+			glk_force_audio_cdclk(dev_priv, false);
+
 	intel_display_power_put(kdev_to_i915(kdev), POWER_DOMAIN_AUDIO);
 }
 
@@ -704,7 +778,7 @@ static void i915_audio_component_codec_wake_override(struct device *kdev,
 	struct drm_i915_private *dev_priv = kdev_to_i915(kdev);
 	u32 tmp;
 
-	if (!IS_GEN9_BC(dev_priv))
+	if (!IS_GEN9(dev_priv))
 		return;
 
 	i915_audio_component_get_power(kdev);
@@ -754,11 +828,11 @@ static struct intel_encoder *get_saved_enc(struct drm_i915_private *dev_priv,
 {
 	struct intel_encoder *encoder;
 
-	if (WARN_ON(pipe >= INTEL_INFO(dev_priv)->num_pipes))
-		return NULL;
-
 	/* MST */
 	if (pipe >= 0) {
+		if (WARN_ON(pipe >= ARRAY_SIZE(dev_priv->av_enc_map)))
+			return NULL;
+
 		encoder = dev_priv->av_enc_map[pipe];
 		/*
 		 * when bootup, audio driver may not know it is

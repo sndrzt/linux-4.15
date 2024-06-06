@@ -142,11 +142,6 @@ static void reset_numa_cpu_lookup_table(void)
 		numa_cpu_lookup_table[cpu] = -1;
 }
 
-static void update_numa_cpu_lookup_table(unsigned int cpu, int node)
-{
-	numa_cpu_lookup_table[cpu] = node;
-}
-
 static void map_cpu_to_node(int cpu, int node)
 {
 	update_numa_cpu_lookup_table(cpu, node);
@@ -551,7 +546,7 @@ static int numa_setup_cpu(unsigned long lcpu)
 	nid = of_node_to_nid_single(cpu);
 
 out_present:
-	if (nid < 0 || !node_online(nid))
+	if (nid < 0 || !node_possible(nid))
 		nid = first_online_node;
 
 	map_cpu_to_node(lcpu, nid);
@@ -892,6 +887,32 @@ static void __init setup_node_data(int nid, u64 start_pfn, u64 end_pfn)
 	NODE_DATA(nid)->node_spanned_pages = spanned_pages;
 }
 
+static void __init find_possible_nodes(void)
+{
+	struct device_node *rtas;
+	u32 numnodes, i;
+
+	if (min_common_depth <= 0)
+		return;
+
+	rtas = of_find_node_by_path("/rtas");
+	if (!rtas)
+		return;
+
+	if (of_property_read_u32_index(rtas,
+				"ibm,max-associativity-domains",
+				min_common_depth, &numnodes))
+		goto out;
+
+	for (i = 0; i < numnodes; i++) {
+		if (!node_possible(i))
+			node_set(i, node_possible_map);
+	}
+
+out:
+	of_node_put(rtas);
+}
+
 void __init initmem_init(void)
 {
 	int nid, cpu;
@@ -905,11 +926,14 @@ void __init initmem_init(void)
 	memblock_dump_all();
 
 	/*
-	 * Reduce the possible NUMA nodes to the online NUMA nodes,
-	 * since we do not support node hotplug. This ensures that  we
-	 * lower the maximum NUMA node ID to what is actually present.
+	 * Modify the set of possible NUMA nodes to reflect information
+	 * available about the set of online nodes, and the set of nodes
+	 * that we expect to make use of for this platform's affinity
+	 * calculations.
 	 */
 	nodes_and(node_possible_map, node_possible_map, node_online_map);
+
+	find_possible_nodes();
 
 	for_each_online_node(nid) {
 		unsigned long start_pfn, end_pfn;
@@ -957,16 +981,22 @@ static int __init early_numa(char *p)
 }
 early_param("numa", early_numa);
 
-static bool topology_updates_enabled = true;
+/*
+ * The platform can inform us through one of several mechanisms
+ * (post-migration device tree updates, PRRN or VPHN) that the NUMA
+ * assignment of a resource has changed. This controls whether we act
+ * on that. Disabled by default.
+ */
+static bool topology_updates_enabled;
 
 static int __init early_topology_updates(char *p)
 {
 	if (!p)
 		return 0;
 
-	if (!strcmp(p, "off")) {
-		pr_info("Disabling topology updates\n");
-		topology_updates_enabled = false;
+	if (!strcmp(p, "on")) {
+		pr_warn("Caution: enabling topology updates\n");
+		topology_updates_enabled = true;
 	}
 
 	return 0;
@@ -1259,7 +1289,7 @@ static long vphn_get_associativity(unsigned long cpu,
 
 	switch (rc) {
 	case H_FUNCTION:
-		printk(KERN_INFO
+		printk_once(KERN_INFO
 			"VPHN is not supported. Disabling polling...\n");
 		stop_topology_update();
 		break;
@@ -1276,6 +1306,43 @@ static long vphn_get_associativity(unsigned long cpu,
 	}
 
 	return rc;
+}
+
+static inline int find_and_online_cpu_nid(int cpu)
+{
+	__be32 associativity[VPHN_ASSOC_BUFSIZE] = {0};
+	int new_nid;
+
+	/* Use associativity from first thread for all siblings */
+	if (vphn_get_associativity(cpu, associativity))
+		return cpu_to_node(cpu);
+
+	new_nid = associativity_to_nid(associativity);
+	if (new_nid < 0 || !node_possible(new_nid))
+		new_nid = first_online_node;
+
+	if (NODE_DATA(new_nid) == NULL) {
+#ifdef CONFIG_MEMORY_HOTPLUG
+		/*
+		 * Need to ensure that NODE_DATA is initialized for a node from
+		 * available memory (see memblock_alloc_try_nid). If unable to
+		 * init the node, then default to nearest node that has memory
+		 * installed. Skip onlining a node if the subsystems are not
+		 * yet initialized.
+		 */
+		if (!topology_inited || try_online_node(new_nid))
+			new_nid = first_online_node;
+#else
+		/*
+		 * Default to using the nearest node that has memory installed.
+		 * Otherwise, it would be necessary to patch the kernel MM code
+		 * to deal with more memoryless-node error conditions.
+		 */
+		new_nid = first_online_node;
+#endif
+	}
+
+	return new_nid;
 }
 
 /*
@@ -1345,7 +1412,6 @@ int numa_update_cpu_topology(bool cpus_locked)
 {
 	unsigned int cpu, sibling, changed = 0;
 	struct topology_update_data *updates, *ud;
-	__be32 associativity[VPHN_ASSOC_BUFSIZE] = {0};
 	cpumask_t updated_cpus;
 	struct device *dev;
 	int weight, new_nid, i = 0;
@@ -1383,11 +1449,7 @@ int numa_update_cpu_topology(bool cpus_locked)
 			continue;
 		}
 
-		/* Use associativity from first thread for all siblings */
-		vphn_get_associativity(cpu, associativity);
-		new_nid = associativity_to_nid(associativity);
-		if (new_nid < 0 || !node_online(new_nid))
-			new_nid = first_online_node;
+		new_nid = find_and_online_cpu_nid(cpu);
 
 		if (new_nid == numa_cpu_lookup_table[cpu]) {
 			cpumask_andnot(&cpu_associativity_changes_mask,
@@ -1505,17 +1567,11 @@ static struct timer_list topology_timer;
 
 static void reset_topology_timer(void)
 {
-	mod_timer(&topology_timer, jiffies + topology_timer_secs * HZ);
+	if (vphn_enabled)
+		mod_timer(&topology_timer, jiffies + topology_timer_secs * HZ);
 }
 
 #ifdef CONFIG_SMP
-
-static void stage_topology_update(int core_id)
-{
-	cpumask_or(&cpu_associativity_changes_mask,
-		&cpu_associativity_changes_mask, cpu_sibling_mask(core_id));
-	reset_topology_timer();
-}
 
 static int dt_update_callback(struct notifier_block *nb,
 				unsigned long action, void *data)
@@ -1529,7 +1585,7 @@ static int dt_update_callback(struct notifier_block *nb,
 		    !of_prop_cmp(update->prop->name, "ibm,associativity")) {
 			u32 core_id;
 			of_property_read_u32(update->dn, "reg", &core_id);
-			stage_topology_update(core_id);
+			rc = dlpar_cpu_readd(core_id);
 			rc = NOTIFY_OK;
 		}
 		break;
@@ -1550,6 +1606,9 @@ static struct notifier_block dt_update_nb = {
 int start_topology_update(void)
 {
 	int rc = 0;
+
+	if (!topology_updates_enabled)
+		return 0;
 
 	if (firmware_has_feature(FW_FEATURE_PRRN)) {
 		if (!prrn_enabled) {
@@ -1579,6 +1638,9 @@ int start_topology_update(void)
 int stop_topology_update(void)
 {
 	int rc = 0;
+
+	if (!topology_updates_enabled)
+		return 0;
 
 	if (prrn_enabled) {
 		prrn_enabled = 0;
@@ -1626,11 +1688,13 @@ static ssize_t topology_write(struct file *file, const char __user *buf,
 
 	kbuf[read_len] = '\0';
 
-	if (!strncmp(kbuf, "on", 2))
+	if (!strncmp(kbuf, "on", 2)) {
+		topology_updates_enabled = true;
 		start_topology_update();
-	else if (!strncmp(kbuf, "off", 3))
+	} else if (!strncmp(kbuf, "off", 3)) {
 		stop_topology_update();
-	else
+		topology_updates_enabled = false;
+	} else
 		return -EINVAL;
 
 	return count;
@@ -1645,9 +1709,7 @@ static const struct file_operations topology_ops = {
 
 static int topology_update_init(void)
 {
-	/* Do not poll for changes if disabled at boot */
-	if (topology_updates_enabled)
-		start_topology_update();
+	start_topology_update();
 
 	if (vphn_enabled)
 		topology_schedule_update();

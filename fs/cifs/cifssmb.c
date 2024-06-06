@@ -150,8 +150,14 @@ cifs_reconnect_tcon(struct cifs_tcon *tcon, int smb_command)
 	 * greater than cifs socket timeout which is 7 seconds
 	 */
 	while (server->tcpStatus == CifsNeedReconnect) {
-		wait_event_interruptible_timeout(server->response_q,
-			(server->tcpStatus != CifsNeedReconnect), 10 * HZ);
+		rc = wait_event_interruptible_timeout(server->response_q,
+						      (server->tcpStatus != CifsNeedReconnect),
+						      10 * HZ);
+		if (rc < 0) {
+			cifs_dbg(FYI, "%s: aborting reconnect due to a received"
+				 " signal by the process\n", __func__);
+			return -ERESTARTSYS;
+		}
 
 		/* are we still trying to reconnect? */
 		if (server->tcpStatus != CifsNeedReconnect)
@@ -583,10 +589,15 @@ CIFSSMBNegotiate(const unsigned int xid, struct cifs_ses *ses)
 	}
 
 	count = 0;
+	/*
+	 * We know that all the name entries in the protocols array
+	 * are short (< 16 bytes anyway) and are NUL terminated.
+	 */
 	for (i = 0; i < CIFS_NUM_PROT; i++) {
-		strncpy(pSMB->DialectsArray+count, protocols[i].name, 16);
-		count += strlen(protocols[i].name) + 1;
-		/* null at end of source and target buffers anyway */
+		size_t len = strlen(protocols[i].name) + 1;
+
+		memcpy(pSMB->DialectsArray+count, protocols[i].name, len);
+		count += len;
 	}
 	inc_rfc1001_len(pSMB, count);
 	pSMB->ByteCount = cpu_to_le16(count);
@@ -1434,16 +1445,24 @@ cifs_discard_remaining_data(struct TCP_Server_Info *server)
 }
 
 static int
-cifs_readv_discard(struct TCP_Server_Info *server, struct mid_q_entry *mid)
+__cifs_readv_discard(struct TCP_Server_Info *server, struct mid_q_entry *mid,
+		     bool malformed)
 {
 	int length;
-	struct cifs_readdata *rdata = mid->callback_data;
 
 	length = cifs_discard_remaining_data(server);
-	dequeue_mid(mid, rdata->result);
+	dequeue_mid(mid, malformed);
 	mid->resp_buf = server->smallbuf;
 	server->smallbuf = NULL;
 	return length;
+}
+
+static int
+cifs_readv_discard(struct TCP_Server_Info *server, struct mid_q_entry *mid)
+{
+	struct cifs_readdata *rdata = mid->callback_data;
+
+	return  __cifs_readv_discard(server, mid, rdata->result);
 }
 
 int
@@ -1485,12 +1504,23 @@ cifs_readv_receive(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 		return -1;
 	}
 
+	/* set up first two iov for signature check and to get credits */
+	rdata->iov[0].iov_base = buf;
+	rdata->iov[0].iov_len = 4;
+	rdata->iov[1].iov_base = buf + 4;
+	rdata->iov[1].iov_len = server->total_read - 4;
+	cifs_dbg(FYI, "0: iov_base=%p iov_len=%zu\n",
+		 rdata->iov[0].iov_base, rdata->iov[0].iov_len);
+	cifs_dbg(FYI, "1: iov_base=%p iov_len=%zu\n",
+		 rdata->iov[1].iov_base, rdata->iov[1].iov_len);
+
 	/* Was the SMB read successful? */
 	rdata->result = server->ops->map_error(buf, false);
 	if (rdata->result != 0) {
 		cifs_dbg(FYI, "%s: server returned error %d\n",
 			 __func__, rdata->result);
-		return cifs_readv_discard(server, mid);
+		/* normal error on read response */
+		return __cifs_readv_discard(server, mid, false);
 	}
 
 	/* Is there enough to get to the rest of the READ_RSP header? */
@@ -1532,14 +1562,6 @@ cifs_readv_receive(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 			return length;
 		server->total_read += length;
 	}
-
-	/* set up first iov for signature check */
-	rdata->iov[0].iov_base = buf;
-	rdata->iov[0].iov_len = 4;
-	rdata->iov[1].iov_base = buf + 4;
-	rdata->iov[1].iov_len = server->total_read - 4;
-	cifs_dbg(FYI, "0: iov_base=%p iov_len=%u\n",
-		 rdata->iov[0].iov_base, server->total_read);
 
 	/* how much data is in the response? */
 	data_len = server->ops->read_data_length(buf);
@@ -1985,26 +2007,28 @@ cifs_writev_requeue(struct cifs_writedata *wdata)
 
 		wdata2->cfile = find_writable_file(CIFS_I(inode), false);
 		if (!wdata2->cfile) {
-			cifs_dbg(VFS, "No writable handles for inode\n");
+			cifs_dbg(VFS, "No writable handle to retry writepages\n");
 			rc = -EBADF;
-			break;
+		} else {
+			wdata2->pid = wdata2->cfile->pid;
+			rc = server->ops->async_writev(wdata2,
+						       cifs_writedata_release);
 		}
-		wdata2->pid = wdata2->cfile->pid;
-		rc = server->ops->async_writev(wdata2, cifs_writedata_release);
 
 		for (j = 0; j < nr_pages; j++) {
 			unlock_page(wdata2->pages[j]);
-			if (rc != 0 && rc != -EAGAIN) {
+			if (rc != 0 && !is_retryable_error(rc)) {
 				SetPageError(wdata2->pages[j]);
 				end_page_writeback(wdata2->pages[j]);
 				put_page(wdata2->pages[j]);
 			}
 		}
 
+		kref_put(&wdata2->refcount, cifs_writedata_release);
 		if (rc) {
-			kref_put(&wdata2->refcount, cifs_writedata_release);
-			if (rc == -EAGAIN)
+			if (is_retryable_error(rc))
 				continue;
+			i += nr_pages;
 			break;
 		}
 
@@ -2012,7 +2036,15 @@ cifs_writev_requeue(struct cifs_writedata *wdata)
 		i += nr_pages;
 	} while (i < wdata->nr_pages);
 
-	mapping_set_error(inode->i_mapping, rc);
+	/* cleanup remaining pages from the original wdata */
+	for (; i < wdata->nr_pages; i++) {
+		SetPageError(wdata->pages[i]);
+		end_page_writeback(wdata->pages[i]);
+		put_page(wdata->pages[i]);
+	}
+
+	if (rc != 0 && !is_retryable_error(rc))
+		mapping_set_error(inode->i_mapping, rc);
 	kref_put(&wdata->refcount, cifs_writedata_release);
 }
 
@@ -4822,10 +4854,11 @@ CIFSGetDFSRefer(const unsigned int xid, struct cifs_ses *ses,
 	*target_nodes = NULL;
 
 	cifs_dbg(FYI, "In GetDFSRefer the path %s\n", search_name);
-	if (ses == NULL)
+	if (ses == NULL || ses->tcon_ipc == NULL)
 		return -ENODEV;
+
 getDFSRetry:
-	rc = smb_init(SMB_COM_TRANSACTION2, 15, NULL, (void **) &pSMB,
+	rc = smb_init(SMB_COM_TRANSACTION2, 15, ses->tcon_ipc, (void **) &pSMB,
 		      (void **) &pSMBr);
 	if (rc)
 		return rc;
@@ -4833,7 +4866,7 @@ getDFSRetry:
 	/* server pointer checked in called function,
 	but should never be null here anyway */
 	pSMB->hdr.Mid = get_next_mid(ses->server);
-	pSMB->hdr.Tid = ses->ipc_tid;
+	pSMB->hdr.Tid = ses->tcon_ipc->tid;
 	pSMB->hdr.Uid = ses->Suid;
 	if (ses->capabilities & CAP_STATUS32)
 		pSMB->hdr.Flags2 |= SMBFLG2_ERR_STATUS;
@@ -6331,9 +6364,7 @@ SetEARetry:
 	pSMB->InformationLevel =
 		cpu_to_le16(SMB_SET_FILE_EA);
 
-	parm_data =
-		(struct fealist *) (((char *) &pSMB->hdr.Protocol) +
-				       offset);
+	parm_data = (void *)pSMB + offsetof(struct smb_hdr, Protocol) + offset;
 	pSMB->ParameterOffset = cpu_to_le16(param_offset);
 	pSMB->DataOffset = cpu_to_le16(offset);
 	pSMB->SetupCount = 1;

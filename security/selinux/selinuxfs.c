@@ -30,6 +30,7 @@
 #include <linux/uaccess.h>
 #include <linux/kobject.h>
 #include <linux/ctype.h>
+#include <linux/lsm_hooks.h>
 
 /* selinuxfs pseudo filesystem for exporting the security policy API.
    Based on the proc code and the fs/nfsd/nfsctl.c code. */
@@ -1291,15 +1292,20 @@ static int sel_make_bools(void)
 
 		ret = -ENOMEM;
 		inode = sel_make_inode(dir->d_sb, S_IFREG | S_IRUGO | S_IWUSR);
-		if (!inode)
+		if (!inode) {
+			dput(dentry);
 			goto out;
+		}
 
 		ret = -ENAMETOOLONG;
 		len = snprintf(page, PAGE_SIZE, "/%s/%s", BOOL_DIR_NAME, names[i]);
-		if (len >= PAGE_SIZE)
+		if (len >= PAGE_SIZE) {
+			dput(dentry);
+			iput(inode);
 			goto out;
+		}
 
-		isec = (struct inode_security_struct *)inode->i_security;
+		isec = (struct inode_security_struct *)selinux_inode(inode);
 		ret = security_genfs_sid("selinuxfs", page, SECCLASS_FILE, &sid);
 		if (ret) {
 			pr_warn_ratelimited("SELinux: no sid found, defaulting to security isid for %s\n",
@@ -1425,6 +1431,7 @@ static struct avc_cache_stats *sel_avc_get_stat_idx(loff_t *idx)
 		*idx = cpu + 1;
 		return &per_cpu(avc_cache_stats, cpu);
 	}
+	(*idx)++;
 	return NULL;
 }
 
@@ -1505,8 +1512,10 @@ static int sel_make_avc_files(struct dentry *dir)
 			return -ENOMEM;
 
 		inode = sel_make_inode(dir->d_sb, S_IFREG|files[i].mode);
-		if (!inode)
+		if (!inode) {
+			dput(dentry);
 			return -ENOMEM;
+		}
 
 		inode->i_fop = files[i].ops;
 		inode->i_ino = ++sel_last_ino;
@@ -1550,8 +1559,10 @@ static int sel_make_initcon_files(struct dentry *dir)
 			return -ENOMEM;
 
 		inode = sel_make_inode(dir->d_sb, S_IFREG|S_IRUGO);
-		if (!inode)
+		if (!inode) {
+			dput(dentry);
 			return -ENOMEM;
+		}
 
 		inode->i_fop = &sel_initcon_ops;
 		inode->i_ino = i|SEL_INITCON_INO_OFFSET;
@@ -1649,8 +1660,10 @@ static int sel_make_perm_files(char *objclass, int classvalue,
 
 		rc = -ENOMEM;
 		inode = sel_make_inode(dir->d_sb, S_IFREG|S_IRUGO);
-		if (!inode)
+		if (!inode) {
+			dput(dentry);
 			goto out;
+		}
 
 		inode->i_fop = &sel_perm_ops;
 		/* i+1 since perm values are 1-indexed */
@@ -1677,8 +1690,10 @@ static int sel_make_class_dir_entries(char *classname, int index,
 		return -ENOMEM;
 
 	inode = sel_make_inode(dir->d_sb, S_IFREG|S_IRUGO);
-	if (!inode)
+	if (!inode) {
+		dput(dentry);
 		return -ENOMEM;
+	}
 
 	inode->i_fop = &sel_class_ops;
 	inode->i_ino = sel_class_to_ino(index);
@@ -1751,8 +1766,10 @@ static int sel_make_policycap(void)
 			return -ENOMEM;
 
 		inode = sel_make_inode(policycap_dir->d_sb, S_IFREG | S_IRUGO);
-		if (inode == NULL)
+		if (inode == NULL) {
+			dput(dentry);
 			return -ENOMEM;
+		}
 
 		inode->i_fop = &sel_policycap_ops;
 		inode->i_ino = iter | SEL_POLICYCAP_INO_OFFSET;
@@ -1836,11 +1853,13 @@ static int sel_fill_super(struct super_block *sb, void *data, int silent)
 
 	ret = -ENOMEM;
 	inode = sel_make_inode(sb, S_IFCHR | S_IRUGO | S_IWUGO);
-	if (!inode)
+	if (!inode) {
+		dput(dentry);
 		goto err;
+	}
 
 	inode->i_ino = ++sel_last_ino;
-	isec = (struct inode_security_struct *)inode->i_security;
+	isec = (struct inode_security_struct *)selinux_inode(inode);
 	isec->sid = SECINITSID_DEVNULL;
 	isec->sclass = SECCLASS_CHR_FILE;
 	isec->initialized = LABEL_INITIALIZED;

@@ -149,7 +149,6 @@ config MACVTAP
 config IPVLAN
     tristate "IP-VLAN support"
     depends on INET
-    depends on IPV6
     depends on NETFILTER
     depends on NET_L3_MASTER_DEV
     ---help---
@@ -197,8 +196,8 @@ config VXLAN
 
 config GENEVE
        tristate "Generic Network Virtualization Encapsulation"
-       depends on INET && NET_UDP_TUNNEL
-       select NET_IP_TUNNEL
+       depends on INET
+       select NET_UDP_TUNNEL
        select GRO_CELLS
        ---help---
 	  This allows one to create geneve virtual interfaces that provide
@@ -212,8 +211,8 @@ config GENEVE
 
 config GTP
 	tristate "GPRS Tunneling Protocol datapath (GTP-U)"
-	depends on INET && NET_UDP_TUNNEL
-	select NET_IP_TUNNEL
+	depends on INET
+	select NET_UDP_TUNNEL
 	---help---
 	  This allows one to create gtp virtual interfaces that provide
 	  the GPRS Tunneling Protocol datapath (GTP-U). This tunneling protocol

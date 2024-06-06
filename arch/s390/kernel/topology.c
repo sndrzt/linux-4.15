@@ -65,6 +65,13 @@ EXPORT_SYMBOL_GPL(cpu_topology);
 
 cpumask_t cpus_with_topology;
 
+int __cpu_to_node(int cpu)
+{
+	return cpu_topology[cpu].node_id;
+}
+
+EXPORT_SYMBOL(__cpu_to_node);
+
 static cpumask_t cpu_group_map(struct mask_info *info, unsigned int cpu)
 {
 	cpumask_t mask;
@@ -311,7 +318,8 @@ int arch_update_cpu_topology(void)
 	on_each_cpu(__arch_update_dedicated_flag, NULL, 0);
 	for_each_online_cpu(cpu) {
 		dev = get_cpu_device(cpu);
-		kobject_uevent(&dev->kobj, KOBJ_CHANGE);
+		if (dev)
+			kobject_uevent(&dev->kobj, KOBJ_CHANGE);
 	}
 	return rc;
 }
@@ -404,8 +412,7 @@ out:
 	put_online_cpus();
 	return rc ? rc : count;
 }
-static DEVICE_ATTR(dispatching, 0644, dispatching_show,
-			 dispatching_store);
+static DEVICE_ATTR_RW(dispatching);
 
 static ssize_t cpu_polarization_show(struct device *dev,
 				     struct device_attribute *attr, char *buf)

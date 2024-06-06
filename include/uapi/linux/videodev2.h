@@ -225,8 +225,8 @@ enum v4l2_colorspace {
 	/* For RGB colorspaces such as produces by most webcams. */
 	V4L2_COLORSPACE_SRGB          = 8,
 
-	/* AdobeRGB colorspace */
-	V4L2_COLORSPACE_ADOBERGB      = 9,
+	/* opRGB colorspace */
+	V4L2_COLORSPACE_OPRGB         = 9,
 
 	/* BT.2020 colorspace, used for UHDTV. */
 	V4L2_COLORSPACE_BT2020        = 10,
@@ -258,7 +258,7 @@ enum v4l2_xfer_func {
 	 *
 	 * V4L2_COLORSPACE_SRGB, V4L2_COLORSPACE_JPEG: V4L2_XFER_FUNC_SRGB
 	 *
-	 * V4L2_COLORSPACE_ADOBERGB: V4L2_XFER_FUNC_ADOBERGB
+	 * V4L2_COLORSPACE_OPRGB: V4L2_XFER_FUNC_OPRGB
 	 *
 	 * V4L2_COLORSPACE_SMPTE240M: V4L2_XFER_FUNC_SMPTE240M
 	 *
@@ -269,7 +269,7 @@ enum v4l2_xfer_func {
 	V4L2_XFER_FUNC_DEFAULT     = 0,
 	V4L2_XFER_FUNC_709         = 1,
 	V4L2_XFER_FUNC_SRGB        = 2,
-	V4L2_XFER_FUNC_ADOBERGB    = 3,
+	V4L2_XFER_FUNC_OPRGB       = 3,
 	V4L2_XFER_FUNC_SMPTE240M   = 4,
 	V4L2_XFER_FUNC_NONE        = 5,
 	V4L2_XFER_FUNC_DCI_P3      = 6,
@@ -281,7 +281,7 @@ enum v4l2_xfer_func {
  * This depends on the colorspace.
  */
 #define V4L2_MAP_XFER_FUNC_DEFAULT(colsp) \
-	((colsp) == V4L2_COLORSPACE_ADOBERGB ? V4L2_XFER_FUNC_ADOBERGB : \
+	((colsp) == V4L2_COLORSPACE_OPRGB ? V4L2_XFER_FUNC_OPRGB : \
 	 ((colsp) == V4L2_COLORSPACE_SMPTE240M ? V4L2_XFER_FUNC_SMPTE240M : \
 	  ((colsp) == V4L2_COLORSPACE_DCI_P3 ? V4L2_XFER_FUNC_DCI_P3 : \
 	   ((colsp) == V4L2_COLORSPACE_RAW ? V4L2_XFER_FUNC_NONE : \
@@ -295,7 +295,7 @@ enum v4l2_ycbcr_encoding {
 	 *
 	 * V4L2_COLORSPACE_SMPTE170M, V4L2_COLORSPACE_470_SYSTEM_M,
 	 * V4L2_COLORSPACE_470_SYSTEM_BG, V4L2_COLORSPACE_SRGB,
-	 * V4L2_COLORSPACE_ADOBERGB and V4L2_COLORSPACE_JPEG: V4L2_YCBCR_ENC_601
+	 * V4L2_COLORSPACE_OPRGB and V4L2_COLORSPACE_JPEG: V4L2_YCBCR_ENC_601
 	 *
 	 * V4L2_COLORSPACE_REC709 and V4L2_COLORSPACE_DCI_P3: V4L2_YCBCR_ENC_709
 	 *
@@ -362,9 +362,9 @@ enum v4l2_hsv_encoding {
 
 enum v4l2_quantization {
 	/*
-	 * The default for R'G'B' quantization is always full range, except
-	 * for the BT2020 colorspace. For Y'CbCr the quantization is always
-	 * limited range, except for COLORSPACE_JPEG: this is full range.
+	 * The default for R'G'B' quantization is always full range.
+	 * For Y'CbCr the quantization is always limited range, except
+	 * for COLORSPACE_JPEG: this is full range.
 	 */
 	V4L2_QUANTIZATION_DEFAULT     = 0,
 	V4L2_QUANTIZATION_FULL_RANGE  = 1,
@@ -373,14 +373,24 @@ enum v4l2_quantization {
 
 /*
  * Determine how QUANTIZATION_DEFAULT should map to a proper quantization.
- * This depends on whether the image is RGB or not, the colorspace and the
- * Y'CbCr encoding.
+ * This depends on whether the image is RGB or not, the colorspace.
+ * The Y'CbCr encoding is not used anymore, but is still there for backwards
+ * compatibility.
  */
 #define V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb_or_hsv, colsp, ycbcr_enc) \
-	(((is_rgb_or_hsv) && (colsp) == V4L2_COLORSPACE_BT2020) ? \
-	 V4L2_QUANTIZATION_LIM_RANGE : \
-	 (((is_rgb_or_hsv) || (colsp) == V4L2_COLORSPACE_JPEG) ? \
-	 V4L2_QUANTIZATION_FULL_RANGE : V4L2_QUANTIZATION_LIM_RANGE))
+	(((is_rgb_or_hsv) || (colsp) == V4L2_COLORSPACE_JPEG) ? \
+	 V4L2_QUANTIZATION_FULL_RANGE : V4L2_QUANTIZATION_LIM_RANGE)
+
+/*
+ * Deprecated names for opRGB colorspace (IEC 61966-2-5)
+ *
+ * WARNING: Please don't use these deprecated defines in your code, as
+ * there is a chance we have to remove them in the future.
+ */
+#ifndef __KERNEL__
+#define V4L2_COLORSPACE_ADOBERGB V4L2_COLORSPACE_OPRGB
+#define V4L2_XFER_FUNC_ADOBERGB  V4L2_XFER_FUNC_OPRGB
+#endif
 
 enum v4l2_priority {
 	V4L2_PRIORITY_UNSET       = 0,  /* not initialized */
@@ -635,6 +645,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_VC1_ANNEX_L v4l2_fourcc('V', 'C', '1', 'L') /* SMPTE 421M Annex L compliant stream */
 #define V4L2_PIX_FMT_VP8      v4l2_fourcc('V', 'P', '8', '0') /* VP8 */
 #define V4L2_PIX_FMT_VP9      v4l2_fourcc('V', 'P', '9', '0') /* VP9 */
+#define V4L2_PIX_FMT_HEVC     v4l2_fourcc('H', 'E', 'V', 'C') /* HEVC aka H.265 */
 
 /*  Vendor-specific formats   */
 #define V4L2_PIX_FMT_CPIA1    v4l2_fourcc('C', 'P', 'I', 'A') /* cpia1 YUV */
@@ -1393,7 +1404,8 @@ struct v4l2_bt_timings {
 	((bt)->width + V4L2_DV_BT_BLANKING_WIDTH(bt))
 #define V4L2_DV_BT_BLANKING_HEIGHT(bt) \
 	((bt)->vfrontporch + (bt)->vsync + (bt)->vbackporch + \
-	 (bt)->il_vfrontporch + (bt)->il_vsync + (bt)->il_vbackporch)
+	 ((bt)->interlaced ? \
+	  ((bt)->il_vfrontporch + (bt)->il_vsync + (bt)->il_vbackporch) : 0))
 #define V4L2_DV_BT_FRAME_HEIGHT(bt) \
 	((bt)->height + V4L2_DV_BT_BLANKING_HEIGHT(bt))
 

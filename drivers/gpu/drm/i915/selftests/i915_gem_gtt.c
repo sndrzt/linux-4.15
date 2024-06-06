@@ -1055,7 +1055,7 @@ static int igt_ggtt_page(void *arg)
 				       i915_gem_object_get_dma_address(obj, 0),
 				       offset, I915_CACHE_NONE, 0);
 
-		vaddr = io_mapping_map_atomic_wc(&ggtt->mappable, offset);
+		vaddr = io_mapping_map_atomic_wc(&ggtt->iomap, offset);
 		iowrite32(n, vaddr + n);
 		io_mapping_unmap_atomic(vaddr);
 
@@ -1073,7 +1073,7 @@ static int igt_ggtt_page(void *arg)
 				       i915_gem_object_get_dma_address(obj, 0),
 				       offset, I915_CACHE_NONE, 0);
 
-		vaddr = io_mapping_map_atomic_wc(&ggtt->mappable, offset);
+		vaddr = io_mapping_map_atomic_wc(&ggtt->iomap, offset);
 		val = ioread32(vaddr + n);
 		io_mapping_unmap_atomic(vaddr);
 
@@ -1208,7 +1208,7 @@ static int igt_gtt_reserve(void *arg)
 		GEM_BUG_ON(!drm_mm_node_allocated(&vma->node));
 		if (vma->node.start != total ||
 		    vma->node.size != 2*I915_GTT_PAGE_SIZE) {
-			pr_err("i915_gem_gtt_reserve (pass 1) placement failed, found (%llx + %llx), expected (%llx + %lx)\n",
+			pr_err("i915_gem_gtt_reserve (pass 1) placement failed, found (%llx + %llx), expected (%llx + %llx)\n",
 			       vma->node.start, vma->node.size,
 			       total, 2*I915_GTT_PAGE_SIZE);
 			err = -EINVAL;
@@ -1257,7 +1257,7 @@ static int igt_gtt_reserve(void *arg)
 		GEM_BUG_ON(!drm_mm_node_allocated(&vma->node));
 		if (vma->node.start != total ||
 		    vma->node.size != 2*I915_GTT_PAGE_SIZE) {
-			pr_err("i915_gem_gtt_reserve (pass 2) placement failed, found (%llx + %llx), expected (%llx + %lx)\n",
+			pr_err("i915_gem_gtt_reserve (pass 2) placement failed, found (%llx + %llx), expected (%llx + %llx)\n",
 			       vma->node.start, vma->node.size,
 			       total, 2*I915_GTT_PAGE_SIZE);
 			err = -EINVAL;
@@ -1301,7 +1301,7 @@ static int igt_gtt_reserve(void *arg)
 		GEM_BUG_ON(!drm_mm_node_allocated(&vma->node));
 		if (vma->node.start != offset ||
 		    vma->node.size != 2*I915_GTT_PAGE_SIZE) {
-			pr_err("i915_gem_gtt_reserve (pass 3) placement failed, found (%llx + %llx), expected (%llx + %lx)\n",
+			pr_err("i915_gem_gtt_reserve (pass 3) placement failed, found (%llx + %llx), expected (%llx + %llx)\n",
 			       vma->node.start, vma->node.size,
 			       offset, 2*I915_GTT_PAGE_SIZE);
 			err = -EINVAL;

@@ -68,6 +68,7 @@
 #include <asm/sysinfo.h>
 #include <asm/numa.h>
 #include <asm/alternative.h>
+#include <asm/nospec-branch.h>
 #include "entry.h"
 
 /*
@@ -140,7 +141,7 @@ static void __init set_preferred_console(void)
 	else if (CONSOLE_IS_3270)
 		add_preferred_console("tty3270", 0, NULL);
 	else if (CONSOLE_IS_VT220)
-		add_preferred_console("ttyS", 1, NULL);
+		add_preferred_console("ttysclp", 0, NULL);
 	else if (CONSOLE_IS_HVC)
 		add_preferred_console("hvc", 0, NULL);
 }
@@ -300,7 +301,7 @@ early_param("vmalloc", parse_vmalloc);
 
 void *restart_stack __section(.data);
 
-static void __init setup_lowcore(void)
+static void __init setup_lowcore_dat_off(void)
 {
 	struct lowcore *lc;
 
@@ -311,19 +312,16 @@ static void __init setup_lowcore(void)
 	lc = memblock_virt_alloc_low(sizeof(*lc), sizeof(*lc));
 	lc->restart_psw.mask = PSW_KERNEL_BITS;
 	lc->restart_psw.addr = (unsigned long) restart_int_handler;
-	lc->external_new_psw.mask = PSW_KERNEL_BITS |
-		PSW_MASK_DAT | PSW_MASK_MCHECK;
+	lc->external_new_psw.mask = PSW_KERNEL_BITS | PSW_MASK_MCHECK;
 	lc->external_new_psw.addr = (unsigned long) ext_int_handler;
 	lc->svc_new_psw.mask = PSW_KERNEL_BITS |
-		PSW_MASK_DAT | PSW_MASK_IO | PSW_MASK_EXT | PSW_MASK_MCHECK;
+		PSW_MASK_IO | PSW_MASK_EXT | PSW_MASK_MCHECK;
 	lc->svc_new_psw.addr = (unsigned long) system_call;
-	lc->program_new_psw.mask = PSW_KERNEL_BITS |
-		PSW_MASK_DAT | PSW_MASK_MCHECK;
+	lc->program_new_psw.mask = PSW_KERNEL_BITS | PSW_MASK_MCHECK;
 	lc->program_new_psw.addr = (unsigned long) pgm_check_handler;
 	lc->mcck_new_psw.mask = PSW_KERNEL_BITS;
 	lc->mcck_new_psw.addr = (unsigned long) mcck_int_handler;
-	lc->io_new_psw.mask = PSW_KERNEL_BITS |
-		PSW_MASK_DAT | PSW_MASK_MCHECK;
+	lc->io_new_psw.mask = PSW_KERNEL_BITS | PSW_MASK_MCHECK;
 	lc->io_new_psw.addr = (unsigned long) io_int_handler;
 	lc->clock_comparator = clock_comparator_max;
 	lc->kernel_stack = ((unsigned long) &init_thread_union)
@@ -340,7 +338,9 @@ static void __init setup_lowcore(void)
 	lc->preempt_count = S390_lowcore.preempt_count;
 	lc->stfl_fac_list = S390_lowcore.stfl_fac_list;
 	memcpy(lc->stfle_fac_list, S390_lowcore.stfle_fac_list,
-	       MAX_FACILITY_BIT/8);
+	       sizeof(lc->stfle_fac_list));
+	memcpy(lc->alt_stfle_fac_list, S390_lowcore.alt_stfle_fac_list,
+	       sizeof(lc->alt_stfle_fac_list));
 	nmi_alloc_boot_cpu(lc);
 	vdso_alloc_boot_cpu(lc);
 	lc->sync_enter_timer = S390_lowcore.sync_enter_timer;
@@ -377,9 +377,20 @@ static void __init setup_lowcore(void)
 	lc->spinlock_index = 0;
 	arch_spin_lock_setup(0);
 #endif
+	lc->br_r1_trampoline = 0x07f1;	/* br %r1 */
 
 	set_prefix((u32)(unsigned long) lc);
 	lowcore_ptr[0] = lc;
+}
+
+static void __init setup_lowcore_dat_on(void)
+{
+	__ctl_clear_bit(0, 28);
+	S390_lowcore.external_new_psw.mask |= PSW_MASK_DAT;
+	S390_lowcore.svc_new_psw.mask |= PSW_MASK_DAT;
+	S390_lowcore.program_new_psw.mask |= PSW_MASK_DAT;
+	S390_lowcore.io_new_psw.mask |= PSW_MASK_DAT;
+	__ctl_set_bit(0, 28);
 }
 
 static struct resource code_resource = {
@@ -524,7 +535,7 @@ static struct notifier_block kdump_mem_nb = {
 /*
  * Make sure that the area behind memory_end is protected
  */
-static void reserve_memory_end(void)
+static void __init reserve_memory_end(void)
 {
 #ifdef CONFIG_CRASH_DUMP
 	if (ipl_info.type == IPL_TYPE_FCP_DUMP &&
@@ -542,7 +553,7 @@ static void reserve_memory_end(void)
 /*
  * Make sure that oldmem, where the dump is stored, is protected
  */
-static void reserve_oldmem(void)
+static void __init reserve_oldmem(void)
 {
 #ifdef CONFIG_CRASH_DUMP
 	if (OLDMEM_BASE)
@@ -554,7 +565,7 @@ static void reserve_oldmem(void)
 /*
  * Make sure that oldmem, where the dump is stored, is protected
  */
-static void remove_oldmem(void)
+static void __init remove_oldmem(void)
 {
 #ifdef CONFIG_CRASH_DUMP
 	if (OLDMEM_BASE)
@@ -690,9 +701,6 @@ static void __init setup_memory(void)
 		storage_key_init_range(reg->base, reg->base + reg->size);
 	}
 	psw_set_key(PAGE_DEFAULT_KEY);
-
-	/* Only cosmetics */
-	memblock_enforce_memory_limit(memblock_end_of_DRAM());
 }
 
 /*
@@ -774,7 +782,15 @@ static int __init setup_hwcaps(void)
 			elf_hwcap |= HWCAP_S390_VXRS_EXT;
 		if (test_facility(135))
 			elf_hwcap |= HWCAP_S390_VXRS_BCD;
+		if (test_facility(148))
+			elf_hwcap |= HWCAP_S390_VXRS_EXT2;
+		if (test_facility(152))
+			elf_hwcap |= HWCAP_S390_VXRS_PDE;
 	}
+	if (test_facility(150))
+		elf_hwcap |= HWCAP_S390_SORT;
+	if (test_facility(151))
+		elf_hwcap |= HWCAP_S390_DFLT;
 
 	/*
 	 * Guarded storage support HWCAP_S390_GS is bit 12.
@@ -815,7 +831,12 @@ static int __init setup_hwcaps(void)
 		strcpy(elf_platform, "z13");
 		break;
 	case 0x3906:
+	case 0x3907:
 		strcpy(elf_platform, "z14");
+		break;
+	case 0x8561:
+	case 0x8562:
+		strcpy(elf_platform, "z15");
 		break;
 	}
 
@@ -875,6 +896,8 @@ void __init setup_arch(char **cmdline_p)
 		pr_info("Linux is running under KVM in 64-bit mode\n");
 	else if (MACHINE_IS_LPAR)
 		pr_info("Linux is running natively in 64-bit mode\n");
+	else
+		pr_info("Linux is running as a guest in 64-bit mode\n");
 
 	/* Have one command line that is parsed and saved in /proc/cmdline */
 	/* boot_command_line has been already set up in early.c */
@@ -887,6 +910,9 @@ void __init setup_arch(char **cmdline_p)
 	init_mm.end_code = (unsigned long) &_etext;
 	init_mm.end_data = (unsigned long) &_edata;
 	init_mm.brk = (unsigned long) &_end;
+
+	if (IS_ENABLED(CONFIG_EXPOLINE_AUTO))
+		nospec_auto_detect();
 
 	parse_early_param();
 #ifdef CONFIG_CRASH_DUMP
@@ -934,7 +960,7 @@ void __init setup_arch(char **cmdline_p)
 #endif
 
 	setup_resources();
-	setup_lowcore();
+	setup_lowcore_dat_off();
 	smp_fill_possible_mask();
 	cpu_detect_mhz_feature();
         cpu_init();
@@ -947,11 +973,19 @@ void __init setup_arch(char **cmdline_p)
 	 */
         paging_init();
 
+	/*
+	 * After paging_init created the kernel page table, the new PSWs
+	 * in lowcore can now run with DAT enabled.
+	 */
+	setup_lowcore_dat_on();
+
         /* Setup default console */
 	conmode_default();
 	set_preferred_console();
 
 	apply_alternative_instructions();
+	if (IS_ENABLED(CONFIG_EXPOLINE))
+		nospec_init_branches();
 
 	/* Setup zfcpdump support */
 	setup_zfcpdump();

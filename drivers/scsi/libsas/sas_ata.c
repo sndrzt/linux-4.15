@@ -219,15 +219,17 @@ static unsigned int sas_ata_qc_issue(struct ata_queued_cmd *qc)
 		memcpy(task->ata_task.atapi_packet, qc->cdb, qc->dev->cdb_len);
 		task->total_xfer_len = qc->nbytes;
 		task->num_scatter = qc->n_elem;
+		task->data_dir = qc->dma_dir;
+	} else if (!ata_is_data(qc->tf.protocol)) {
+		task->data_dir = DMA_NONE;
 	} else {
 		for_each_sg(qc->sg, sg, qc->n_elem, si)
 			xfer += sg_dma_len(sg);
 
 		task->total_xfer_len = xfer;
 		task->num_scatter = si;
+		task->data_dir = qc->dma_dir;
 	}
-
-	task->data_dir = qc->dma_dir;
 	task->scatter = qc->sg;
 	task->ata_task.retry_count = 1;
 	task->task_state_flags = SAS_TASK_STATE_PENDING;
@@ -642,7 +644,7 @@ void sas_probe_sata(struct asd_sas_port *port)
 		/* if libata could not bring the link up, don't surface
 		 * the device
 		 */
-		if (ata_dev_disabled(sas_to_ata_dev(dev)))
+		if (!ata_dev_enabled(sas_to_ata_dev(dev)))
 			sas_fail_probe(dev, __func__, -ENODEV);
 	}
 
@@ -730,7 +732,6 @@ int sas_discover_sata(struct domain_device *dev)
 	if (res)
 		return res;
 
-	sas_discover_event(dev->port, DISCE_PROBE);
 	return 0;
 }
 

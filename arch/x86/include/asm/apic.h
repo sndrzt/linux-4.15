@@ -10,6 +10,7 @@
 #include <asm/fixmap.h>
 #include <asm/mpspec.h>
 #include <asm/msr.h>
+#include <asm/hardirq.h>
 
 #define ARCH_APICTIMER_STOPS_ON_C3	1
 
@@ -47,7 +48,7 @@ static inline void generic_apic_probe(void)
 
 #ifdef CONFIG_X86_LOCAL_APIC
 
-extern unsigned int apic_verbosity;
+extern int apic_verbosity;
 extern int local_apic_timer_c2_ok;
 
 extern int disable_apic;
@@ -137,6 +138,7 @@ extern void disable_local_APIC(void);
 extern void lapic_shutdown(void);
 extern void sync_Arb_IDs(void);
 extern void init_bsp_APIC(void);
+extern void apic_intr_mode_select(void);
 extern void apic_intr_mode_init(void);
 extern void setup_local_APIC(void);
 extern void init_apic_mappings(void);
@@ -172,8 +174,10 @@ static inline int apic_is_clustered_box(void)
 extern int setup_APIC_eilvt(u8 lvt_off, u8 vector, u8 msg_type, u8 mask);
 extern void lapic_assign_system_vectors(void);
 extern void lapic_assign_legacy_vector(unsigned int isairq, bool replace);
+extern void lapic_update_legacy_vectors(void);
 extern void lapic_online(void);
 extern void lapic_offline(void);
+extern bool apic_needs_pit(void);
 
 #else /* !CONFIG_X86_LOCAL_APIC */
 static inline void lapic_shutdown(void) { }
@@ -183,22 +187,14 @@ static inline void disable_local_APIC(void) { }
 # define setup_boot_APIC_clock x86_init_noop
 # define setup_secondary_APIC_clock x86_init_noop
 static inline void lapic_update_tsc_freq(void) { }
+static inline void apic_intr_mode_select(void) { }
 static inline void apic_intr_mode_init(void) { }
 static inline void lapic_assign_system_vectors(void) { }
 static inline void lapic_assign_legacy_vector(unsigned int i, bool r) { }
+static inline bool apic_needs_pit(void) { return true; }
 #endif /* !CONFIG_X86_LOCAL_APIC */
 
 #ifdef CONFIG_X86_X2APIC
-/*
- * Make previous memory operations globally visible before
- * sending the IPI through x2apic wrmsr. We need a serializing instruction or
- * mfence for this.
- */
-static inline void x2apic_wrmsr_fence(void)
-{
-	asm volatile("mfence" : : : "memory");
-}
-
 static inline void native_apic_msr_write(u32 reg, u32 v)
 {
 	if (reg == APIC_DFR || reg == APIC_ID || reg == APIC_LDR ||
@@ -251,6 +247,7 @@ static inline u64 native_x2apic_icr_read(void)
 
 extern int x2apic_mode;
 extern int x2apic_phys;
+extern void __init x2apic_set_max_apicid(u32 apicid);
 extern void __init check_x2apic(void);
 extern void x2apic_setup(void);
 static inline int x2apic_enabled(void)
@@ -319,7 +316,7 @@ struct apic {
 	/* Probe, setup and smpboot functions */
 	int	(*probe)(void);
 	int	(*acpi_madt_oem_check)(char *oem_id, char *oem_table_id);
-	int	(*apic_id_valid)(int apicid);
+	int	(*apic_id_valid)(u32 apicid);
 	int	(*apic_id_registered)(void);
 
 	bool	(*check_apicid_used)(physid_mask_t *map, int apicid);
@@ -442,6 +439,8 @@ static inline void apic_set_eoi_write(void (*eoi_write)(u32 reg, u32 v)) {}
 
 #endif /* CONFIG_X86_LOCAL_APIC */
 
+extern void apic_ack_irq(struct irq_data *data);
+
 static inline void ack_APIC_irq(void)
 {
 	/*
@@ -449,6 +448,14 @@ static inline void ack_APIC_irq(void)
 	 * ... yummie.
 	 */
 	apic_eoi();
+}
+
+
+static inline bool lapic_vector_set_in_irr(unsigned int vector)
+{
+	u32 irr = apic_read(APIC_IRR + (vector / 32 * 0x10));
+
+	return !!(irr & (1U << (vector % 32)));
 }
 
 static inline unsigned default_get_apic_id(unsigned long x)
@@ -492,7 +499,7 @@ static inline unsigned int read_apic_id(void)
 	return apic->get_apic_id(reg);
 }
 
-extern int default_apic_id_valid(int apicid);
+extern int default_apic_id_valid(u32 apicid);
 extern int default_acpi_madt_oem_check(char *, char *);
 extern void default_setup_apic_routing(void);
 
@@ -516,12 +523,21 @@ extern int default_check_phys_apicid_present(int phys_apicid);
 
 #endif /* CONFIG_X86_LOCAL_APIC */
 
+#ifdef CONFIG_SMP
+bool apic_id_is_primary_thread(unsigned int id);
+bool apic_id_disabled(unsigned int id);
+#else
+static inline bool apic_id_is_primary_thread(unsigned int id) { return false; }
+static inline bool apic_id_disabled(unsigned int id) { return false; }
+#endif
+
 extern void irq_enter(void);
 extern void irq_exit(void);
 
 static inline void entering_irq(void)
 {
 	irq_enter();
+	kvm_set_cpu_l1tf_flush_l1d();
 }
 
 static inline void entering_ack_irq(void)
@@ -534,6 +550,7 @@ static inline void ipi_entering_ack_irq(void)
 {
 	irq_enter();
 	ack_APIC_irq();
+	kvm_set_cpu_l1tf_flush_l1d();
 }
 
 static inline void exiting_irq(void)

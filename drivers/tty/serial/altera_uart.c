@@ -270,16 +270,17 @@ static irqreturn_t altera_uart_interrupt(int irq, void *data)
 {
 	struct uart_port *port = data;
 	struct altera_uart *pp = container_of(port, struct altera_uart, port);
+	unsigned long flags;
 	unsigned int isr;
 
 	isr = altera_uart_readl(port, ALTERA_UART_STATUS_REG) & pp->imr;
 
-	spin_lock(&port->lock);
+	spin_lock_irqsave(&port->lock, flags);
 	if (isr & ALTERA_UART_STATUS_RRDY_MSK)
 		altera_uart_rx_chars(pp);
 	if (isr & ALTERA_UART_STATUS_TRDY_MSK)
 		altera_uart_tx_chars(pp);
-	spin_unlock(&port->lock);
+	spin_unlock_irqrestore(&port->lock, flags);
 
 	return IRQ_RETVAL(isr);
 }
@@ -327,7 +328,7 @@ static int altera_uart_startup(struct uart_port *port)
 
 	/* Enable RX interrupts now */
 	pp->imr = ALTERA_UART_CONTROL_RRDY_MSK;
-	writel(pp->imr, port->membase + ALTERA_UART_CONTROL_REG);
+	altera_uart_writel(port, pp->imr, ALTERA_UART_CONTROL_REG);
 
 	spin_unlock_irqrestore(&port->lock, flags);
 
@@ -343,7 +344,7 @@ static void altera_uart_shutdown(struct uart_port *port)
 
 	/* Disable all interrupts now */
 	pp->imr = 0;
-	writel(pp->imr, port->membase + ALTERA_UART_CONTROL_REG);
+	altera_uart_writel(port, pp->imr, ALTERA_UART_CONTROL_REG);
 
 	spin_unlock_irqrestore(&port->lock, flags);
 
@@ -432,7 +433,7 @@ static void altera_uart_console_putc(struct uart_port *port, int c)
 		 ALTERA_UART_STATUS_TRDY_MSK))
 		cpu_relax();
 
-	writel(c, port->membase + ALTERA_UART_TXDATA_REG);
+	altera_uart_writel(port, c, ALTERA_UART_TXDATA_REG);
 }
 
 static void altera_uart_console_write(struct console *co, const char *s,
@@ -502,13 +503,13 @@ static int __init altera_uart_earlycon_setup(struct earlycon_device *dev,
 		return -ENODEV;
 
 	/* Enable RX interrupts now */
-	writel(ALTERA_UART_CONTROL_RRDY_MSK,
-	       port->membase + ALTERA_UART_CONTROL_REG);
+	altera_uart_writel(port, ALTERA_UART_CONTROL_RRDY_MSK,
+			   ALTERA_UART_CONTROL_REG);
 
 	if (dev->baud) {
 		unsigned int baudclk = port->uartclk / dev->baud;
 
-		writel(baudclk, port->membase + ALTERA_UART_DIVISOR_REG);
+		altera_uart_writel(port, baudclk, ALTERA_UART_DIVISOR_REG);
 	}
 
 	dev->con->write = altera_uart_earlycon_write;

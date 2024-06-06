@@ -146,7 +146,7 @@ static unsigned int mvebu_uart_tx_empty(struct uart_port *port)
 	st = readl(port->membase + UART_STAT);
 	spin_unlock_irqrestore(&port->lock, flags);
 
-	return (st & STAT_TX_FIFO_EMP) ? TIOCSER_TEMT : 0;
+	return (st & STAT_TX_EMP) ? TIOCSER_TEMT : 0;
 }
 
 static unsigned int mvebu_uart_get_mctrl(struct uart_port *port)
@@ -455,7 +455,7 @@ static void mvebu_uart_set_termios(struct uart_port *port,
 				   struct ktermios *old)
 {
 	unsigned long flags;
-	unsigned int baud;
+	unsigned int baud, min_baud, max_baud;
 
 	spin_lock_irqsave(&port->lock, flags);
 
@@ -474,16 +474,21 @@ static void mvebu_uart_set_termios(struct uart_port *port,
 		port->ignore_status_mask |= STAT_RX_RDY(port) | STAT_BRK_ERR;
 
 	/*
+	 * Maximal divisor is 1023 * 16 when using default (x16) scheme.
 	 * Maximum achievable frequency with simple baudrate divisor is 230400.
 	 * Since the error per bit frame would be of more than 15%, achieving
 	 * higher frequencies would require to implement the fractional divisor
 	 * feature.
 	 */
-	baud = uart_get_baud_rate(port, termios, old, 0, 230400);
+	min_baud = DIV_ROUND_UP(port->uartclk, 1023 * 16);
+	max_baud = 230400;
+
+	baud = uart_get_baud_rate(port, termios, old, min_baud, max_baud);
 	if (mvebu_uart_baud_rate_set(port, baud)) {
 		/* No clock available, baudrate cannot be changed */
 		if (old)
-			baud = uart_get_baud_rate(port, old, NULL, 0, 230400);
+			baud = uart_get_baud_rate(port, old, NULL,
+						  min_baud, max_baud);
 	} else {
 		tty_termios_encode_baud_rate(termios, baud, baud);
 		uart_update_timeout(port, termios->c_cflag, baud);
@@ -495,7 +500,7 @@ static void mvebu_uart_set_termios(struct uart_port *port,
 		termios->c_iflag |= old->c_iflag & ~(INPCK | IGNPAR);
 		termios->c_cflag &= CREAD | CBAUD;
 		termios->c_cflag |= old->c_cflag & ~(CREAD | CBAUD);
-		termios->c_lflag = old->c_lflag;
+		termios->c_cflag |= CS8;
 	}
 
 	spin_unlock_irqrestore(&port->lock, flags);
@@ -618,6 +623,14 @@ static void wait_for_xmitr(struct uart_port *port)
 	u32 val;
 
 	readl_poll_timeout_atomic(port->membase + UART_STAT, val,
+				  (val & STAT_TX_RDY(port)), 1, 10000);
+}
+
+static void wait_for_xmite(struct uart_port *port)
+{
+	u32 val;
+
+	readl_poll_timeout_atomic(port->membase + UART_STAT, val,
 				  (val & STAT_TX_EMP), 1, 10000);
 }
 
@@ -648,7 +661,7 @@ static void mvebu_uart_console_write(struct console *co, const char *s,
 
 	uart_console_write(port, s, count, mvebu_uart_console_putchar);
 
-	wait_for_xmitr(port);
+	wait_for_xmite(port);
 
 	if (ier)
 		writel(ier, port->membase + UART_CTRL(port));
@@ -776,7 +789,7 @@ static int mvebu_uart_probe(struct platform_device *pdev)
 
 	port->membase = devm_ioremap_resource(&pdev->dev, reg);
 	if (IS_ERR(port->membase))
-		return -PTR_ERR(port->membase);
+		return PTR_ERR(port->membase);
 
 	mvuart = devm_kzalloc(&pdev->dev, sizeof(struct mvebu_uart),
 			      GFP_KERNEL);

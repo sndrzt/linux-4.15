@@ -543,24 +543,91 @@ void smp_send_debugger_break(void)
 #ifdef CONFIG_KEXEC_CORE
 void crash_send_ipi(void (*crash_ipi_callback)(struct pt_regs *))
 {
+	int cpu;
+
 	smp_send_nmi_ipi(NMI_IPI_ALL_OTHERS, crash_ipi_callback, 1000000);
+	if (kdump_in_progress() && crash_wake_offline) {
+		for_each_present_cpu(cpu) {
+			if (cpu_online(cpu))
+				continue;
+			/*
+			 * crash_ipi_callback will wait for
+			 * all cpus, including offline CPUs.
+			 * We don't care about nmi_ipi_function.
+			 * Offline cpus will jump straight into
+			 * crash_ipi_callback, we can skip the
+			 * entire NMI dance and waiting for
+			 * cpus to clear pending mask, etc.
+			 */
+			do_smp_send_nmi_ipi(cpu);
+		}
+	}
 }
 #endif
 
-static void stop_this_cpu(void *dummy)
+#ifdef CONFIG_NMI_IPI
+static void nmi_stop_this_cpu(struct pt_regs *regs)
 {
-	/* Remove this CPU */
+	/*
+	 * This is a special case because it never returns, so the NMI IPI
+	 * handling would never mark it as done, which makes any later
+	 * smp_send_nmi_ipi() call spin forever. Mark it done now.
+	 *
+	 * IRQs are already hard disabled by the smp_handle_nmi_ipi.
+	 */
 	set_cpu_online(smp_processor_id(), false);
 
-	local_irq_disable();
+	nmi_ipi_lock();
+	nmi_ipi_busy_count--;
+	nmi_ipi_unlock();
+
+	spin_begin();
 	while (1)
-		;
+		spin_cpu_relax();
 }
 
 void smp_send_stop(void)
 {
+	smp_send_nmi_ipi(NMI_IPI_ALL_OTHERS, nmi_stop_this_cpu, 1000000);
+}
+
+#else /* CONFIG_NMI_IPI */
+
+static void stop_this_cpu(void *dummy)
+{
+	hard_irq_disable();
+
+	/*
+	 * Offlining CPUs in stop_this_cpu can result in scheduler warnings,
+	 * (see commit de6e5d38417e), but printk_safe_flush_on_panic() wants
+	 * to know other CPUs are offline before it breaks locks to flush
+	 * printk buffers, in case we panic()ed while holding the lock.
+	 */
+	set_cpu_online(smp_processor_id(), false);
+
+	spin_begin();
+	while (1)
+		spin_cpu_relax();
+}
+
+void smp_send_stop(void)
+{
+	static bool stopped = false;
+
+	/*
+	 * Prevent waiting on csd lock from a previous smp_send_stop.
+	 * This is racy, but in general callers try to do the right
+	 * thing and only fire off one smp_send_stop (e.g., see
+	 * kernel/panic.c)
+	 */
+	if (stopped)
+		return;
+
+	stopped = true;
+
 	smp_call_function(stop_this_cpu, NULL, 0);
 }
+#endif /* CONFIG_NMI_IPI */
 
 struct thread_info *current_set[NR_CPUS];
 
@@ -985,6 +1052,9 @@ void start_secondary(void *unused)
 
 	vdso_getcpu_init();
 #endif
+	set_numa_node(numa_cpu_lookup_table[cpu]);
+	set_numa_mem(local_memory_node(numa_cpu_lookup_table[cpu]));
+
 	/* Update topology CPU masks */
 	add_cpu_to_masks(cpu);
 
@@ -994,9 +1064,6 @@ void start_secondary(void *unused)
 	 */
 	if (!cpumask_equal(cpu_l2_cache_mask(cpu), cpu_sibling_mask(cpu)))
 		shared_caches = true;
-
-	set_numa_node(numa_cpu_lookup_table[cpu]);
-	set_numa_mem(local_memory_node(numa_cpu_lookup_table[cpu]));
 
 	smp_wmb();
 	notify_cpu_starting(cpu);
@@ -1009,10 +1076,12 @@ void start_secondary(void *unused)
 	BUG();
 }
 
+#ifdef CONFIG_PROFILING
 int setup_profiling_timer(unsigned int multiplier)
 {
 	return 0;
 }
+#endif
 
 #ifdef CONFIG_SCHED_SMT
 /* cpumask of CPUs with asymetric SMT dependancy */

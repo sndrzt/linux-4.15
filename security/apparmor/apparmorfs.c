@@ -126,17 +126,22 @@ static int aafs_show_path(struct seq_file *seq, struct dentry *dentry)
 	return 0;
 }
 
-static void aafs_evict_inode(struct inode *inode)
+static void aafs_i_callback(struct rcu_head *head)
 {
-	truncate_inode_pages_final(&inode->i_data);
-	clear_inode(inode);
+	struct inode *inode = container_of(head, struct inode, i_rcu);
 	if (S_ISLNK(inode->i_mode))
 		kfree(inode->i_link);
+	free_inode_nonrcu(inode);
+}
+
+static void aafs_destroy_inode(struct inode *inode)
+{
+	call_rcu(&inode->i_rcu, aafs_i_callback);
 }
 
 static const struct super_operations aafs_super_ops = {
 	.statfs = simple_statfs,
-	.evict_inode = aafs_evict_inode,
+	.destroy_inode = aafs_destroy_inode,
 	.show_path = aafs_show_path,
 };
 
@@ -313,6 +318,7 @@ static struct dentry *aafs_create_dir(const char *name, struct dentry *parent)
  * @name: name of dentry to create
  * @parent: parent directory for this dentry
  * @target: if symlink, symlink target string
+ * @private: private data
  * @iops: struct of inode_operations that should be used
  *
  * If @target parameter is %NULL, then the @iops parameter needs to be
@@ -321,17 +327,17 @@ static struct dentry *aafs_create_dir(const char *name, struct dentry *parent)
 static struct dentry *aafs_create_symlink(const char *name,
 					  struct dentry *parent,
 					  const char *target,
+					  void *private,
 					  const struct inode_operations *iops)
 {
 	struct dentry *dent;
 	char *link = NULL;
 
 	if (target) {
-		link = kstrdup(target, GFP_KERNEL);
 		if (!link)
 			return ERR_PTR(-ENOMEM);
 	}
-	dent = aafs_create(name, S_IFLNK | 0444, parent, NULL, link, NULL,
+	dent = aafs_create(name, S_IFLNK | 0444, parent, private, link, NULL,
 			   iops);
 	if (IS_ERR(dent))
 		kfree(link);
@@ -358,6 +364,7 @@ static void aafs_remove(struct dentry *dentry)
 			simple_rmdir(dir, dentry);
 		else
 			simple_unlink(dir, dentry);
+		d_delete(dentry);
 		dput(dentry);
 	}
 	inode_unlock(dir);
@@ -420,7 +427,7 @@ static ssize_t policy_update(u32 mask, const char __user *buf, size_t size,
 	 */
 	error = aa_may_manage_policy(label, ns, mask);
 	if (error)
-		return error;
+		goto end_section;
 
 	data = aa_simple_write_to_buffer(buf, size, size, pos);
 	error = PTR_ERR(data);
@@ -428,6 +435,7 @@ static ssize_t policy_update(u32 mask, const char __user *buf, size_t size,
 		error = aa_replace_profiles(ns, label, mask, data);
 		aa_put_loaddata(data);
 	}
+end_section:
 	end_current_label_crit_section(label);
 
 	return error;
@@ -867,8 +875,10 @@ static struct multi_transaction *multi_transaction_new(struct file *file,
 	if (!t)
 		return ERR_PTR(-ENOMEM);
 	kref_init(&t->count);
-	if (copy_from_user(t->data, buf, size))
+	if (copy_from_user(t->data, buf, size)) {
+		put_multi_transaction(t);
 		return ERR_PTR(-EFAULT);
+	}
 
 	return t;
 }
@@ -1189,9 +1199,7 @@ static int seq_ns_level_show(struct seq_file *seq, void *v)
 static int seq_ns_name_show(struct seq_file *seq, void *v)
 {
 	struct aa_label *label = begin_current_label_crit_section();
-
-	seq_printf(seq, "%s\n", aa_ns_name(labels_ns(label),
-					   labels_ns(label), true));
+	seq_printf(seq, "%s\n", labels_ns(label)->base.name);
 	end_current_label_crit_section(label);
 
 	return 0;
@@ -1484,25 +1492,96 @@ static int profile_depth(struct aa_profile *profile)
 	return depth;
 }
 
-static int gen_symlink_name(char *buffer, size_t bsize, int depth,
-			    const char *dirname, const char *fname)
+static char *gen_symlink_name(int depth, const char *dirname, const char *fname)
 {
+	char *buffer, *s;
 	int error;
+	int size = depth * 6 + strlen(dirname) + strlen(fname) + 11;
+
+	s = buffer = kmalloc(size, GFP_KERNEL);
+	if (!buffer)
+		return ERR_PTR(-ENOMEM);
 
 	for (; depth > 0; depth--) {
-		if (bsize < 7)
-			return -ENAMETOOLONG;
-		strcpy(buffer, "../../");
-		buffer += 6;
-		bsize -= 6;
+		strcpy(s, "../../");
+		s += 6;
+		size -= 6;
 	}
 
-	error = snprintf(buffer, bsize, "raw_data/%s/%s", dirname, fname);
-	if (error >= bsize || error < 0)
-		return -ENAMETOOLONG;
+	error = snprintf(s, size, "raw_data/%s/%s", dirname, fname);
+	if (error >= size || error < 0) {
+		kfree(buffer);
+		return ERR_PTR(-ENAMETOOLONG);
+	}
 
-	return 0;
+	return buffer;
 }
+
+static void rawdata_link_cb(void *arg)
+{
+	kfree(arg);
+}
+
+static const char *rawdata_get_link_base(struct dentry *dentry,
+					 struct inode *inode,
+					 struct delayed_call *done,
+					 const char *name)
+{
+	struct aa_proxy *proxy = inode->i_private;
+	struct aa_label *label;
+	struct aa_profile *profile;
+	char *target;
+	int depth;
+
+	if (!dentry)
+		return ERR_PTR(-ECHILD);
+
+	label = aa_get_label_rcu(&proxy->label);
+	profile = labels_profile(label);
+	depth = profile_depth(profile);
+	target = gen_symlink_name(depth, profile->rawdata->name, name);
+	aa_put_label(label);
+
+	if (IS_ERR(target))
+		return target;
+
+	set_delayed_call(done, rawdata_link_cb, target);
+
+	return target;
+}
+
+static const char *rawdata_get_link_sha1(struct dentry *dentry,
+					 struct inode *inode,
+					 struct delayed_call *done)
+{
+	return rawdata_get_link_base(dentry, inode, done, "sha1");
+}
+
+static const char *rawdata_get_link_abi(struct dentry *dentry,
+					struct inode *inode,
+					struct delayed_call *done)
+{
+	return rawdata_get_link_base(dentry, inode, done, "abi");
+}
+
+static const char *rawdata_get_link_data(struct dentry *dentry,
+					 struct inode *inode,
+					 struct delayed_call *done)
+{
+	return rawdata_get_link_base(dentry, inode, done, "raw_data");
+}
+
+static const struct inode_operations rawdata_link_sha1_iops = {
+	.get_link	= rawdata_get_link_sha1,
+};
+
+static const struct inode_operations rawdata_link_abi_iops = {
+	.get_link	= rawdata_get_link_abi,
+};
+static const struct inode_operations rawdata_link_data_iops = {
+	.get_link	= rawdata_get_link_data,
+};
+
 
 /*
  * Requires: @profile->ns->lock held
@@ -1574,34 +1653,28 @@ int __aafs_profile_mkdir(struct aa_profile *profile, struct dentry *parent)
 	}
 
 	if (profile->rawdata) {
-		char target[64];
-		int depth = profile_depth(profile);
-
-		error = gen_symlink_name(target, sizeof(target), depth,
-					 profile->rawdata->name, "sha1");
-		if (error < 0)
-			goto fail2;
-		dent = aafs_create_symlink("raw_sha1", dir, target, NULL);
+		dent = aafs_create_symlink("raw_sha1", dir, NULL,
+					   profile->label.proxy,
+					   &rawdata_link_sha1_iops);
 		if (IS_ERR(dent))
 			goto fail;
+		aa_get_proxy(profile->label.proxy);
 		profile->dents[AAFS_PROF_RAW_HASH] = dent;
 
-		error = gen_symlink_name(target, sizeof(target), depth,
-					 profile->rawdata->name, "abi");
-		if (error < 0)
-			goto fail2;
-		dent = aafs_create_symlink("raw_abi", dir, target, NULL);
+		dent = aafs_create_symlink("raw_abi", dir, NULL,
+					   profile->label.proxy,
+					   &rawdata_link_abi_iops);
 		if (IS_ERR(dent))
 			goto fail;
+		aa_get_proxy(profile->label.proxy);
 		profile->dents[AAFS_PROF_RAW_ABI] = dent;
 
-		error = gen_symlink_name(target, sizeof(target), depth,
-					 profile->rawdata->name, "raw_data");
-		if (error < 0)
-			goto fail2;
-		dent = aafs_create_symlink("raw_data", dir, target, NULL);
+		dent = aafs_create_symlink("raw_data", dir, NULL,
+					   profile->label.proxy,
+					   &rawdata_link_data_iops);
 		if (IS_ERR(dent))
 			goto fail;
+		aa_get_proxy(profile->label.proxy);
 		profile->dents[AAFS_PROF_RAW_DATA] = dent;
 	}
 
@@ -1895,9 +1968,6 @@ fail2:
 	return error;
 }
 
-
-#define list_entry_is_head(pos, head, member) (&pos->member == (head))
-
 /**
  * __next_ns - find the next namespace to list
  * @root: root namespace to stop search at (NOT NULL)
@@ -2187,6 +2257,11 @@ static struct aa_sfs_entry aa_sfs_entry_ns[] = {
 	{ }
 };
 
+static struct aa_sfs_entry aa_sfs_entry_dbus[] = {
+	AA_SFS_FILE_STRING("mask", "acquire send receive"),
+	{ }
+};
+
 static struct aa_sfs_entry aa_sfs_entry_query_label[] = {
 	AA_SFS_FILE_STRING("perms", "allow deny audit quiet"),
 	AA_SFS_FILE_BOOLEAN("data",		1),
@@ -2202,6 +2277,7 @@ static struct aa_sfs_entry aa_sfs_entry_features[] = {
 	AA_SFS_DIR("policy",			aa_sfs_entry_policy),
 	AA_SFS_DIR("domain",			aa_sfs_entry_domain),
 	AA_SFS_DIR("file",			aa_sfs_entry_file),
+	AA_SFS_DIR("network",			aa_sfs_entry_network),
 	AA_SFS_DIR("mount",			aa_sfs_entry_mount),
 	AA_SFS_DIR("namespaces",		aa_sfs_entry_ns),
 	AA_SFS_FILE_U64("capability",		VFS_CAP_FLAGS_MASK),
@@ -2209,6 +2285,7 @@ static struct aa_sfs_entry aa_sfs_entry_features[] = {
 	AA_SFS_DIR("caps",			aa_sfs_entry_caps),
 	AA_SFS_DIR("ptrace",			aa_sfs_entry_ptrace),
 	AA_SFS_DIR("signal",			aa_sfs_entry_signal),
+	AA_SFS_DIR("dbus",			aa_sfs_entry_dbus),
 	AA_SFS_DIR("query",			aa_sfs_entry_query),
 	{ }
 };

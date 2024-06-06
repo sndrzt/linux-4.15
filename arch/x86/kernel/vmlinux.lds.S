@@ -36,12 +36,12 @@ OUTPUT_FORMAT(CONFIG_OUTPUT_FORMAT, CONFIG_OUTPUT_FORMAT, CONFIG_OUTPUT_FORMAT)
 #ifdef CONFIG_X86_32
 OUTPUT_ARCH(i386)
 ENTRY(phys_startup_32)
-jiffies = jiffies_64;
 #else
 OUTPUT_ARCH(i386:x86-64)
 ENTRY(phys_startup_64)
-jiffies_64 = jiffies;
 #endif
+
+jiffies = jiffies_64;
 
 #if defined(CONFIG_X86_64)
 /*
@@ -55,19 +55,22 @@ jiffies_64 = jiffies;
  * so we can enable protection checks as well as retain 2MB large page
  * mappings for kernel text.
  */
-#define X64_ALIGN_RODATA_BEGIN	. = ALIGN(HPAGE_SIZE);
+#define X86_ALIGN_RODATA_BEGIN	. = ALIGN(HPAGE_SIZE);
 
-#define X64_ALIGN_RODATA_END					\
+#define X86_ALIGN_RODATA_END					\
 		. = ALIGN(HPAGE_SIZE);				\
-		__end_rodata_hpage_align = .;
+		__end_rodata_hpage_align = .;			\
+		__end_rodata_aligned = .;
 
 #define ALIGN_ENTRY_TEXT_BEGIN	. = ALIGN(PMD_SIZE);
 #define ALIGN_ENTRY_TEXT_END	. = ALIGN(PMD_SIZE);
 
 #else
 
-#define X64_ALIGN_RODATA_BEGIN
-#define X64_ALIGN_RODATA_END
+#define X86_ALIGN_RODATA_BEGIN
+#define X86_ALIGN_RODATA_END					\
+		. = ALIGN(PAGE_SIZE);				\
+		__end_rodata_aligned = .;
 
 #define ALIGN_ENTRY_TEXT_BEGIN
 #define ALIGN_ENTRY_TEXT_END
@@ -118,9 +121,11 @@ SECTIONS
 
 #ifdef CONFIG_X86_64
 		. = ALIGN(PAGE_SIZE);
+		VMLINUX_SYMBOL(__entry_trampoline_start) = .;
 		_entry_trampoline = .;
 		*(.entry_trampoline)
 		. = ALIGN(PAGE_SIZE);
+		VMLINUX_SYMBOL(__entry_trampoline_end) = .;
 		ASSERT(. - _entry_trampoline == PAGE_SIZE, "entry trampoline is too big");
 #endif
 
@@ -140,9 +145,9 @@ SECTIONS
 
 	/* .text should occupy whole number of pages */
 	. = ALIGN(PAGE_SIZE);
-	X64_ALIGN_RODATA_BEGIN
+	X86_ALIGN_RODATA_BEGIN
 	RO_DATA(PAGE_SIZE)
-	X64_ALIGN_RODATA_END
+	X86_ALIGN_RODATA_END
 
 	/* Data */
 	.data : AT(ADDR(.data) - LOAD_OFFSET) {
@@ -350,7 +355,8 @@ SECTIONS
 	.bss : AT(ADDR(.bss) - LOAD_OFFSET) {
 		__bss_start = .;
 		*(.bss..page_aligned)
-		*(.bss)
+		. = ALIGN(PAGE_SIZE);
+		*(BSS_MAIN)
 		. = ALIGN(PAGE_SIZE);
 		__bss_stop = .;
 	}
@@ -388,7 +394,7 @@ SECTIONS
  * Per-cpu symbols which need to be offset from __per_cpu_load
  * for the boot processor.
  */
-#define INIT_PER_CPU(x) init_per_cpu__##x = x + __per_cpu_load
+#define INIT_PER_CPU(x) init_per_cpu__##x = ABSOLUTE(x) + __per_cpu_load
 INIT_PER_CPU(gdt_page);
 INIT_PER_CPU(irq_stack_union);
 

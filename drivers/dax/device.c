@@ -19,6 +19,7 @@
 #include <linux/dax.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
+#include <linux/mman.h>
 #include "dax-private.h"
 #include "dax.h"
 
@@ -188,14 +189,16 @@ static int check_vma(struct dev_dax *dev_dax, struct vm_area_struct *vma,
 
 	/* prevent private mappings from being established */
 	if ((vma->vm_flags & VM_MAYSHARE) != VM_MAYSHARE) {
-		dev_info(dev, "%s: %s: fail, attempted private mapping\n",
+		dev_info_ratelimited(dev,
+				"%s: %s: fail, attempted private mapping\n",
 				current->comm, func);
 		return -EINVAL;
 	}
 
 	mask = dax_region->align - 1;
 	if (vma->vm_start & mask || vma->vm_end & mask) {
-		dev_info(dev, "%s: %s: fail, unaligned vma (%#lx - %#lx, %#lx)\n",
+		dev_info_ratelimited(dev,
+				"%s: %s: fail, unaligned vma (%#lx - %#lx, %#lx)\n",
 				current->comm, func, vma->vm_start, vma->vm_end,
 				mask);
 		return -EINVAL;
@@ -203,13 +206,15 @@ static int check_vma(struct dev_dax *dev_dax, struct vm_area_struct *vma,
 
 	if ((dax_region->pfn_flags & (PFN_DEV|PFN_MAP)) == PFN_DEV
 			&& (vma->vm_flags & VM_DONTCOPY) == 0) {
-		dev_info(dev, "%s: %s: fail, dax range requires MADV_DONTFORK\n",
+		dev_info_ratelimited(dev,
+				"%s: %s: fail, dax range requires MADV_DONTFORK\n",
 				current->comm, func);
 		return -EINVAL;
 	}
 
 	if (!vma_is_dax(vma)) {
-		dev_info(dev, "%s: %s: fail, vma is not DAX capable\n",
+		dev_info_ratelimited(dev,
+				"%s: %s: fail, vma is not DAX capable\n",
 				current->comm, func);
 		return -EINVAL;
 	}
@@ -330,8 +335,7 @@ static int __dev_dax_pmd_fault(struct dev_dax *dev_dax, struct vm_fault *vmf)
 
 	pfn = phys_to_pfn_t(phys, dax_region->pfn_flags);
 
-	return vmf_insert_pfn_pmd(vmf->vma, vmf->address, vmf->pmd, pfn,
-			vmf->flags & FAULT_FLAG_WRITE);
+	return vmf_insert_pfn_pmd(vmf, pfn, vmf->flags & FAULT_FLAG_WRITE);
 }
 
 #ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
@@ -382,8 +386,7 @@ static int __dev_dax_pud_fault(struct dev_dax *dev_dax, struct vm_fault *vmf)
 
 	pfn = phys_to_pfn_t(phys, dax_region->pfn_flags);
 
-	return vmf_insert_pfn_pud(vmf->vma, vmf->address, vmf->pud, pfn,
-			vmf->flags & FAULT_FLAG_WRITE);
+	return vmf_insert_pfn_pud(vmf, pfn, vmf->flags & FAULT_FLAG_WRITE);
 }
 #else
 static int __dev_dax_pud_fault(struct dev_dax *dev_dax, struct vm_fault *vmf)
@@ -534,6 +537,7 @@ static const struct file_operations dax_fops = {
 	.release = dax_release,
 	.get_unmapped_area = dax_get_unmapped_area,
 	.mmap = dax_mmap,
+	.mmap_supported_flags = MAP_SYNC,
 };
 
 static void dev_dax_release(struct device *dev)

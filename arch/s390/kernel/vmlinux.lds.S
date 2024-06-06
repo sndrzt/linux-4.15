@@ -123,6 +123,21 @@ SECTIONS
 		*(.altinstr_replacement)
 	}
 
+	/*
+	 * Table with the patch locations to undo expolines
+	*/
+	. = ALIGN(4);
+	.nospec_call_table : {
+		__nospec_call_start = . ;
+		*(.s390_indirect*)
+		__nospec_call_end = . ;
+	}
+	.nospec_return_table : {
+		__nospec_return_start = . ;
+		*(.s390_return*)
+		__nospec_return_end = . ;
+	}
+
 	/* early.c uses stsi, which requires page aligned data. */
 	. = ALIGN(PAGE_SIZE);
 	INIT_DATA_SECTION(0x100)

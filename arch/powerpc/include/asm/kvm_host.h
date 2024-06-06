@@ -294,6 +294,7 @@ struct kvm_arch {
 #ifdef CONFIG_PPC_BOOK3S_64
 	struct list_head spapr_tce_tables;
 	struct list_head rtas_tokens;
+	struct mutex rtas_token_lock;
 	DECLARE_BITMAP(enabled_hcalls, MAX_HCALL_OPCODE/4 + 1);
 #endif
 #ifdef CONFIG_KVM_MPIC
@@ -610,6 +611,7 @@ struct kvm_vcpu_arch {
 	u64 tfhar;
 	u64 texasr;
 	u64 tfiar;
+	u64 orig_texasr;
 
 	u32 cr_tm;
 	u64 xer_tm;
@@ -690,6 +692,7 @@ struct kvm_vcpu_arch {
 	u8 mmio_vsx_offset;
 	u8 mmio_vsx_copy_type;
 	u8 mmio_vsx_tx_sx_enabled;
+	u8 mmio_vmx_copy_nums;
 	u8 osi_needed;
 	u8 osi_enabled;
 	u8 papr_enabled;
@@ -800,6 +803,7 @@ struct kvm_vcpu_arch {
 #define KVM_MMIO_REG_QPR	0x0040
 #define KVM_MMIO_REG_FQPR	0x0060
 #define KVM_MMIO_REG_VSX	0x0080
+#define KVM_MMIO_REG_VMX	0x00c0
 
 #define __KVM_HAVE_ARCH_WQP
 #define __KVM_HAVE_CREATE_DEVICE
@@ -807,7 +811,7 @@ struct kvm_vcpu_arch {
 static inline void kvm_arch_hardware_disable(void) {}
 static inline void kvm_arch_hardware_unsetup(void) {}
 static inline void kvm_arch_sync_events(struct kvm *kvm) {}
-static inline void kvm_arch_memslots_updated(struct kvm *kvm, struct kvm_memslots *slots) {}
+static inline void kvm_arch_memslots_updated(struct kvm *kvm, u64 gen) {}
 static inline void kvm_arch_flush_shadow_all(struct kvm *kvm) {}
 static inline void kvm_arch_sched_in(struct kvm_vcpu *vcpu, int cpu) {}
 static inline void kvm_arch_exit(void) {}

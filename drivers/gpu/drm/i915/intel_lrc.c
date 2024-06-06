@@ -418,7 +418,8 @@ static u64 execlists_update_context(struct drm_i915_gem_request *rq)
 
 	reg_state[CTX_RING_TAIL+1] = intel_ring_set_tail(rq->ring, rq->tail);
 
-	/* True 32b PPGTT with dynamic page allocation: update PDP
+	/*
+	 * True 32b PPGTT with dynamic page allocation: update PDP
 	 * registers and point the unallocated PDPs to scratch page.
 	 * PML4 is allocated during ppgtt init, so this is not needed
 	 * in 48-bit mode.
@@ -426,6 +427,22 @@ static u64 execlists_update_context(struct drm_i915_gem_request *rq)
 	if (ppgtt && !i915_vm_is_48bit(&ppgtt->base))
 		execlists_update_context_pdps(ppgtt, reg_state);
 
+	/*
+	 * Make sure the context image is complete before we submit it to HW.
+	 *
+	 * Ostensibly, writes (including the WCB) should be flushed prior to
+	 * an uncached write such as our mmio register access, the empirical
+	 * evidence (esp. on Braswell) suggests that the WC write into memory
+	 * may not be visible to the HW prior to the completion of the UC
+	 * register write and that we may begin execution from the context
+	 * before its image is complete leading to invalid PD chasing.
+	 *
+	 * Furthermore, Braswell, at least, wants a full mb to be sure that
+	 * the writes are coherent in memory (visible to the GPU) prior to
+	 * execution, and not just visible to other CPUs (as is the result of
+	 * wmb).
+	 */
+	mb();
 	return ce->lrc_desc;
 }
 
@@ -1060,12 +1077,34 @@ static void execlists_schedule(struct drm_i915_gem_request *request, int prio)
 	spin_unlock_irq(&engine->timeline->lock);
 }
 
+static int __context_pin(struct i915_gem_context *ctx, struct i915_vma *vma)
+{
+	unsigned int flags;
+	int err;
+
+	/*
+	 * Clear this page out of any CPU caches for coherent swap-in/out.
+	 * We only want to do this on the first bind so that we do not stall
+	 * on an active context (which by nature is already on the GPU).
+	 */
+	if (!(vma->flags & I915_VMA_GLOBAL_BIND)) {
+		err = i915_gem_object_set_to_gtt_domain(vma->obj, true);
+		if (err)
+			return err;
+	}
+
+	flags = PIN_GLOBAL | PIN_HIGH;
+	if (ctx->ggtt_offset_bias)
+		flags |= PIN_OFFSET_BIAS | ctx->ggtt_offset_bias;
+
+	return i915_vma_pin(vma, 0, GEN8_LR_CONTEXT_ALIGN, flags);
+}
+
 static struct intel_ring *
 execlists_context_pin(struct intel_engine_cs *engine,
 		      struct i915_gem_context *ctx)
 {
 	struct intel_context *ce = &ctx->engine[engine->id];
-	unsigned int flags;
 	void *vaddr;
 	int ret;
 
@@ -1082,11 +1121,7 @@ execlists_context_pin(struct intel_engine_cs *engine,
 	}
 	GEM_BUG_ON(!ce->state);
 
-	flags = PIN_GLOBAL | PIN_HIGH;
-	if (ctx->ggtt_offset_bias)
-		flags |= PIN_OFFSET_BIAS | ctx->ggtt_offset_bias;
-
-	ret = i915_vma_pin(ce->state, 0, GEN8_LR_CONTEXT_ALIGN, flags);
+	ret = __context_pin(ctx, ce->state);
 	if (ret)
 		goto err;
 
@@ -1106,9 +1141,7 @@ execlists_context_pin(struct intel_engine_cs *engine,
 	ce->lrc_reg_state[CTX_RING_BUFFER_START+1] =
 		i915_ggtt_offset(ce->ring->vma);
 
-	ce->state->obj->mm.dirty = true;
 	ce->state->obj->pin_global++;
-
 	i915_gem_context_get(ctx);
 out:
 	return ce->ring;
@@ -1147,7 +1180,6 @@ static int execlists_request_alloc(struct drm_i915_gem_request *request)
 	struct intel_engine_cs *engine = request->engine;
 	struct intel_context *ce = &request->ctx->engine[engine->id];
 	u32 *cs;
-	int ret;
 
 	GEM_BUG_ON(!ce->pin_count);
 
@@ -1160,14 +1192,6 @@ static int execlists_request_alloc(struct drm_i915_gem_request *request)
 	cs = intel_ring_begin(request, 0);
 	if (IS_ERR(cs))
 		return PTR_ERR(cs);
-
-	if (!ce->initialised) {
-		ret = engine->init_context(request);
-		if (ret)
-			return ret;
-
-		ce->initialised = true;
-	}
 
 	/* Note that after this point, we have committed to using
 	 * this request as it is being used to both track the
@@ -1277,24 +1301,31 @@ static u32 *gen9_init_indirectctx_bb(struct intel_engine_cs *engine, u32 *batch)
 	/* WaFlushCoherentL3CacheLinesAtContextSwitch:skl,bxt,glk */
 	batch = gen8_emit_flush_coherentl3_wa(engine, batch);
 
+	*batch++ = MI_LOAD_REGISTER_IMM(3);
+
 	/* WaDisableGatherAtSetShaderCommonSlice:skl,bxt,kbl,glk */
-	*batch++ = MI_LOAD_REGISTER_IMM(1);
 	*batch++ = i915_mmio_reg_offset(COMMON_SLICE_CHICKEN2);
 	*batch++ = _MASKED_BIT_DISABLE(
 			GEN9_DISABLE_GATHER_AT_SET_SHADER_COMMON_SLICE);
+
+	/* BSpec: 11391 */
+	*batch++ = i915_mmio_reg_offset(FF_SLICE_CHICKEN);
+	*batch++ = _MASKED_BIT_ENABLE(FF_SLICE_CHICKEN_CL_PROVOKING_VERTEX_FIX);
+
+	/* BSpec: 11299 */
+	*batch++ = i915_mmio_reg_offset(_3D_CHICKEN3);
+	*batch++ = _MASKED_BIT_ENABLE(_3D_CHICKEN_SF_PROVOKING_VERTEX_FIX);
+
 	*batch++ = MI_NOOP;
 
-	/* WaClearSlmSpaceAtContextSwitch:kbl */
-	/* Actual scratch location is at 128 bytes offset */
-	if (IS_KBL_REVID(engine->i915, 0, KBL_REVID_A0)) {
-		batch = gen8_emit_pipe_control(batch,
-					       PIPE_CONTROL_FLUSH_L3 |
-					       PIPE_CONTROL_GLOBAL_GTT_IVB |
-					       PIPE_CONTROL_CS_STALL |
-					       PIPE_CONTROL_QW_WRITE,
-					       i915_ggtt_offset(engine->scratch)
-					       + 2 * CACHELINE_BYTES);
-	}
+	/* WaClearSlmSpaceAtContextSwitch:skl,bxt,kbl,glk,cfl */
+	batch = gen8_emit_pipe_control(batch,
+				       PIPE_CONTROL_FLUSH_L3 |
+				       PIPE_CONTROL_GLOBAL_GTT_IVB |
+				       PIPE_CONTROL_CS_STALL |
+				       PIPE_CONTROL_QW_WRITE,
+				       i915_ggtt_offset(engine->scratch) +
+				       2 * CACHELINE_BYTES);
 
 	/* WaMediaPoolStateCmdInWABB:bxt,glk */
 	if (HAS_POOLED_EU(engine->i915)) {
@@ -2109,7 +2140,6 @@ static void execlists_init_reg_state(u32 *regs,
 
 	CTX_REG(regs, CTX_CONTEXT_CONTROL, RING_CONTEXT_CONTROL(engine),
 		_MASKED_BIT_ENABLE(CTX_CTRL_INHIBIT_SYN_CTX_SWITCH |
-				   CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT |
 				   (HAS_RESOURCE_STREAMER(dev_priv) ?
 				   CTX_CTRL_RS_CTX_ENABLE : 0)));
 	CTX_REG(regs, CTX_RING_HEAD, RING_HEAD(base), 0);
@@ -2186,6 +2216,7 @@ populate_lr_context(struct i915_gem_context *ctx,
 		    struct intel_ring *ring)
 {
 	void *vaddr;
+	u32 *regs;
 	int ret;
 
 	ret = i915_gem_object_set_to_cpu_domain(ctx_obj, true);
@@ -2202,11 +2233,31 @@ populate_lr_context(struct i915_gem_context *ctx,
 	}
 	ctx_obj->mm.dirty = true;
 
+	if (engine->default_state) {
+		/*
+		 * We only want to copy over the template context state;
+		 * skipping over the headers reserved for GuC communication,
+		 * leaving those as zero.
+		 */
+		const unsigned long start = LRC_HEADER_PAGES * PAGE_SIZE;
+		void *defaults;
+
+		defaults = i915_gem_object_pin_map(engine->default_state,
+						   I915_MAP_WB);
+		if (IS_ERR(defaults))
+			return PTR_ERR(defaults);
+
+		memcpy(vaddr + start, defaults + start, engine->context_size);
+		i915_gem_object_unpin_map(engine->default_state);
+	}
+
 	/* The second page of the context object contains some fields which must
 	 * be set up prior to the first execution. */
-
-	execlists_init_reg_state(vaddr + LRC_STATE_PN * PAGE_SIZE,
-				 ctx, engine, ring);
+	regs = vaddr + LRC_STATE_PN * PAGE_SIZE;
+	execlists_init_reg_state(regs, ctx, engine, ring);
+	if (!engine->default_state)
+		regs[CTX_CONTEXT_CONTROL + 1] |=
+			_MASKED_BIT_ENABLE(CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT);
 
 	i915_gem_object_unpin_map(ctx_obj);
 
@@ -2259,7 +2310,6 @@ static int execlists_context_deferred_alloc(struct i915_gem_context *ctx,
 
 	ce->ring = ring;
 	ce->state = vma;
-	ce->initialised |= engine->init_context == NULL;
 
 	return 0;
 

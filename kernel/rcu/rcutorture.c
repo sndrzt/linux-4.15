@@ -1435,7 +1435,7 @@ static int rcu_torture_stall(void *args)
 		VERBOSE_TOROUT_STRING("rcu_torture_stall end holdoff");
 	}
 	if (!kthread_should_stop()) {
-		stop_at = get_seconds() + stall_cpu;
+		stop_at = ktime_get_seconds() + stall_cpu;
 		/* RCU CPU stall is expected behavior in following code. */
 		rcu_read_lock();
 		if (stall_cpu_irqsoff)
@@ -1444,7 +1444,8 @@ static int rcu_torture_stall(void *args)
 			preempt_disable();
 		pr_alert("rcu_torture_stall start on CPU %d.\n",
 			 smp_processor_id());
-		while (ULONG_CMP_LT(get_seconds(), stop_at))
+		while (ULONG_CMP_LT((unsigned long)ktime_get_seconds(),
+				    stop_at))
 			continue;  /* Induce RCU CPU stall warning. */
 		if (stall_cpu_irqsoff)
 			local_irq_enable();
@@ -1613,6 +1614,10 @@ rcu_torture_cleanup(void)
 			cur_ops->cb_barrier();
 		return;
 	}
+	if (!cur_ops) {
+		torture_cleanup_end();
+		return;
+	}
 
 	rcu_torture_barrier_cleanup();
 	torture_stop_kthread(rcu_torture_stall, stall_task);
@@ -1748,6 +1753,7 @@ rcu_torture_init(void)
 			pr_alert(" %s", torture_ops[i]->name);
 		pr_alert("\n");
 		firsterr = -EINVAL;
+		cur_ops = NULL;
 		goto unwind;
 	}
 	if (cur_ops->fqs == NULL && fqs_duration != 0) {

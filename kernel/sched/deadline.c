@@ -217,7 +217,6 @@ static void task_non_contending(struct task_struct *p)
 	if (dl_se->dl_runtime == 0)
 		return;
 
-	WARN_ON(hrtimer_active(&dl_se->inactive_timer));
 	WARN_ON(dl_se->dl_non_contending);
 
 	zerolag_time = dl_se->deadline -
@@ -234,7 +233,7 @@ static void task_non_contending(struct task_struct *p)
 	 * If the "0-lag time" already passed, decrease the active
 	 * utilization now, instead of starting a timer
 	 */
-	if (zerolag_time < 0) {
+	if ((zerolag_time < 0) || hrtimer_active(&dl_se->inactive_timer)) {
 		if (dl_task(p))
 			sub_running_bw(dl_se->dl_bw, dl_rq);
 		if (!dl_task(p) || p->state == TASK_DEAD) {
@@ -1084,7 +1083,7 @@ extern bool sched_rt_bandwidth_account(struct rt_rq *rt_rq);
  * should be larger than 2^(64 - 20 - 8), which is more than 64 seconds.
  * So, overflow is not an issue here.
  */
-u64 grub_reclaim(u64 delta, struct rq *rq, struct sched_dl_entity *dl_se)
+static u64 grub_reclaim(u64 delta, struct rq *rq, struct sched_dl_entity *dl_se)
 {
 	u64 u_inact = rq->dl.this_bw - rq->dl.running_bw; /* Utot - Uact */
 	u64 u_act;
@@ -2023,8 +2022,14 @@ retry:
 	sub_rq_bw(next_task->dl.dl_bw, &rq->dl);
 	set_task_cpu(next_task, later_rq->cpu);
 	add_rq_bw(next_task->dl.dl_bw, &later_rq->dl);
+
+	/*
+	 * Update the later_rq clock here, because the clock is used
+	 * by the cpufreq_update_util() inside __add_running_bw().
+	 */
+	update_rq_clock(later_rq);
 	add_running_bw(next_task->dl.dl_bw, &later_rq->dl);
-	activate_task(later_rq, next_task, 0);
+	activate_task(later_rq, next_task, ENQUEUE_NOCLOCK);
 	ret = 1;
 
 	resched_curr(later_rq);
@@ -2346,7 +2351,7 @@ int sched_dl_global_validate(void)
 	u64 period = global_rt_period();
 	u64 new_bw = to_ratio(period, runtime);
 	struct dl_bw *dl_b;
-	int cpu, ret = 0;
+	int cpu, cpus, ret = 0;
 	unsigned long flags;
 
 	/*
@@ -2361,9 +2366,10 @@ int sched_dl_global_validate(void)
 	for_each_possible_cpu(cpu) {
 		rcu_read_lock_sched();
 		dl_b = dl_bw_of(cpu);
+		cpus = dl_bw_cpus(cpu);
 
 		raw_spin_lock_irqsave(&dl_b->lock, flags);
-		if (new_bw < dl_b->total_bw)
+		if (new_bw * cpus < dl_b->total_bw)
 			ret = -EBUSY;
 		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
 
@@ -2563,6 +2569,7 @@ void __dl_clear_params(struct task_struct *p)
 	dl_se->dl_bw = 0;
 	dl_se->dl_density = 0;
 
+	dl_se->dl_boosted = 0;
 	dl_se->dl_throttled = 0;
 	dl_se->dl_yielded = 0;
 	dl_se->dl_non_contending = 0;
@@ -2652,8 +2659,6 @@ bool dl_cpu_busy(unsigned int cpu)
 #endif
 
 #ifdef CONFIG_SCHED_DEBUG
-extern void print_dl_rq(struct seq_file *m, int cpu, struct dl_rq *dl_rq);
-
 void print_dl_stats(struct seq_file *m, int cpu)
 {
 	print_dl_rq(m, cpu, &cpu_rq(cpu)->dl);

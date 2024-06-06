@@ -1354,7 +1354,7 @@ nvkm_vmm_get_locked(struct nvkm_vmm *vmm, bool getref, bool mapref, bool sparse,
 
 		tail = this->addr + this->size;
 		if (vmm->func->page_block && next && next->page != p)
-			tail = ALIGN_DOWN(addr, vmm->func->page_block);
+			tail = ALIGN_DOWN(tail, vmm->func->page_block);
 
 		if (addr <= tail && tail - addr >= size) {
 			rb_erase(&this->tree, &vmm->free);
@@ -1423,7 +1423,7 @@ nvkm_vmm_get(struct nvkm_vmm *vmm, u8 page, u64 size, struct nvkm_vma **pvma)
 void
 nvkm_vmm_part(struct nvkm_vmm *vmm, struct nvkm_memory *inst)
 {
-	if (vmm->func->part && inst) {
+	if (inst && vmm && vmm->func->part) {
 		mutex_lock(&vmm->mutex);
 		vmm->func->part(vmm, inst);
 		mutex_unlock(&vmm->mutex);

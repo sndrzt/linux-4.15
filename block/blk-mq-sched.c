@@ -81,6 +81,15 @@ static bool blk_mq_sched_restart_hctx(struct blk_mq_hw_ctx *hctx)
 	} else
 		clear_bit(BLK_MQ_S_SCHED_RESTART, &hctx->state);
 
+	/*
+	 * Order clearing SCHED_RESTART and list_empty_careful(&hctx->dispatch)
+	 * in blk_mq_run_hw_queue(). Its pair is the barrier in
+	 * blk_mq_dispatch_rq_list(). So dispatch code won't see SCHED_RESTART,
+	 * meantime new request added to hctx->dispatch is missed to check in
+	 * blk_mq_run_hw_queue().
+	 */
+	smp_mb();
+
 	return blk_mq_run_hw_queue(hctx, true);
 }
 
@@ -220,15 +229,8 @@ void blk_mq_sched_dispatch_requests(struct blk_mq_hw_ctx *hctx)
 		}
 	} else if (has_sched_dispatch) {
 		blk_mq_do_dispatch_sched(hctx);
-	} else if (q->mq_ops->get_budget) {
-		/*
-		 * If we need to get budget before queuing request, we
-		 * dequeue request one by one from sw queue for avoiding
-		 * to mess up I/O merge when dispatch runs out of resource.
-		 *
-		 * TODO: get more budgets, and dequeue more requests in
-		 * one time.
-		 */
+	} else if (hctx->dispatch_busy) {
+		/* dequeue request one by one from sw queue if queue is busy */
 		blk_mq_do_dispatch_ctx(hctx);
 	} else {
 		blk_mq_flush_busy_ctxs(hctx, &rq_list);
@@ -324,7 +326,8 @@ bool __blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio)
 		return e->type->ops.mq.bio_merge(hctx, bio);
 	}
 
-	if (hctx->flags & BLK_MQ_F_SHOULD_MERGE) {
+	if ((hctx->flags & BLK_MQ_F_SHOULD_MERGE) &&
+			!list_empty_careful(&ctx->rq_list)) {
 		/* default per sw-queue merge */
 		spin_lock(&ctx->lock);
 		ret = blk_mq_attempt_merge(q, ctx, bio);
@@ -428,7 +431,7 @@ done:
 }
 
 void blk_mq_sched_insert_request(struct request *rq, bool at_head,
-				 bool run_queue, bool async, bool can_block)
+				 bool run_queue, bool async)
 {
 	struct request_queue *q = rq->q;
 	struct elevator_queue *e = q->elevator;
@@ -471,8 +474,19 @@ void blk_mq_sched_insert_requests(struct request_queue *q,
 
 	if (e && e->type->ops.mq.insert_requests)
 		e->type->ops.mq.insert_requests(hctx, list, false);
-	else
+	else {
+		/*
+		 * try to issue requests directly if the hw queue isn't
+		 * busy in case of 'none' scheduler, and this way may save
+		 * us one extra enqueue & dequeue to sw queue.
+		 */
+		if (!hctx->dispatch_busy && !e && !run_queue_async) {
+			blk_mq_try_issue_list_directly(hctx, list);
+			if (list_empty(list))
+				return;
+		}
 		blk_mq_insert_requests(hctx, ctx, list);
+	}
 
 	blk_mq_run_hw_queue(hctx, run_queue_async);
 }

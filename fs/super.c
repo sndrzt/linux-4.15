@@ -120,13 +120,23 @@ static unsigned long super_cache_count(struct shrinker *shrink,
 	sb = container_of(shrink, struct super_block, s_shrink);
 
 	/*
-	 * Don't call trylock_super as it is a potential
-	 * scalability bottleneck. The counts could get updated
-	 * between super_cache_count and super_cache_scan anyway.
-	 * Call to super_cache_count with shrinker_rwsem held
-	 * ensures the safety of call to list_lru_shrink_count() and
-	 * s_op->nr_cached_objects().
+	 * We don't call trylock_super() here as it is a scalability bottleneck,
+	 * so we're exposed to partial setup state. The shrinker rwsem does not
+	 * protect filesystem operations backing list_lru_shrink_count() or
+	 * s_op->nr_cached_objects(). Counts can change between
+	 * super_cache_count and super_cache_scan, so we really don't need locks
+	 * here.
+	 *
+	 * However, if we are currently mounting the superblock, the underlying
+	 * filesystem might be in a state of partial construction and hence it
+	 * is dangerous to access it.  trylock_super() uses a SB_BORN check to
+	 * avoid this situation, so do the same here. The memory barrier is
+	 * matched with the one in mount_fs() as we don't hold locks here.
 	 */
+	if (!(sb->s_flags & SB_BORN))
+		return 0;
+	smp_rmb();
+
 	if (sb->s_op && sb->s_op->nr_cached_objects)
 		total_objects = sb->s_op->nr_cached_objects(sb, sc);
 
@@ -166,6 +176,7 @@ static void destroy_unused_super(struct super_block *s)
 	security_sb_free(s);
 	put_user_ns(s->s_user_ns);
 	kfree(s->s_subtype);
+	free_prealloced_shrinker(&s->s_shrink);
 	/* no delays needed */
 	destroy_super_work(&s->destroy_work);
 }
@@ -251,6 +262,8 @@ static struct super_block *alloc_super(struct file_system_type *type, int flags,
 	s->s_shrink.count_objects = super_cache_count;
 	s->s_shrink.batch = 1024;
 	s->s_shrink.flags = SHRINKER_NUMA_AWARE | SHRINKER_MEMCG_AWARE;
+	if (prealloc_shrinker(&s->s_shrink))
+		goto fail;
 	return s;
 
 fail:
@@ -517,11 +530,7 @@ retry:
 	hlist_add_head(&s->s_instances, &type->fs_supers);
 	spin_unlock(&sb_lock);
 	get_filesystem(type);
-	err = register_shrinker(&s->s_shrink);
-	if (err) {
-		deactivate_locked_super(s);
-		s = ERR_PTR(err);
-	}
+	register_shrinker_prepared(&s->s_shrink);
 	return s;
 }
 
@@ -1078,6 +1087,23 @@ struct dentry *mount_bdev(struct file_system_type *fs_type,
 	if (IS_ERR(bdev))
 		return ERR_CAST(bdev);
 
+	if (current_user_ns() != &init_user_ns) {
+		/*
+		 * For userns mounts, disallow mounting if bdev is open for
+		 * writing
+		 */
+		if (!atomic_dec_unless_positive(&bdev->bd_inode->i_writecount)) {
+			error = -EBUSY;
+			goto error_bdev;
+		}
+		if (bdev->bd_contains != bdev &&
+		    !atomic_dec_unless_positive(&bdev->bd_contains->bd_inode->i_writecount)) {
+			atomic_inc(&bdev->bd_inode->i_writecount);
+			error = -EBUSY;
+			goto error_bdev;
+		}
+	}
+
 	/*
 	 * once the super is inserted into the list by sget, s_umount
 	 * will protect the lockfs code from trying to start a snapshot
@@ -1087,7 +1113,7 @@ struct dentry *mount_bdev(struct file_system_type *fs_type,
 	if (bdev->bd_fsfreeze_count > 0) {
 		mutex_unlock(&bdev->bd_fsfreeze_mutex);
 		error = -EBUSY;
-		goto error_bdev;
+		goto error_inc;
 	}
 	s = sget(fs_type, test_bdev_super, set_bdev_super, flags | SB_NOSEC,
 		 bdev);
@@ -1099,7 +1125,7 @@ struct dentry *mount_bdev(struct file_system_type *fs_type,
 		if ((flags ^ s->s_flags) & SB_RDONLY) {
 			deactivate_locked_super(s);
 			error = -EBUSY;
-			goto error_bdev;
+			goto error_inc;
 		}
 
 		/*
@@ -1130,6 +1156,12 @@ struct dentry *mount_bdev(struct file_system_type *fs_type,
 
 error_s:
 	error = PTR_ERR(s);
+error_inc:
+	if (current_user_ns() != &init_user_ns) {
+		atomic_inc(&bdev->bd_inode->i_writecount);
+		if (bdev->bd_contains != bdev)
+			atomic_inc(&bdev->bd_contains->bd_inode->i_writecount);
+	}
 error_bdev:
 	blkdev_put(bdev, mode);
 error:
@@ -1146,6 +1178,11 @@ void kill_block_super(struct super_block *sb)
 	generic_shutdown_super(sb);
 	sync_blockdev(bdev);
 	WARN_ON_ONCE(!(mode & FMODE_EXCL));
+	if (sb->s_user_ns != &init_user_ns) {
+		atomic_inc(&bdev->bd_inode->i_writecount);
+		if (bdev->bd_contains != bdev)
+			atomic_inc(&bdev->bd_contains->bd_inode->i_writecount);
+	}
 	blkdev_put(bdev, mode | FMODE_EXCL);
 }
 
@@ -1227,6 +1264,14 @@ mount_fs(struct file_system_type *type, int flags, const char *name, void *data)
 	sb = root->d_sb;
 	BUG_ON(!sb);
 	WARN_ON(!sb->s_bdi);
+
+	/*
+	 * Write barrier is for super_cache_count(). We place it before setting
+	 * SB_BORN as the data dependency between the two functions is the
+	 * superblock structure contents that we just set up, not the SB_BORN
+	 * flag.
+	 */
+	smp_wmb();
 	sb->s_flags |= SB_BORN;
 
 	error = security_sb_kern_mount(sb, flags, secdata);
@@ -1313,36 +1358,11 @@ EXPORT_SYMBOL(__sb_end_write);
  */
 int __sb_start_write(struct super_block *sb, int level, bool wait)
 {
-	bool force_trylock = false;
-	int ret = 1;
+	if (!wait)
+		return percpu_down_read_trylock(sb->s_writers.rw_sem + level-1);
 
-#ifdef CONFIG_LOCKDEP
-	/*
-	 * We want lockdep to tell us about possible deadlocks with freezing
-	 * but it's it bit tricky to properly instrument it. Getting a freeze
-	 * protection works as getting a read lock but there are subtle
-	 * problems. XFS for example gets freeze protection on internal level
-	 * twice in some cases, which is OK only because we already hold a
-	 * freeze protection also on higher level. Due to these cases we have
-	 * to use wait == F (trylock mode) which must not fail.
-	 */
-	if (wait) {
-		int i;
-
-		for (i = 0; i < level - 1; i++)
-			if (percpu_rwsem_is_held(sb->s_writers.rw_sem + i)) {
-				force_trylock = true;
-				break;
-			}
-	}
-#endif
-	if (wait && !force_trylock)
-		percpu_down_read(sb->s_writers.rw_sem + level-1);
-	else
-		ret = percpu_down_read_trylock(sb->s_writers.rw_sem + level-1);
-
-	WARN_ON(force_trylock && !ret);
-	return ret;
+	percpu_down_read(sb->s_writers.rw_sem + level-1);
+	return 1;
 }
 EXPORT_SYMBOL(__sb_start_write);
 
@@ -1382,11 +1402,9 @@ static void lockdep_sb_freeze_acquire(struct super_block *sb)
 		percpu_rwsem_acquire(sb->s_writers.rw_sem + level, 0, _THIS_IP_);
 }
 
-static void sb_freeze_unlock(struct super_block *sb)
+static void sb_freeze_unlock(struct super_block *sb, int level)
 {
-	int level;
-
-	for (level = SB_FREEZE_LEVELS - 1; level >= 0; level--)
+	for (level--; level >= 0; level--)
 		percpu_up_write(sb->s_writers.rw_sem + level);
 }
 
@@ -1457,7 +1475,14 @@ int freeze_super(struct super_block *sb)
 	sb_wait_write(sb, SB_FREEZE_PAGEFAULT);
 
 	/* All writers are done so after syncing there won't be dirty data */
-	sync_filesystem(sb);
+	ret = sync_filesystem(sb);
+	if (ret) {
+		sb->s_writers.frozen = SB_UNFROZEN;
+		sb_freeze_unlock(sb, SB_FREEZE_PAGEFAULT);
+		wake_up(&sb->s_writers.wait_unfrozen);
+		deactivate_locked_super(sb);
+		return ret;
+	}
 
 	/* Now wait for internal filesystem counter */
 	sb->s_writers.frozen = SB_FREEZE_FS;
@@ -1469,7 +1494,7 @@ int freeze_super(struct super_block *sb)
 			printk(KERN_ERR
 				"VFS:Filesystem freeze failed\n");
 			sb->s_writers.frozen = SB_UNFROZEN;
-			sb_freeze_unlock(sb);
+			sb_freeze_unlock(sb, SB_FREEZE_FS);
 			wake_up(&sb->s_writers.wait_unfrozen);
 			deactivate_locked_super(sb);
 			return ret;
@@ -1521,7 +1546,7 @@ int thaw_super(struct super_block *sb)
 	}
 
 	sb->s_writers.frozen = SB_UNFROZEN;
-	sb_freeze_unlock(sb);
+	sb_freeze_unlock(sb, SB_FREEZE_FS);
 out:
 	wake_up(&sb->s_writers.wait_unfrozen);
 	deactivate_locked_super(sb);

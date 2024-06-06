@@ -92,10 +92,15 @@ config ASUS_LAPTOP
 	  If you have an ACPI-compatible ASUS laptop, say Y or M here.
 
 config DELL_SMBIOS
-	tristate
+	tristate "Dell SMBIOS driver"
+	---help---
+	This provides support for the Dell SMBIOS calling interface.
+	If you have a Dell computer you should enable this option.
+
+	Be sure to select at least one backend for it to work properly.
 
 config DELL_SMBIOS_WMI
-	tristate "Dell SMBIOS calling interface (WMI implementation)"
+	bool "Dell SMBIOS driver WMI backend"
 	depends on ACPI_WMI
 	select DELL_WMI_DESCRIPTOR
 	select DELL_SMBIOS
@@ -103,19 +108,19 @@ config DELL_SMBIOS_WMI
 	This provides an implementation for the Dell SMBIOS calling interface
 	communicated over ACPI-WMI.
 
-	If you have a Dell computer from >2007 you should say Y or M here.
+	If you have a Dell computer from >2007 you should say Y here.
 	If you aren't sure and this module doesn't work for your computer
 	it just won't load.
 
 config DELL_SMBIOS_SMM
-	tristate "Dell SMBIOS calling interface (SMM implementation)"
+	bool "Dell SMBIOS driver SMM backend"
 	depends on DCDBAS
 	select DELL_SMBIOS
 	---help---
 	This provides an implementation for the Dell SMBIOS calling interface
 	communicated over SMI/SMM.
 
-	If you have a Dell computer from <=2017 you should say Y or M here.
+	If you have a Dell computer from <=2017 you should say Y here.
 	If you aren't sure and this module doesn't work for your computer
 	it just won't load.
 
@@ -126,7 +131,7 @@ config DELL_LAPTOP
 	depends on ACPI_VIDEO || ACPI_VIDEO = n
 	depends on RFKILL || RFKILL = n
 	depends on SERIO_I8042
-	select DELL_SMBIOS
+	depends on DELL_SMBIOS
 	select POWER_SUPPLY
 	select LEDS_CLASS
 	select NEW_LEDS
@@ -140,8 +145,8 @@ config DELL_WMI
 	depends on DMI
 	depends on INPUT
 	depends on ACPI_VIDEO || ACPI_VIDEO = n
+	depends on DELL_SMBIOS
 	select DELL_WMI_DESCRIPTOR
-	select DELL_SMBIOS
 	select INPUT_SPARSEKMAP
 	---help---
 	  Say Y here if you want to support WMI-based hotkeys on Dell laptops.
@@ -199,6 +204,20 @@ config DELL_RBTN
 	  To compile this driver as a module, choose M here: the module will
 	  be called dell-rbtn.
 
+config DELL_UART_BACKLIGHT
+	tristate "Dell AIO UART Backlight driver"
+	depends on SERIAL_8250
+	depends on ACPI
+	---help---
+	  Say Y here if you want to support Dell AIO UART backlight interface.
+	  The Dell AIO machines released after 2017 come with a UART interface
+	  to communicate with the backlight scalar board. This driver creates
+	  a standard backlight interface and talks to the scalar board through
+	  UART to adjust the AIO screen brightness.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called dell_uart_backlight.
+
 
 config FUJITSU_LAPTOP
 	tristate "Fujitsu Laptop Extras"
@@ -207,6 +226,7 @@ config FUJITSU_LAPTOP
 	depends on BACKLIGHT_CLASS_DEVICE
 	depends on ACPI_VIDEO || ACPI_VIDEO = n
 	select INPUT_SPARSEKMAP
+	select NEW_LEDS
 	select LEDS_CLASS
 	---help---
 	  This is a driver for laptops built by Fujitsu:
@@ -949,7 +969,7 @@ config INTEL_IMR
 	  If you are running on a Galileo/Quark say Y here.
 
 config INTEL_PMC_CORE
-	bool "Intel PMC Core driver"
+	tristate "Intel PMC Core driver"
 	depends on PCI
 	---help---
 	  The Intel Platform Controller Hub for Intel Core SoCs provides access
@@ -1032,6 +1052,7 @@ config INTEL_OAKTRAIL
 config SAMSUNG_Q10
 	tristate "Samsung Q10 Extras"
 	depends on ACPI
+	depends on BACKLIGHT_LCD_SUPPORT
 	select BACKLIGHT_CLASS_DEVICE
 	---help---
 	  This driver provides support for backlight control on Samsung Q10
@@ -1169,6 +1190,18 @@ config SILEAD_DMI
 	  into the tablet model specific version of the driver shipped
 	  with the OS-image for the device. This option supplies the missing
 	  information. Enable this for x86 tablets with Silead touchscreens.
+
+config INTEL_ATOMISP2_PM
+	tristate "Intel AtomISP2 dummy / power-management driver"
+	depends on PCI && IOSF_MBI && PM
+	help
+	  Power-management driver for Intel's Image Signal Processor found on
+	  Bay and Cherry Trail devices. This dummy driver's sole purpose is to
+	  turn the ISP off (put it in D3) to save power and to allow entering
+	  of S0ix modes.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called intel_atomisp2_pm.
 
 endif # X86_PLATFORM_DEVICES
 

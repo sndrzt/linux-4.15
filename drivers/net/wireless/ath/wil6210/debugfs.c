@@ -502,10 +502,10 @@ static ssize_t wil_read_file_ioblob(struct file *file, char __user *user_buf,
 {
 	enum { max_count = 4096 };
 	struct wil_blob_wrapper *wil_blob = file->private_data;
-	loff_t pos = *ppos;
+	loff_t aligned_pos, pos = *ppos;
 	size_t available = wil_blob->blob.size;
 	void *buf;
-	size_t ret;
+	size_t unaligned_bytes, aligned_count, ret;
 
 	if (test_bit(wil_status_suspending, wil_blob->wil->status) ||
 	    test_bit(wil_status_suspended, wil_blob->wil->status))
@@ -522,14 +522,19 @@ static ssize_t wil_read_file_ioblob(struct file *file, char __user *user_buf,
 	if (count > max_count)
 		count = max_count;
 
-	buf = kmalloc(count, GFP_KERNEL);
+	/* set pos to 4 bytes aligned */
+	unaligned_bytes = pos % 4;
+	aligned_pos = pos - unaligned_bytes;
+	aligned_count = count + unaligned_bytes;
+
+	buf = kmalloc(aligned_count, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 
 	wil_memcpy_fromio_32(buf, (const void __iomem *)
-			     wil_blob->blob.data + pos, count);
+			     wil_blob->blob.data + aligned_pos, aligned_count);
 
-	ret = copy_to_user(user_buf, buf, count);
+	ret = copy_to_user(user_buf, buf + unaligned_bytes, count);
 	kfree(buf);
 	if (ret == count)
 		return -EFAULT;
@@ -554,32 +559,6 @@ struct dentry *wil_debugfs_create_ioblob(const char *name,
 {
 	return debugfs_create_file(name, mode, parent, wil_blob, &fops_ioblob);
 }
-
-/*---reset---*/
-static ssize_t wil_write_file_reset(struct file *file, const char __user *buf,
-				    size_t len, loff_t *ppos)
-{
-	struct wil6210_priv *wil = file->private_data;
-	struct net_device *ndev = wil_to_ndev(wil);
-
-	/**
-	 * BUG:
-	 * this code does NOT sync device state with the rest of system
-	 * use with care, debug only!!!
-	 */
-	rtnl_lock();
-	dev_close(ndev);
-	ndev->flags &= ~IFF_UP;
-	rtnl_unlock();
-	wil_reset(wil, true);
-
-	return len;
-}
-
-static const struct file_operations fops_reset = {
-	.write = wil_write_file_reset,
-	.open  = simple_open,
-};
 
 /*---write channel 1..4 to rxon for it, 0 to rxoff---*/
 static ssize_t wil_write_file_rxon(struct file *file, const char __user *buf,
@@ -834,20 +813,14 @@ static ssize_t wil_write_file_wmi(struct file *file, const char __user *buf,
 	void *cmd;
 	int cmdlen = len - sizeof(struct wmi_cmd_hdr);
 	u16 cmdid;
-	int rc, rc1;
+	int rc1;
 
-	if (cmdlen < 0)
+	if (cmdlen < 0 || *ppos != 0)
 		return -EINVAL;
 
-	wmi = kmalloc(len, GFP_KERNEL);
-	if (!wmi)
-		return -ENOMEM;
-
-	rc = simple_write_to_buffer(wmi, len, ppos, buf, len);
-	if (rc < 0) {
-		kfree(wmi);
-		return rc;
-	}
+	wmi = memdup_user(buf, len);
+	if (IS_ERR(wmi))
+		return PTR_ERR(wmi);
 
 	cmd = (cmdlen > 0) ? &wmi[1] : NULL;
 	cmdid = le16_to_cpu(wmi->command_id);
@@ -857,7 +830,7 @@ static ssize_t wil_write_file_wmi(struct file *file, const char __user *buf,
 
 	wil_info(wil, "0x%04x[%d] -> %d\n", cmdid, cmdlen, rc1);
 
-	return rc;
+	return len;
 }
 
 static const struct file_operations fops_wmi = {
@@ -1049,7 +1022,7 @@ static const struct file_operations fops_bf = {
 };
 
 /*---------temp------------*/
-static void print_temp(struct seq_file *s, const char *prefix, u32 t)
+static void print_temp(struct seq_file *s, const char *prefix, s32 t)
 {
 	switch (t) {
 	case 0:
@@ -1057,7 +1030,8 @@ static void print_temp(struct seq_file *s, const char *prefix, u32 t)
 		seq_printf(s, "%s N/A\n", prefix);
 	break;
 	default:
-		seq_printf(s, "%s %d.%03d\n", prefix, t / 1000, t % 1000);
+		seq_printf(s, "%s %s%d.%03d\n", prefix, (t < 0 ? "-" : ""),
+			   abs(t / 1000), abs(t % 1000));
 		break;
 	}
 }
@@ -1065,7 +1039,7 @@ static void print_temp(struct seq_file *s, const char *prefix, u32 t)
 static int wil_temp_debugfs_show(struct seq_file *s, void *data)
 {
 	struct wil6210_priv *wil = s->private;
-	u32 t_m, t_r;
+	s32 t_m, t_r;
 	int rc = wmi_get_temperature(wil, &t_m, &t_r);
 
 	if (rc) {
@@ -1652,7 +1626,6 @@ static const struct {
 	{"desc",	0444,		&fops_txdesc},
 	{"bf",		0444,		&fops_bf},
 	{"mem_val",	0644,		&fops_memread},
-	{"reset",	0244,		&fops_reset},
 	{"rxon",	0244,		&fops_rxon},
 	{"tx_mgmt",	0244,		&fops_txmgmt},
 	{"wmi_send", 0244,		&fops_wmi},

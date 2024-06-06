@@ -129,7 +129,7 @@ static void __init move_device_tree(void)
 		p = __va(memblock_alloc(size, PAGE_SIZE));
 		memcpy(p, initial_boot_params, size);
 		initial_boot_params = p;
-		DBG("Moved device tree to 0x%p\n", p);
+		DBG("Moved device tree to 0x%px\n", p);
 	}
 
 	DBG("<- move_device_tree\n");
@@ -266,7 +266,7 @@ static struct feature_property {
 };
 
 #if defined(CONFIG_44x) && defined(CONFIG_PPC_FPU)
-static inline void identical_pvr_fixup(unsigned long node)
+static __init void identical_pvr_fixup(unsigned long node)
 {
 	unsigned int pvr;
 	const char *model = of_get_flat_dt_prop(node, "model", NULL);
@@ -303,6 +303,29 @@ static void __init check_cpu_feature_properties(unsigned long node)
 	}
 }
 
+/*
+ * Adjust the logical id of a boot cpu to fall under nr_cpu_ids. Map it to
+ * last core slot in the allocated paca array.
+ *
+ * e.g. on SMT=8 system, kernel booted with nr_cpus=1 and boot cpu = 33,
+ * align nr_cpu_ids to MAX_SMT value 8. Allocate paca array to hold up-to
+ * MAX_SMT=8 cpus. Since boot cpu 33 is greater than nr_cpus (8), adjust
+ * its logical id so that new id becomes less than nr_cpu_ids. Make sure
+ * that boot cpu's new logical id is aligned to its thread id and falls
+ * under last nthreads slots available in paca array. In this case the
+ * boot cpu 33 is adjusted to new boot cpu id 1.
+ *
+ */
+static inline void adjust_boot_cpuid(int nthreads, int phys_id)
+{
+	boot_hw_cpuid = phys_id;
+	if (boot_cpuid >= nr_cpu_ids) {
+		boot_cpuid = (boot_cpuid % nthreads) + (nr_cpu_ids - nthreads);
+		pr_info("Adjusted logical boot cpu id: logical %d physical %d\n",
+			boot_cpuid, phys_id);
+	}
+}
+
 static int __init early_init_dt_scan_cpus(unsigned long node,
 					  const char *uname, int depth,
 					  void *data)
@@ -325,6 +348,18 @@ static int __init early_init_dt_scan_cpus(unsigned long node,
 		intserv = of_get_flat_dt_prop(node, "reg", &len);
 
 	nthreads = len / sizeof(int);
+
+#ifdef CONFIG_SMP
+	/*
+	 * Now that we know threads per core lets align nr_cpu_ids to
+	 * correct SMT value.
+	 */
+	if (nr_cpu_ids % nthreads) {
+		nr_cpu_ids = _ALIGN_UP(nr_cpu_ids, nthreads);
+		pr_info("Aligned nr_cpus to SMT=%d, nr_cpu_ids = %d\n",
+				 nthreads, nr_cpu_ids);
+	}
+#endif
 
 	/*
 	 * Now see if any of these threads match our boot cpu.
@@ -364,7 +399,9 @@ static int __init early_init_dt_scan_cpus(unsigned long node,
 	DBG("boot cpu: logical %d physical %d\n", found,
 	    be32_to_cpu(intserv[found_thread]));
 	boot_cpuid = found;
-	set_hard_smp_processor_id(found, be32_to_cpu(intserv[found_thread]));
+	adjust_boot_cpuid(nthreads, be32_to_cpu(intserv[found_thread]));
+	set_hard_smp_processor_id(boot_cpuid,
+					be32_to_cpu(intserv[found_thread]));
 
 	/*
 	 * PAPR defines "logical" PVR values for cpus that
@@ -691,11 +728,28 @@ static void __init tm_init(void)
 static void tm_init(void) { }
 #endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
 
+#ifdef CONFIG_PPC64
+static void __init save_fscr_to_task(void)
+{
+	/*
+	 * Ensure the init_task (pid 0, aka swapper) uses the value of FSCR we
+	 * have configured via the device tree features or via __init_FSCR().
+	 * That value will then be propagated to pid 1 (init) and all future
+	 * processes.
+	 */
+	if (early_cpu_has_feature(CPU_FTR_ARCH_207S))
+		init_task.thread.fscr = mfspr(SPRN_FSCR);
+}
+#else
+static inline void save_fscr_to_task(void) {};
+#endif
+
+
 void __init early_init_devtree(void *params)
 {
 	phys_addr_t limit;
 
-	DBG(" -> early_init_devtree(%p)\n", params);
+	DBG(" -> early_init_devtree(%px)\n", params);
 
 	/* Too early to BUG_ON(), do it by hand */
 	if (!early_init_dt_verify(params))
@@ -726,6 +780,13 @@ void __init early_init_devtree(void *params)
 	of_scan_flat_dt(early_init_dt_scan_root, NULL);
 	of_scan_flat_dt(early_init_dt_scan_memory_ppc, NULL);
 
+	/*
+	 * As generic code authors expect to be able to use static keys
+	 * in early_param() handlers, we initialize the static keys just
+	 * before parsing early params (it's fine to call jump_label_init()
+	 * more than once).
+	 */
+	jump_label_init();
 	parse_early_param();
 
 	/* make sure we've parsed cmdline for mem= before this */
@@ -755,7 +816,7 @@ void __init early_init_devtree(void *params)
 	memblock_allow_resize();
 	memblock_dump_all();
 
-	DBG("Phys. mem: %llx\n", memblock_phys_mem_size());
+	DBG("Phys. mem: %llx\n", (unsigned long long)memblock_phys_mem_size());
 
 	/* We may need to relocate the flat tree, do it now.
 	 * FIXME .. and the initrd too? */
@@ -775,6 +836,8 @@ void __init early_init_devtree(void *params)
 		printk("Failed to identify boot CPU !\n");
 		BUG();
 	}
+
+	save_fscr_to_task();
 
 #if defined(CONFIG_SMP) && defined(CONFIG_PPC64)
 	/* We'll later wait for secondaries to check in; there are

@@ -272,7 +272,8 @@ qla2x00_mbx_completion(scsi_qla_host_t *vha, uint16_t mb0)
 	struct device_reg_2xxx __iomem *reg = &ha->iobase->isp;
 
 	/* Read all mbox registers? */
-	mboxes = (1 << ha->mbx_count) - 1;
+	WARN_ON_ONCE(ha->mbx_count > 32);
+	mboxes = (1ULL << ha->mbx_count) - 1;
 	if (!ha->mcp)
 		ql_dbg(ql_dbg_async, vha, 0x5001, "MBX pointer ERROR.\n");
 	else
@@ -809,6 +810,7 @@ skip_rio:
 		break;
 
 	case MBA_LOOP_DOWN:		/* Loop Down Event */
+		SAVE_TOPO(ha);
 		ha->flags.n2n_ae = 0;
 		ha->flags.lip_ae = 0;
 		ha->current_topology = 0;
@@ -922,7 +924,6 @@ skip_rio:
 		set_bit(REGISTER_FC4_NEEDED, &vha->dpc_flags);
 		set_bit(REGISTER_FDMI_NEEDED, &vha->dpc_flags);
 
-		ha->flags.gpsc_supported = 1;
 		vha->flags.management_server_logged_in = 0;
 		break;
 
@@ -1009,7 +1010,7 @@ skip_rio:
 			if (qla_ini_mode_enabled(vha)) {
 				qla2x00_mark_device_lost(fcport->vha, fcport, 1, 1);
 				fcport->logout_on_delete = 0;
-				qlt_schedule_sess_for_deletion_lock(fcport);
+				qlt_schedule_sess_for_deletion(fcport);
 			}
 			break;
 
@@ -1046,8 +1047,6 @@ global_port_update:
 			ql_dbg(ql_dbg_async, vha, 0x5011,
 			    "Asynchronous PORT UPDATE ignored %04x/%04x/%04x.\n",
 			    mb[1], mb[2], mb[3]);
-
-			qlt_async_event(mb[0], vha, mb);
 			break;
 		}
 
@@ -1060,13 +1059,9 @@ global_port_update:
 		 */
 		atomic_set(&vha->loop_state, LOOP_UP);
 
-		qla2x00_mark_all_devices_lost(vha, 1);
-
 		set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
 		set_bit(LOCAL_LOOP_UPDATE, &vha->dpc_flags);
 		set_bit(VP_CONFIG_OK, &vha->vp_flags);
-
-		qlt_async_event(mb[0], vha, mb);
 		break;
 
 	case MBA_RSCN_UPDATE:		/* State Change Registration */
@@ -1574,7 +1569,7 @@ qla24xx_els_ct_entry(scsi_qla_host_t *vha, struct req_que *req,
 		/* borrowing sts_entry_24xx.comp_status.
 		   same location as ct_entry_24xx.comp_status
 		 */
-		res = qla2x00_chk_ms_status(vha, (ms_iocb_entry_t *)pkt,
+		res = qla2x00_chk_ms_status(sp->vha, (ms_iocb_entry_t *)pkt,
 			(struct ct_sns_rsp *)sp->u.iocb_cmd.u.ctarg.rsp,
 			sp->name);
 		sp->done(sp, res);
@@ -1819,6 +1814,7 @@ qla24xx_tm_iocb_entry(scsi_qla_host_t *vha, struct req_que *req, void *tsk)
 		iocb->u.tmf.data = QLA_FUNCTION_FAILED;
 	} else if ((le16_to_cpu(sts->scsi_status) &
 	    SS_RESPONSE_INFO_LEN_VALID)) {
+		host_to_fcp_swap(sts->data, sizeof(sts->data));
 		if (le32_to_cpu(sts->rsp_data_len) < 4) {
 			ql_log(ql_log_warn, fcport->vha, 0x503b,
 			    "Async-%s error - hdl=%x not enough response(%d).\n",
@@ -1884,6 +1880,18 @@ qla24xx_nvme_iocb_entry(scsi_qla_host_t *vha, struct req_que *req, void *tsk)
 		inbuf = (uint32_t *)&sts->nvme_ersp_data;
 		outbuf = (uint32_t *)fd->rspaddr;
 		iocb->u.nvme.rsp_pyld_len = le16_to_cpu(sts->nvme_rsp_pyld_len);
+		if (unlikely(iocb->u.nvme.rsp_pyld_len >
+		    sizeof(struct nvme_fc_ersp_iu))) {
+			if (ql_mask_match(ql_dbg_io)) {
+				WARN_ONCE(1, "Unexpected response payload length %u.\n",
+				    iocb->u.nvme.rsp_pyld_len);
+				ql_log(ql_log_warn, fcport->vha, 0x5100,
+				    "Unexpected response payload length %u.\n",
+				    iocb->u.nvme.rsp_pyld_len);
+			}
+			iocb->u.nvme.rsp_pyld_len =
+			    sizeof(struct nvme_fc_ersp_iu);
+		}
 		iter = iocb->u.nvme.rsp_pyld_len >> 2;
 		for (; iter; iter--)
 			*outbuf++ = swab32(*inbuf++);
@@ -2369,7 +2377,6 @@ qla2x00_status_entry(scsi_qla_host_t *vha, struct rsp_que *rsp, void *pkt)
 	int res = 0;
 	uint16_t state_flags = 0;
 	uint16_t retry_delay = 0;
-	uint8_t no_logout = 0;
 
 	sts = (sts_entry_t *) pkt;
 	sts24 = (struct sts_entry_24xx *) pkt;
@@ -2482,8 +2489,12 @@ qla2x00_status_entry(scsi_qla_host_t *vha, struct rsp_que *rsp, void *pkt)
 		ox_id = le16_to_cpu(sts24->ox_id);
 		par_sense_len = sizeof(sts24->data);
 		/* Valid values of the retry delay timer are 0x1-0xffef */
-		if (sts24->retry_delay > 0 && sts24->retry_delay < 0xfff1)
-			retry_delay = sts24->retry_delay;
+		if (sts24->retry_delay > 0 && sts24->retry_delay < 0xfff1) {
+			retry_delay = sts24->retry_delay & 0x3fff;
+			ql_dbg(ql_dbg_io, sp->vha, 0x3033,
+			    "%s: scope=%#x retry_delay=%#x\n", __func__,
+			    sts24->retry_delay >> 14, retry_delay);
+		}
 	} else {
 		if (scsi_status & SS_SENSE_LEN_VALID)
 			sense_len = le16_to_cpu(sts->req_sense_length);
@@ -2640,7 +2651,6 @@ check_scsi_status:
 		break;
 
 	case CS_PORT_LOGGED_OUT:
-		no_logout = 1;
 	case CS_PORT_CONFIG_CHG:
 	case CS_PORT_BUSY:
 	case CS_INCOMPLETE:
@@ -2671,11 +2681,8 @@ check_scsi_status:
 				port_state_str[atomic_read(&fcport->state)],
 				comp_status);
 
-			if (no_logout)
-				fcport->logout_on_delete = 0;
-
 			qla2x00_mark_device_lost(fcport->vha, fcport, 1, 1);
-			qlt_schedule_sess_for_deletion_lock(fcport);
+			qlt_schedule_sess_for_deletion(fcport);
 		}
 
 		break;
@@ -2820,6 +2827,7 @@ qla2x00_error_entry(scsi_qla_host_t *vha, struct rsp_que *rsp, sts_entry_t *pkt)
 	case ELS_IOCB_TYPE:
 	case ABORT_IOCB_TYPE:
 	case MBX_IOCB_TYPE:
+	default:
 		sp = qla2x00_get_sp_from_handle(vha, func, req, pkt);
 		if (sp) {
 			sp->done(sp, res);
@@ -2830,7 +2838,6 @@ qla2x00_error_entry(scsi_qla_host_t *vha, struct rsp_que *rsp, sts_entry_t *pkt)
 	case ABTS_RESP_24XX:
 	case CTIO_TYPE7:
 	case CTIO_CRC2:
-	default:
 		return 1;
 	}
 fatal:
@@ -2854,7 +2861,8 @@ qla24xx_mbx_completion(scsi_qla_host_t *vha, uint16_t mb0)
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
 
 	/* Read all mbox registers? */
-	mboxes = (1 << ha->mbx_count) - 1;
+	WARN_ON_ONCE(ha->mbx_count > 32);
+	mboxes = (1ULL << ha->mbx_count) - 1;
 	if (!ha->mcp)
 		ql_dbg(ql_dbg_async, vha, 0x504e, "MBX pointer ERROR.\n");
 	else
@@ -3098,6 +3106,7 @@ qla24xx_intr_handler(int irq, void *dev_id)
 	uint16_t	mb[8];
 	struct rsp_que *rsp;
 	unsigned long	flags;
+	bool process_atio = false;
 
 	rsp = (struct rsp_que *) dev_id;
 	if (!rsp) {
@@ -3158,22 +3167,13 @@ qla24xx_intr_handler(int irq, void *dev_id)
 			qla24xx_process_response_queue(vha, rsp);
 			break;
 		case INTR_ATIO_QUE_UPDATE_27XX:
-		case INTR_ATIO_QUE_UPDATE:{
-			unsigned long flags2;
-			spin_lock_irqsave(&ha->tgt.atio_lock, flags2);
-			qlt_24xx_process_atio_queue(vha, 1);
-			spin_unlock_irqrestore(&ha->tgt.atio_lock, flags2);
+		case INTR_ATIO_QUE_UPDATE:
+			process_atio = true;
 			break;
-		}
-		case INTR_ATIO_RSP_QUE_UPDATE: {
-			unsigned long flags2;
-			spin_lock_irqsave(&ha->tgt.atio_lock, flags2);
-			qlt_24xx_process_atio_queue(vha, 1);
-			spin_unlock_irqrestore(&ha->tgt.atio_lock, flags2);
-
+		case INTR_ATIO_RSP_QUE_UPDATE:
+			process_atio = true;
 			qla24xx_process_response_queue(vha, rsp);
 			break;
-		}
 		default:
 			ql_dbg(ql_dbg_async, vha, 0x504f,
 			    "Unrecognized interrupt type (%d).\n", stat * 0xff);
@@ -3186,6 +3186,12 @@ qla24xx_intr_handler(int irq, void *dev_id)
 	}
 	qla2x00_handle_mbx_completion(ha, status);
 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+
+	if (process_atio) {
+		spin_lock_irqsave(&ha->tgt.atio_lock, flags);
+		qlt_24xx_process_atio_queue(vha, 0);
+		spin_unlock_irqrestore(&ha->tgt.atio_lock, flags);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -3233,6 +3239,7 @@ qla24xx_msix_default(int irq, void *dev_id)
 	uint32_t	hccr;
 	uint16_t	mb[8];
 	unsigned long flags;
+	bool process_atio = false;
 
 	rsp = (struct rsp_que *) dev_id;
 	if (!rsp) {
@@ -3289,22 +3296,13 @@ qla24xx_msix_default(int irq, void *dev_id)
 			qla24xx_process_response_queue(vha, rsp);
 			break;
 		case INTR_ATIO_QUE_UPDATE_27XX:
-		case INTR_ATIO_QUE_UPDATE:{
-			unsigned long flags2;
-			spin_lock_irqsave(&ha->tgt.atio_lock, flags2);
-			qlt_24xx_process_atio_queue(vha, 1);
-			spin_unlock_irqrestore(&ha->tgt.atio_lock, flags2);
+		case INTR_ATIO_QUE_UPDATE:
+			process_atio = true;
 			break;
-		}
-		case INTR_ATIO_RSP_QUE_UPDATE: {
-			unsigned long flags2;
-			spin_lock_irqsave(&ha->tgt.atio_lock, flags2);
-			qlt_24xx_process_atio_queue(vha, 1);
-			spin_unlock_irqrestore(&ha->tgt.atio_lock, flags2);
-
+		case INTR_ATIO_RSP_QUE_UPDATE:
+			process_atio = true;
 			qla24xx_process_response_queue(vha, rsp);
 			break;
-		}
 		default:
 			ql_dbg(ql_dbg_async, vha, 0x5051,
 			    "Unrecognized interrupt type (%d).\n", stat & 0xff);
@@ -3314,6 +3312,12 @@ qla24xx_msix_default(int irq, void *dev_id)
 	} while (0);
 	qla2x00_handle_mbx_completion(ha, status);
 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+
+	if (process_atio) {
+		spin_lock_irqsave(&ha->tgt.atio_lock, flags);
+		qlt_24xx_process_atio_queue(vha, 0);
+		spin_unlock_irqrestore(&ha->tgt.atio_lock, flags);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -3399,10 +3403,8 @@ qla24xx_enable_msix(struct qla_hw_data *ha, struct rsp_que *rsp)
 		    ha->msix_count, ret);
 		goto msix_out;
 	} else if (ret < ha->msix_count) {
-		ql_log(ql_log_warn, vha, 0x00c6,
-		    "MSI-X: Failed to enable support "
-		     "with %d vectors, using %d vectors.\n",
-		    ha->msix_count, ret);
+		ql_log(ql_log_info, vha, 0x00c6,
+		    "MSI-X: Using %d vectors\n", ret);
 		ha->msix_count = ret;
 		/* Recalculate queue values */
 		if (ha->mqiobase && (ql2xmqsupport || ql2xnvmeenable)) {
@@ -3425,7 +3427,7 @@ qla24xx_enable_msix(struct qla_hw_data *ha, struct rsp_que *rsp)
 		ql_log(ql_log_fatal, vha, 0x00c8,
 		    "Failed to allocate memory for ha->msix_entries.\n");
 		ret = -ENOMEM;
-		goto msix_out;
+		goto free_irqs;
 	}
 	ha->flags.msix_enabled = 1;
 
@@ -3508,6 +3510,10 @@ msix_register_fail:
 
 msix_out:
 	return ret;
+
+free_irqs:
+	pci_free_irq_vectors(ha->pdev);
+	goto msix_out;
 }
 
 int
@@ -3555,7 +3561,7 @@ qla2x00_request_irqs(struct qla_hw_data *ha, struct rsp_que *rsp)
 skip_msix:
 
 	ql_log(ql_log_info, vha, 0x0037,
-	    "Falling back-to MSI mode -%d.\n", ret);
+	    "Falling back-to MSI mode -- ret=%d.\n", ret);
 
 	if (!IS_QLA24XX(ha) && !IS_QLA2532(ha) && !IS_QLA8432(ha) &&
 	    !IS_QLA8001(ha) && !IS_P3P_TYPE(ha) && !IS_QLAFX00(ha) &&
@@ -3563,13 +3569,13 @@ skip_msix:
 		goto skip_msi;
 
 	ret = pci_alloc_irq_vectors(ha->pdev, 1, 1, PCI_IRQ_MSI);
-	if (!ret) {
+	if (ret > 0) {
 		ql_dbg(ql_dbg_init, vha, 0x0038,
 		    "MSI: Enabled.\n");
 		ha->flags.msi_enabled = 1;
 	} else
 		ql_log(ql_log_warn, vha, 0x0039,
-		    "Falling back-to INTa mode -- %d.\n", ret);
+		    "Falling back-to INTa mode -- ret=%d.\n", ret);
 skip_msi:
 
 	/* Skip INTx on ISP82xx. */

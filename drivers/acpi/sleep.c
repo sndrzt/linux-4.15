@@ -338,6 +338,14 @@ static const struct dmi_system_id acpisleep_dmi_table[] __initconst = {
 		DMI_MATCH(DMI_PRODUCT_NAME, "K54HR"),
 		},
 	},
+	{
+	.callback = init_nvs_save_s3,
+	.ident = "Asus 1025C",
+	.matches = {
+		DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
+		DMI_MATCH(DMI_PRODUCT_NAME, "1025C"),
+		},
+	},
 	/*
 	 * https://bugzilla.kernel.org/show_bug.cgi?id=189431
 	 * Lenovo G50-45 is a platform later than 2012, but needs nvs memory
@@ -351,6 +359,14 @@ static const struct dmi_system_id acpisleep_dmi_table[] __initconst = {
 		DMI_MATCH(DMI_PRODUCT_NAME, "80E3"),
 		},
 	},
+	{
+	.callback = init_nvs_save_s3,
+	.ident = "Lenovo G40-45",
+	.matches = {
+		DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+		DMI_MATCH(DMI_PRODUCT_NAME, "80E1"),
+		},
+	},
 	/*
 	 * https://bugzilla.kernel.org/show_bug.cgi?id=196907
 	 * Some Dell XPS13 9360 cannot do suspend-to-idle using the Low Power
@@ -362,6 +378,19 @@ static const struct dmi_system_id acpisleep_dmi_table[] __initconst = {
 	.matches = {
 		DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
 		DMI_MATCH(DMI_PRODUCT_NAME, "XPS 13 9360"),
+		},
+	},
+	/*
+	 * ThinkPad X1 Tablet(2016) cannot do suspend-to-idle using
+	 * the Low Power S0 Idle firmware interface (see
+	 * https://bugzilla.kernel.org/show_bug.cgi?id=199057).
+	 */
+	{
+	.callback = init_no_lps0,
+	.ident = "ThinkPad X1 Tablet(2016)",
+	.matches = {
+		DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+		DMI_MATCH(DMI_PRODUCT_NAME, "20GGA00L00"),
 		},
 	},
 	{},
@@ -913,6 +942,8 @@ static int lps0_device_attach(struct acpi_device *adev,
 
 		acpi_handle_debug(adev->handle, "_DSM function mask: 0x%x\n",
 				  bitmask);
+
+		acpi_ec_mark_gpe_for_wake();
 	} else {
 		acpi_handle_debug(adev->handle,
 				  "_DSM function 0 evaluation failed\n");
@@ -941,18 +972,18 @@ static int acpi_s2idle_prepare(void)
 	if (lps0_device_handle) {
 		acpi_sleep_run_lps0_dsm(ACPI_LPS0_SCREEN_OFF);
 		acpi_sleep_run_lps0_dsm(ACPI_LPS0_ENTRY);
-	} else {
-		/*
-		 * The configuration of GPEs is changed here to avoid spurious
-		 * wakeups, but that should not be necessary if this is a
-		 * "low-power S0" platform and the low-power S0 _DSM is present.
-		 */
-		acpi_enable_all_wakeup_gpes();
-		acpi_os_wait_events_complete();
+
+		acpi_ec_set_gpe_wake_mask(ACPI_GPE_ENABLE);
 	}
+
 	if (acpi_sci_irq_valid())
 		enable_irq_wake(acpi_sci_irq);
 
+	acpi_enable_wakeup_devices(ACPI_STATE_S0);
+
+	/* Change the configuration of GPEs to avoid spurious wakeup. */
+	acpi_enable_all_wakeup_gpes();
+	acpi_os_wait_events_complete();
 	return 0;
 }
 
@@ -989,14 +1020,18 @@ static void acpi_s2idle_sync(void)
 
 static void acpi_s2idle_restore(void)
 {
+	acpi_enable_all_runtime_gpes();
+
+	acpi_disable_wakeup_devices(ACPI_STATE_S0);
+
 	if (acpi_sci_irq_valid())
 		disable_irq_wake(acpi_sci_irq);
 
 	if (lps0_device_handle) {
+		acpi_ec_set_gpe_wake_mask(ACPI_GPE_DISABLE);
+
 		acpi_sleep_run_lps0_dsm(ACPI_LPS0_EXIT);
 		acpi_sleep_run_lps0_dsm(ACPI_LPS0_SCREEN_ON);
-	} else {
-		acpi_enable_all_runtime_gpes();
 	}
 }
 

@@ -61,6 +61,8 @@
 #include <linux/uidgid.h>
 #include <linux/cred.h>
 
+#include <linux/nospec.h>
+
 #include <linux/kmsg_dump.h>
 /* Move somewhere else to avoid recompiling? */
 #include <generated/utsrelease.h>
@@ -1139,6 +1141,21 @@ out:
 DECLARE_RWSEM(uts_sem);
 
 #ifdef COMPAT_UTS_MACHINE
+static char compat_uts_machine[__OLD_UTS_LEN+1] = COMPAT_UTS_MACHINE;
+
+static int __init parse_compat_uts_machine(char *arg)
+{
+	strncpy(compat_uts_machine, arg, __OLD_UTS_LEN);
+	compat_uts_machine[__OLD_UTS_LEN] = 0;
+	return 0;
+}
+early_param("compat_uts_machine", parse_compat_uts_machine);
+
+#undef COMPAT_UTS_MACHINE
+#define COMPAT_UTS_MACHINE compat_uts_machine
+#endif
+
+#ifdef COMPAT_UTS_MACHINE
 #define override_architecture(name) \
 	(personality(current->personality) == PER_LINUX32 && \
 	 copy_to_user(name->machine, COMPAT_UTS_MACHINE, \
@@ -1180,18 +1197,19 @@ static int override_release(char __user *release, size_t len)
 
 SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 {
-	int errno = 0;
+	struct new_utsname tmp;
 
 	down_read(&uts_sem);
-	if (copy_to_user(name, utsname(), sizeof *name))
-		errno = -EFAULT;
+	memcpy(&tmp, utsname(), sizeof(tmp));
 	up_read(&uts_sem);
+	if (copy_to_user(name, &tmp, sizeof(tmp)))
+		return -EFAULT;
 
-	if (!errno && override_release(name->release, sizeof(name->release)))
-		errno = -EFAULT;
-	if (!errno && override_architecture(name))
-		errno = -EFAULT;
-	return errno;
+	if (override_release(name->release, sizeof(name->release)))
+		return -EFAULT;
+	if (override_architecture(name))
+		return -EFAULT;
+	return 0;
 }
 
 #ifdef __ARCH_WANT_SYS_OLD_UNAME
@@ -1200,55 +1218,48 @@ SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
  */
 SYSCALL_DEFINE1(uname, struct old_utsname __user *, name)
 {
-	int error = 0;
+	struct old_utsname tmp;
 
 	if (!name)
 		return -EFAULT;
 
 	down_read(&uts_sem);
-	if (copy_to_user(name, utsname(), sizeof(*name)))
-		error = -EFAULT;
+	memcpy(&tmp, utsname(), sizeof(tmp));
 	up_read(&uts_sem);
+	if (copy_to_user(name, &tmp, sizeof(tmp)))
+		return -EFAULT;
 
-	if (!error && override_release(name->release, sizeof(name->release)))
-		error = -EFAULT;
-	if (!error && override_architecture(name))
-		error = -EFAULT;
-	return error;
+	if (override_release(name->release, sizeof(name->release)))
+		return -EFAULT;
+	if (override_architecture(name))
+		return -EFAULT;
+	return 0;
 }
 
 SYSCALL_DEFINE1(olduname, struct oldold_utsname __user *, name)
 {
-	int error;
+	struct oldold_utsname tmp;
 
 	if (!name)
 		return -EFAULT;
-	if (!access_ok(VERIFY_WRITE, name, sizeof(struct oldold_utsname)))
-		return -EFAULT;
+
+	memset(&tmp, 0, sizeof(tmp));
 
 	down_read(&uts_sem);
-	error = __copy_to_user(&name->sysname, &utsname()->sysname,
-			       __OLD_UTS_LEN);
-	error |= __put_user(0, name->sysname + __OLD_UTS_LEN);
-	error |= __copy_to_user(&name->nodename, &utsname()->nodename,
-				__OLD_UTS_LEN);
-	error |= __put_user(0, name->nodename + __OLD_UTS_LEN);
-	error |= __copy_to_user(&name->release, &utsname()->release,
-				__OLD_UTS_LEN);
-	error |= __put_user(0, name->release + __OLD_UTS_LEN);
-	error |= __copy_to_user(&name->version, &utsname()->version,
-				__OLD_UTS_LEN);
-	error |= __put_user(0, name->version + __OLD_UTS_LEN);
-	error |= __copy_to_user(&name->machine, &utsname()->machine,
-				__OLD_UTS_LEN);
-	error |= __put_user(0, name->machine + __OLD_UTS_LEN);
+	memcpy(&tmp.sysname, &utsname()->sysname, __OLD_UTS_LEN);
+	memcpy(&tmp.nodename, &utsname()->nodename, __OLD_UTS_LEN);
+	memcpy(&tmp.release, &utsname()->release, __OLD_UTS_LEN);
+	memcpy(&tmp.version, &utsname()->version, __OLD_UTS_LEN);
+	memcpy(&tmp.machine, &utsname()->machine, __OLD_UTS_LEN);
 	up_read(&uts_sem);
+	if (copy_to_user(name, &tmp, sizeof(tmp)))
+		return -EFAULT;
 
-	if (!error && override_architecture(name))
-		error = -EFAULT;
-	if (!error && override_release(name->release, sizeof(name->release)))
-		error = -EFAULT;
-	return error ? -EFAULT : 0;
+	if (override_architecture(name))
+		return -EFAULT;
+	if (override_release(name->release, sizeof(name->release)))
+		return -EFAULT;
+	return 0;
 }
 #endif
 
@@ -1262,17 +1273,18 @@ SYSCALL_DEFINE2(sethostname, char __user *, name, int, len)
 
 	if (len < 0 || len > __NEW_UTS_LEN)
 		return -EINVAL;
-	down_write(&uts_sem);
 	errno = -EFAULT;
 	if (!copy_from_user(tmp, name, len)) {
-		struct new_utsname *u = utsname();
+		struct new_utsname *u;
 
+		down_write(&uts_sem);
+		u = utsname();
 		memcpy(u->nodename, tmp, len);
 		memset(u->nodename + len, 0, sizeof(u->nodename) - len);
 		errno = 0;
 		uts_proc_notify(UTS_PROC_HOSTNAME);
+		up_write(&uts_sem);
 	}
-	up_write(&uts_sem);
 	return errno;
 }
 
@@ -1280,8 +1292,9 @@ SYSCALL_DEFINE2(sethostname, char __user *, name, int, len)
 
 SYSCALL_DEFINE2(gethostname, char __user *, name, int, len)
 {
-	int i, errno;
+	int i;
 	struct new_utsname *u;
+	char tmp[__NEW_UTS_LEN + 1];
 
 	if (len < 0)
 		return -EINVAL;
@@ -1290,11 +1303,11 @@ SYSCALL_DEFINE2(gethostname, char __user *, name, int, len)
 	i = 1 + strlen(u->nodename);
 	if (i > len)
 		i = len;
-	errno = 0;
-	if (copy_to_user(name, u->nodename, i))
-		errno = -EFAULT;
+	memcpy(tmp, u->nodename, i);
 	up_read(&uts_sem);
-	return errno;
+	if (copy_to_user(name, tmp, i))
+		return -EFAULT;
+	return 0;
 }
 
 #endif
@@ -1313,17 +1326,18 @@ SYSCALL_DEFINE2(setdomainname, char __user *, name, int, len)
 	if (len < 0 || len > __NEW_UTS_LEN)
 		return -EINVAL;
 
-	down_write(&uts_sem);
 	errno = -EFAULT;
 	if (!copy_from_user(tmp, name, len)) {
-		struct new_utsname *u = utsname();
+		struct new_utsname *u;
 
+		down_write(&uts_sem);
+		u = utsname();
 		memcpy(u->domainname, tmp, len);
 		memset(u->domainname + len, 0, sizeof(u->domainname) - len);
 		errno = 0;
 		uts_proc_notify(UTS_PROC_DOMAINNAME);
+		up_write(&uts_sem);
 	}
-	up_write(&uts_sem);
 	return errno;
 }
 
@@ -1399,6 +1413,7 @@ SYSCALL_DEFINE2(old_getrlimit, unsigned int, resource,
 	if (resource >= RLIM_NLIMITS)
 		return -EINVAL;
 
+	resource = array_index_nospec(resource, RLIM_NLIMITS);
 	task_lock(current->group_leader);
 	x = current->signal->rlim[resource];
 	task_unlock(current->group_leader);
@@ -1418,6 +1433,7 @@ COMPAT_SYSCALL_DEFINE2(old_getrlimit, unsigned int, resource,
 	if (resource >= RLIM_NLIMITS)
 		return -EINVAL;
 
+	resource = array_index_nospec(resource, RLIM_NLIMITS);
 	task_lock(current->group_leader);
 	r = current->signal->rlim[resource];
 	task_unlock(current->group_leader);
@@ -1477,6 +1493,8 @@ int do_prlimit(struct task_struct *tsk, unsigned int resource,
 
 	if (resource >= RLIM_NLIMITS)
 		return -EINVAL;
+	resource = array_index_nospec(resource, RLIM_NLIMITS);
+
 	if (new_rlim) {
 		if (new_rlim->rlim_cur > new_rlim->rlim_max)
 			return -EINVAL;
@@ -1868,7 +1886,7 @@ static int validate_prctl_map(struct prctl_mm_map *prctl_map)
 	((unsigned long)prctl_map->__m1 __op				\
 	 (unsigned long)prctl_map->__m2) ? 0 : -EINVAL
 	error  = __prctl_check_order(start_code, <, end_code);
-	error |= __prctl_check_order(start_data, <, end_data);
+	error |= __prctl_check_order(start_data,<=, end_data);
 	error |= __prctl_check_order(start_brk, <=, brk);
 	error |= __prctl_check_order(arg_start, <=, arg_end);
 	error |= __prctl_check_order(env_start, <=, env_end);
@@ -1877,13 +1895,6 @@ static int validate_prctl_map(struct prctl_mm_map *prctl_map)
 #undef __prctl_check_order
 
 	error = -EINVAL;
-
-	/*
-	 * @brk should be after @end_data in traditional maps.
-	 */
-	if (prctl_map->start_brk <= prctl_map->end_data ||
-	    prctl_map->brk <= prctl_map->end_data)
-		goto out;
 
 	/*
 	 * Neither we should allow to override limits if they set.
@@ -2190,6 +2201,17 @@ static int propagate_has_child_subreaper(struct task_struct *p, void *data)
 	return 1;
 }
 
+int __weak arch_prctl_spec_ctrl_get(struct task_struct *t, unsigned long which)
+{
+	return -EINVAL;
+}
+
+int __weak arch_prctl_spec_ctrl_set(struct task_struct *t, unsigned long which,
+				    unsigned long ctrl)
+{
+	return -EINVAL;
+}
+
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		unsigned long, arg4, unsigned long, arg5)
 {
@@ -2397,6 +2419,16 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		break;
 	case PR_SVE_GET_VL:
 		error = SVE_GET_VL();
+		break;
+	case PR_GET_SPECULATION_CTRL:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = arch_prctl_spec_ctrl_get(me, arg2);
+		break;
+	case PR_SET_SPECULATION_CTRL:
+		if (arg4 || arg5)
+			return -EINVAL;
+		error = arch_prctl_spec_ctrl_set(me, arg2, arg3);
 		break;
 	default:
 		error = -EINVAL;

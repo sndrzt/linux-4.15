@@ -113,7 +113,7 @@ MODULE_PARM_DESC(no_bt_rfkill, "No rfkill for bluetooth.");
 /*
  * ACPI Helpers
  */
-#define IDEAPAD_EC_TIMEOUT (100) /* in ms */
+#define IDEAPAD_EC_TIMEOUT (200) /* in ms */
 
 static int read_method_int(acpi_handle handle, const char *method, int *val)
 {
@@ -958,221 +958,21 @@ static void ideapad_wmi_notify(u32 value, void *context)
 #endif
 
 /*
- * Some ideapads don't have a hardware rfkill switch, reading VPCCMD_R_RF
- * always results in 0 on these models, causing ideapad_laptop to wrongly
- * report all radios as hardware-blocked.
+ * Some ideapads have a hardware rfkill switch, but most do not have one.
+ * Reading VPCCMD_R_RF always results in 0 on models without a hardware rfkill,
+ * switch causing ideapad_laptop to wrongly report all radios as hw-blocked.
+ * There used to be a long list of DMI ids for models without a hw rfkill
+ * switch here, but that resulted in playing whack a mole.
+ * More importantly wrongly reporting the wifi radio as hw-blocked, results in
+ * non working wifi. Whereas not reporting it hw-blocked, when it actually is
+ * hw-blocked results in an empty SSID list, which is a much more benign
+ * failure mode.
+ * So the default now is the much safer option of assuming there is no
+ * hardware rfkill switch. This default also actually matches most hardware,
+ * since having a hw rfkill switch is quite rare on modern hardware, so this
+ * also leads to a much shorter list.
  */
-static const struct dmi_system_id no_hw_rfkill_list[] = {
-	{
-		.ident = "Lenovo G40-30",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo G40-30"),
-		},
-	},
-	{
-		.ident = "Lenovo G50-30",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo G50-30"),
-		},
-	},
-	{
-		.ident = "Lenovo V310-14IKB",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo V310-14IKB"),
-		},
-	},
-	{
-		.ident = "Lenovo V310-14ISK",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo V310-14ISK"),
-		},
-	},
-	{
-		.ident = "Lenovo V310-15IKB",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo V310-15IKB"),
-		},
-	},
-	{
-		.ident = "Lenovo V310-15ISK",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo V310-15ISK"),
-		},
-	},
-	{
-		.ident = "Lenovo V510-15IKB",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo V510-15IKB"),
-		},
-	},
-	{
-		.ident = "Lenovo ideapad 300-15IBR",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo ideapad 300-15IBR"),
-		},
-	},
-	{
-		.ident = "Lenovo ideapad 300-15IKB",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo ideapad 300-15IKB"),
-		},
-	},
-	{
-		.ident = "Lenovo ideapad 300S-11IBR",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo ideapad 300S-11BR"),
-		},
-	},
-	{
-		.ident = "Lenovo ideapad 310-15ABR",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo ideapad 310-15ABR"),
-		},
-	},
-	{
-		.ident = "Lenovo ideapad 310-15IAP",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo ideapad 310-15IAP"),
-		},
-	},
-	{
-		.ident = "Lenovo ideapad 310-15IKB",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo ideapad 310-15IKB"),
-		},
-	},
-	{
-		.ident = "Lenovo ideapad 310-15ISK",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo ideapad 310-15ISK"),
-		},
-	},
-	{
-		.ident = "Lenovo ideapad Y700-14ISK",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo ideapad Y700-14ISK"),
-		},
-	},
-	{
-		.ident = "Lenovo ideapad Y700-15ACZ",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo ideapad Y700-15ACZ"),
-		},
-	},
-	{
-		.ident = "Lenovo ideapad Y700-15ISK",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo ideapad Y700-15ISK"),
-		},
-	},
-	{
-		.ident = "Lenovo ideapad Y700 Touch-15ISK",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo ideapad Y700 Touch-15ISK"),
-		},
-	},
-	{
-		.ident = "Lenovo ideapad Y700-17ISK",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo ideapad Y700-17ISK"),
-		},
-	},
-	{
-		.ident = "Lenovo Legion Y520-15IKBN",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo Y520-15IKBN"),
-		},
-	},
-	{
-		.ident = "Lenovo Legion Y720-15IKBN",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo Y720-15IKBN"),
-		},
-	},
-	{
-		.ident = "Lenovo Yoga 2 11 / 13 / Pro",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo Yoga 2"),
-		},
-	},
-	{
-		.ident = "Lenovo Yoga 2 11 / 13 / Pro",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_BOARD_NAME, "Yoga2"),
-		},
-	},
-	{
-		.ident = "Lenovo Yoga 3 1170 / 1470",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo Yoga 3"),
-		},
-	},
-	{
-		.ident = "Lenovo Yoga 3 Pro 1370",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo YOGA 3"),
-		},
-	},
-	{
-		.ident = "Lenovo Yoga 700",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo YOGA 700"),
-		},
-	},
-	{
-		.ident = "Lenovo Yoga 900",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo YOGA 900"),
-		},
-	},
-	{
-		.ident = "Lenovo Yoga 900",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_BOARD_NAME, "VIUU4"),
-		},
-	},
-	{
-		.ident = "Lenovo YOGA 910-13IKB",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo YOGA 910-13IKB"),
-		},
-	},
-	{
-		.ident = "Lenovo YOGA 920-13IKB",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo YOGA 920-13IKB"),
-		},
-	},
+static const struct dmi_system_id hw_rfkill_list[] = {
 	{}
 };
 
@@ -1198,7 +998,7 @@ static int ideapad_acpi_add(struct platform_device *pdev)
 	priv->cfg = cfg;
 	priv->adev = adev;
 	priv->platform_device = pdev;
-	priv->has_hw_rfkill_switch = !dmi_check_system(no_hw_rfkill_list);
+	priv->has_hw_rfkill_switch = dmi_check_system(hw_rfkill_list);
 
 	ret = ideapad_sysfs_init(priv);
 	if (ret)

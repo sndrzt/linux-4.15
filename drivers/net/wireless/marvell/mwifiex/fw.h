@@ -208,6 +208,7 @@ enum MWIFIEX_802_11_PRIVACY_FILTER {
 #define TLV_TYPE_CHANNEL_STATS      (PROPRIETARY_TLV_BASE_ID + 198)
 #define TLV_BTCOEX_WL_AGGR_WINSIZE  (PROPRIETARY_TLV_BASE_ID + 202)
 #define TLV_BTCOEX_WL_SCANTIME      (PROPRIETARY_TLV_BASE_ID + 203)
+#define TLV_TYPE_LED_CONTROL        (PROPRIETARY_TLV_BASE_ID + 205)
 #define TLV_TYPE_BSS_MODE           (PROPRIETARY_TLV_BASE_ID + 206)
 #define TLV_TYPE_RANDOM_MAC         (PROPRIETARY_TLV_BASE_ID + 236)
 #define TLV_TYPE_CHAN_ATTR_CFG      (PROPRIETARY_TLV_BASE_ID + 237)
@@ -353,6 +354,7 @@ enum MWIFIEX_802_11_PRIVACY_FILTER {
 #define HostCmd_CMD_802_11_AD_HOC_JOIN                0x002c
 #define HostCmd_CMD_802_11_AD_HOC_STOP                0x0040
 #define HostCmd_CMD_802_11_MAC_ADDRESS                0x004D
+#define HostCmd_CMD_802_11_LED_CONTROL                0X004E
 #define HostCmd_CMD_802_11D_DOMAIN_INFO               0x005b
 #define HostCmd_CMD_802_11_KEY_MATERIAL               0x005e
 #define HostCmd_CMD_802_11_BG_SCAN_CONFIG             0x006b
@@ -500,10 +502,10 @@ enum mwifiex_channel_flags {
 
 #define RF_ANTENNA_AUTO                 0xFFFF
 
-#define HostCmd_SET_SEQ_NO_BSS_INFO(seq, num, type) {   \
-	(((seq) & 0x00ff) |                             \
-	 (((num) & 0x000f) << 8)) |                     \
-	(((type) & 0x000f) << 12);                  }
+#define HostCmd_SET_SEQ_NO_BSS_INFO(seq, num, type) \
+	((((seq) & 0x00ff) |                        \
+	 (((num) & 0x000f) << 8)) |                 \
+	(((type) & 0x000f) << 12))
 
 #define HostCmd_GET_SEQ_NO(seq)       \
 	((seq) & HostCmd_SEQ_NUM_MASK)
@@ -940,7 +942,7 @@ struct mwifiex_tkip_param {
 struct mwifiex_aes_param {
 	u8 pn[WPA_PN_SIZE];
 	__le16 key_len;
-	u8 key[WLAN_KEY_LEN_CCMP];
+	u8 key[WLAN_KEY_LEN_CCMP_256];
 } __packed;
 
 struct mwifiex_wapi_param {
@@ -1180,6 +1182,16 @@ struct ieee_types_oper_mode_ntf {
 	u8 oper_mode;
 } __packed;
 
+struct mwifiex_led_param {
+	__le16 mode;
+	__le16 on;
+} __packed;
+
+struct mwifiex_ie_types_led_param {
+	struct mwifiex_ie_types_header header;
+	struct mwifiex_led_param led_cfg;
+} __packed;
+
 struct host_cmd_ds_802_11_ad_hoc_start {
 	u8 ssid[IEEE80211_MAX_SSID_LEN];
 	u8 bss_mode;
@@ -1301,6 +1313,11 @@ struct host_cmd_ds_802_11_hs_cfg_enh {
 		struct mwifiex_hs_config_param hs_config;
 		struct hs_activate_param hs_activate;
 	} params;
+} __packed;
+
+struct host_cmd_ds_802_11_led_control {
+	__le16 action;
+	__le16 num_led;
 } __packed;
 
 enum SNMP_MIB_INDEX {
@@ -1746,9 +1763,10 @@ struct mwifiex_ie_types_wmm_queue_status {
 struct ieee_types_vendor_header {
 	u8 element_id;
 	u8 len;
-	u8 oui[4];	/* 0~2: oui, 3: oui_type */
-	u8 oui_subtype;
-	u8 version;
+	struct {
+		u8 oui[3];
+		u8 oui_type;
+	} __packed oui;
 } __packed;
 
 struct ieee_types_wmm_parameter {
@@ -1762,6 +1780,9 @@ struct ieee_types_wmm_parameter {
 	 *   Version     [1]
 	 */
 	struct ieee_types_vendor_header vend_hdr;
+	u8 oui_subtype;
+	u8 version;
+
 	u8 qos_info_bitmap;
 	u8 reserved;
 	struct ieee_types_wmm_ac_parameters ac_params[IEEE80211_NUM_ACS];
@@ -1779,6 +1800,8 @@ struct ieee_types_wmm_info {
 	 *   Version     [1]
 	 */
 	struct ieee_types_vendor_header vend_hdr;
+	u8 oui_subtype;
+	u8 version;
 
 	u8 qos_info_bitmap;
 } __packed;
@@ -2346,6 +2369,7 @@ struct host_cmd_ds_command {
 		struct host_cmd_sdio_sp_rx_aggr_cfg sdio_rx_aggr_cfg;
 		struct host_cmd_ds_multi_chan_policy mc_policy;
 		struct host_cmd_ds_robust_coex coex;
+		struct host_cmd_ds_802_11_led_control led_cfg;
 		struct host_cmd_ds_wakeup_reason hs_wakeup_reason;
 		struct host_cmd_ds_gtk_rekey_params rekey;
 		struct host_cmd_ds_chan_region_cfg reg_cfg;

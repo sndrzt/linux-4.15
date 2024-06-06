@@ -597,13 +597,13 @@ static ssize_t vpm_show(struct device *dev, struct device_attribute *attr,
 	return sprintf(buf, "%02x\n", sch->vpm);
 }
 
-static DEVICE_ATTR(devtype, 0444, devtype_show, NULL);
-static DEVICE_ATTR(cutype, 0444, cutype_show, NULL);
-static DEVICE_ATTR(modalias, 0444, modalias_show, NULL);
-static DEVICE_ATTR(online, 0644, online_show, online_store);
+static DEVICE_ATTR_RO(devtype);
+static DEVICE_ATTR_RO(cutype);
+static DEVICE_ATTR_RO(modalias);
+static DEVICE_ATTR_RW(online);
 static DEVICE_ATTR(availability, 0444, available_show, NULL);
 static DEVICE_ATTR(logging, 0200, NULL, initiate_logging);
-static DEVICE_ATTR(vpm, 0444, vpm_show, NULL);
+static DEVICE_ATTR_RO(vpm);
 
 static struct attribute *io_subchannel_attrs[] = {
 	&dev_attr_logging.attr,
@@ -827,8 +827,10 @@ static void io_subchannel_register(struct ccw_device *cdev)
 	 * Now we know this subchannel will stay, we can throw
 	 * our delayed uevent.
 	 */
-	dev_set_uevent_suppress(&sch->dev, 0);
-	kobject_uevent(&sch->dev.kobj, KOBJ_ADD);
+	if (dev_get_uevent_suppress(&sch->dev)) {
+		dev_set_uevent_suppress(&sch->dev, 0);
+		kobject_uevent(&sch->dev.kobj, KOBJ_ADD);
+	}
 	/* make it known to the system */
 	ret = ccw_device_add(cdev);
 	if (ret) {
@@ -1036,8 +1038,11 @@ static int io_subchannel_probe(struct subchannel *sch)
 		 * Throw the delayed uevent for the subchannel, register
 		 * the ccw_device and exit.
 		 */
-		dev_set_uevent_suppress(&sch->dev, 0);
-		kobject_uevent(&sch->dev.kobj, KOBJ_ADD);
+		if (dev_get_uevent_suppress(&sch->dev)) {
+			/* should always be the case for the console */
+			dev_set_uevent_suppress(&sch->dev, 0);
+			kobject_uevent(&sch->dev.kobj, KOBJ_ADD);
+		}
 		cdev = sch_get_cdev(sch);
 		rc = ccw_device_add(cdev);
 		if (rc) {

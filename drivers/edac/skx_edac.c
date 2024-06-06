@@ -362,7 +362,7 @@ static int get_dimm_info(u32 mtr, u32 amap, struct dimm_info *dimm,
 	size = ((1ull << (rows + cols + ranks)) * banks) >> (20 - 3);
 	npages = MiB_TO_PAGES(size);
 
-	edac_dbg(0, "mc#%d: channel %d, dimm %d, %lld Mb (%d pages) bank: %d, rank: %d, row: %#x, col: %#x\n",
+	edac_dbg(0, "mc#%d: channel %d, dimm %d, %lld MiB (%d pages) bank: %d, rank: %d, row: %#x, col: %#x\n",
 		 imc->mc, chan, dimmno, size, npages,
 		 banks, 1 << ranks, rows, cols);
 
@@ -613,7 +613,7 @@ sad_found:
 			break;
 		case 2:
 			lchan = (addr >> shift) % 2;
-			lchan = (lchan << 1) | ~lchan;
+			lchan = (lchan << 1) | !lchan;
 			break;
 		case 3:
 			lchan = ((addr >> shift) % 2) << 1;
@@ -904,6 +904,7 @@ static void skx_mce_output_error(struct mem_ctl_info *mci,
 	recoverable = GET_BITFIELD(m->status, 56, 56);
 
 	if (uncorrected_error) {
+		core_err_cnt = 1;
 		if (ripv) {
 			type = "FATAL";
 			tp_event = HW_EVENT_ERR_FATAL;

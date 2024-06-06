@@ -235,6 +235,11 @@ static void octeon_mgmt_rx_fill_ring(struct net_device *netdev)
 
 		/* Put it in the ring.  */
 		p->rx_ring[p->rx_next_fill] = re.d64;
+		/* Make sure there is no reorder of filling the ring and ringing
+		 * the bell
+		 */
+		wmb();
+
 		dma_sync_single_for_device(p->dev, p->rx_ring_handle,
 					   ring_size_to_bytes(OCTEON_MGMT_RX_RING_SIZE),
 					   DMA_BIDIRECTIONAL);
@@ -643,13 +648,21 @@ static int octeon_mgmt_set_mac_address(struct net_device *netdev, void *addr)
 static int octeon_mgmt_change_mtu(struct net_device *netdev, int new_mtu)
 {
 	struct octeon_mgmt *p = netdev_priv(netdev);
-	int size_without_fcs = new_mtu + OCTEON_MGMT_RX_HEADROOM;
+	int max_packet = new_mtu + ETH_HLEN + ETH_FCS_LEN;
 
 	netdev->mtu = new_mtu;
 
-	cvmx_write_csr(p->agl + AGL_GMX_RX_FRM_MAX, size_without_fcs);
+	/* HW lifts the limit if the frame is VLAN tagged
+	 * (+4 bytes per each tag, up to two tags)
+	 */
+	cvmx_write_csr(p->agl + AGL_GMX_RX_FRM_MAX, max_packet);
+	/* Set the hardware to truncate packets larger than the MTU. The jabber
+	 * register must be set to a multiple of 8 bytes, so round up. JABBER is
+	 * an unconditional limit, so we need to account for two possible VLAN
+	 * tags.
+	 */
 	cvmx_write_csr(p->agl + AGL_GMX_RX_JABBER,
-		       (size_without_fcs + 7) & 0xfff8);
+		       (max_packet + 7 + VLAN_HLEN * 2) & 0xfff8);
 
 	return 0;
 }
@@ -1260,12 +1273,13 @@ static int octeon_mgmt_stop(struct net_device *netdev)
 	return 0;
 }
 
-static int octeon_mgmt_xmit(struct sk_buff *skb, struct net_device *netdev)
+static netdev_tx_t
+octeon_mgmt_xmit(struct sk_buff *skb, struct net_device *netdev)
 {
 	struct octeon_mgmt *p = netdev_priv(netdev);
 	union mgmt_port_ring_entry re;
 	unsigned long flags;
-	int rv = NETDEV_TX_BUSY;
+	netdev_tx_t rv = NETDEV_TX_BUSY;
 
 	re.d64 = 0;
 	re.s.tstamp = ((skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) != 0);
@@ -1487,7 +1501,7 @@ static int octeon_mgmt_probe(struct platform_device *pdev)
 	netdev->ethtool_ops = &octeon_mgmt_ethtool_ops;
 
 	netdev->min_mtu = 64 - OCTEON_MGMT_RX_HEADROOM;
-	netdev->max_mtu = 16383 - OCTEON_MGMT_RX_HEADROOM;
+	netdev->max_mtu = 16383 - OCTEON_MGMT_RX_HEADROOM - VLAN_HLEN;
 
 	mac = of_get_mac_address(pdev->dev.of_node);
 

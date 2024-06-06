@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <api/fs/fs.h>
 #include <locale.h>
+#include <regex.h>
 #include "util.h"
 #include "pmu.h"
 #include "parse-events.h"
@@ -144,7 +145,7 @@ static int perf_pmu__parse_scale(struct perf_pmu_alias *alias, char *dir, char *
 	int fd, ret = -1;
 	char path[PATH_MAX];
 
-	snprintf(path, PATH_MAX, "%s/%s.scale", dir, name);
+	scnprintf(path, PATH_MAX, "%s/%s.scale", dir, name);
 
 	fd = open(path, O_RDONLY);
 	if (fd == -1)
@@ -174,7 +175,7 @@ static int perf_pmu__parse_unit(struct perf_pmu_alias *alias, char *dir, char *n
 	ssize_t sret;
 	int fd;
 
-	snprintf(path, PATH_MAX, "%s/%s.unit", dir, name);
+	scnprintf(path, PATH_MAX, "%s/%s.unit", dir, name);
 
 	fd = open(path, O_RDONLY);
 	if (fd == -1)
@@ -204,7 +205,7 @@ perf_pmu__parse_per_pkg(struct perf_pmu_alias *alias, char *dir, char *name)
 	char path[PATH_MAX];
 	int fd;
 
-	snprintf(path, PATH_MAX, "%s/%s.per-pkg", dir, name);
+	scnprintf(path, PATH_MAX, "%s/%s.per-pkg", dir, name);
 
 	fd = open(path, O_RDONLY);
 	if (fd == -1)
@@ -222,7 +223,7 @@ static int perf_pmu__parse_snapshot(struct perf_pmu_alias *alias,
 	char path[PATH_MAX];
 	int fd;
 
-	snprintf(path, PATH_MAX, "%s/%s.snapshot", dir, name);
+	scnprintf(path, PATH_MAX, "%s/%s.snapshot", dir, name);
 
 	fd = open(path, O_RDONLY);
 	if (fd == -1)
@@ -350,7 +351,7 @@ static int pmu_aliases_parse(char *dir, struct list_head *head)
 		if (pmu_alias_info_file(name))
 			continue;
 
-		snprintf(path, PATH_MAX, "%s/%s", dir, name);
+		scnprintf(path, PATH_MAX, "%s/%s", dir, name);
 
 		file = fopen(path, "r");
 		if (!file) {
@@ -537,17 +538,40 @@ static bool pmu_is_uncore(const char *name)
 }
 
 /*
+ *  PMU CORE devices have different name other than cpu in sysfs on some
+ *  platforms.
+ *  Looking for possible sysfs files to identify the arm core device.
+ */
+static int is_arm_pmu_core(const char *name)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	const char *sysfs = sysfs__mountpoint();
+
+	if (!sysfs)
+		return 0;
+
+	/* Look for cpu sysfs (specific to arm) */
+	scnprintf(path, PATH_MAX, "%s/bus/event_source/devices/%s/cpus",
+				sysfs, name);
+	if (stat(path, &st) == 0)
+		return 1;
+
+	return 0;
+}
+
+/*
  * Return the CPU id as a raw string.
  *
  * Each architecture should provide a more precise id string that
  * can be use to match the architecture's "mapfile".
  */
-char * __weak get_cpuid_str(void)
+char * __weak get_cpuid_str(struct perf_pmu *pmu __maybe_unused)
 {
 	return NULL;
 }
 
-static char *perf_pmu__getcpuid(void)
+static char *perf_pmu__getcpuid(struct perf_pmu *pmu)
 {
 	char *cpuid;
 	static bool printed;
@@ -556,7 +580,7 @@ static char *perf_pmu__getcpuid(void)
 	if (cpuid)
 		cpuid = strdup(cpuid);
 	if (!cpuid)
-		cpuid = get_cpuid_str();
+		cpuid = get_cpuid_str(pmu);
 	if (!cpuid)
 		return NULL;
 
@@ -567,22 +591,45 @@ static char *perf_pmu__getcpuid(void)
 	return cpuid;
 }
 
-struct pmu_events_map *perf_pmu__find_map(void)
+struct pmu_events_map *perf_pmu__find_map(struct perf_pmu *pmu)
 {
 	struct pmu_events_map *map;
-	char *cpuid = perf_pmu__getcpuid();
+	char *cpuid = perf_pmu__getcpuid(pmu);
 	int i;
+
+	/* on some platforms which uses cpus map, cpuid can be NULL for
+	 * PMUs other than CORE PMUs.
+	 */
+	if (!cpuid)
+		return NULL;
 
 	i = 0;
 	for (;;) {
+		regex_t re;
+		regmatch_t pmatch[1];
+		int match;
+
 		map = &pmu_events_map[i++];
 		if (!map->table) {
 			map = NULL;
 			break;
 		}
 
-		if (!strcmp(map->cpuid, cpuid))
+		if (regcomp(&re, map->cpuid, REG_EXTENDED) != 0) {
+			/* Warn unable to generate match particular string. */
+			pr_info("Invalid regular expression %s\n", map->cpuid);
 			break;
+		}
+
+		match = !regexec(&re, cpuid, 1, pmatch, 0);
+		regfree(&re);
+		if (match) {
+			size_t match_len = (pmatch[0].rm_eo - pmatch[0].rm_so);
+
+			/* Verify the entire string matched. */
+			if (match_len == strlen(cpuid))
+				break;
+		}
 	}
 	free(cpuid);
 	return map;
@@ -593,13 +640,13 @@ struct pmu_events_map *perf_pmu__find_map(void)
  * to the current running CPU. Then, add all PMU events from that table
  * as aliases.
  */
-static void pmu_add_cpu_aliases(struct list_head *head, const char *name)
+static void pmu_add_cpu_aliases(struct list_head *head, struct perf_pmu *pmu)
 {
 	int i;
 	struct pmu_events_map *map;
-	struct pmu_event *pe;
+	const char *name = pmu->name;
 
-	map = perf_pmu__find_map();
+	map = perf_pmu__find_map(pmu);
 	if (!map)
 		return;
 
@@ -608,19 +655,28 @@ static void pmu_add_cpu_aliases(struct list_head *head, const char *name)
 	 */
 	i = 0;
 	while (1) {
-		const char *pname;
+		const char *cpu_name = is_arm_pmu_core(name) ? name : "cpu";
+		struct pmu_event *pe = &map->table[i++];
+		const char *pname = pe->pmu ? pe->pmu : cpu_name;
 
-		pe = &map->table[i++];
 		if (!pe->name) {
 			if (pe->metric_group || pe->metric_name)
 				continue;
 			break;
 		}
 
-		pname = pe->pmu ? pe->pmu : "cpu";
-		if (strncmp(pname, name, strlen(pname)))
+		/*
+		 * uncore alias may be from different PMU
+		 * with common prefix
+		 */
+		if (pmu_is_uncore(name) &&
+		    !strncmp(pname, name, strlen(pname)))
+			goto new_alias;
+
+		if (strcmp(pname, name))
 			continue;
 
+new_alias:
 		/* need type casts to override 'const' */
 		__perf_pmu__new_alias(head, NULL, (char *)pe->name,
 				(char *)pe->desc, (char *)pe->event,
@@ -661,21 +717,20 @@ static struct perf_pmu *pmu_lookup(const char *name)
 	if (pmu_aliases(name, &aliases))
 		return NULL;
 
-	pmu_add_cpu_aliases(&aliases, name);
 	pmu = zalloc(sizeof(*pmu));
 	if (!pmu)
 		return NULL;
 
 	pmu->cpus = pmu_cpumask(name);
-
+	pmu->name = strdup(name);
+	pmu->type = type;
 	pmu->is_uncore = pmu_is_uncore(name);
+	pmu_add_cpu_aliases(&aliases, pmu);
 
 	INIT_LIST_HEAD(&pmu->format);
 	INIT_LIST_HEAD(&pmu->aliases);
 	list_splice(&format, &pmu->format);
 	list_splice(&aliases, &pmu->aliases);
-	pmu->name = strdup(name);
-	pmu->type = type;
 	list_add_tail(&pmu->list, &pmus);
 
 	pmu->default_config = perf_pmu__get_default_config(pmu);
@@ -775,13 +830,14 @@ static void pmu_format_value(unsigned long *format, __u64 value, __u64 *v,
 
 static __u64 pmu_format_max_value(const unsigned long *format)
 {
-	__u64 w = 0;
-	int fbit;
+	int w;
 
-	for_each_set_bit(fbit, format, PERF_PMU_FORMAT_BITS)
-		w |= (1ULL << fbit);
-
-	return w;
+	w = bitmap_weight(format, PERF_PMU_FORMAT_BITS);
+	if (!w)
+		return 0;
+	if (w < 64)
+		return (1ULL << w) - 1;
+	return -1;
 }
 
 /*
@@ -1118,6 +1174,17 @@ void perf_pmu__set_format(unsigned long *bits, long from, long to)
 	memset(bits, 0, BITS_TO_BYTES(PERF_PMU_FORMAT_BITS));
 	for (b = from; b <= to; b++)
 		set_bit(b, bits);
+}
+
+void perf_pmu__del_formats(struct list_head *formats)
+{
+	struct perf_pmu_format *fmt, *tmp;
+
+	list_for_each_entry_safe(fmt, tmp, formats, list) {
+		list_del(&fmt->list);
+		free(fmt->name);
+		free(fmt);
+	}
 }
 
 static int sub_non_neg(int a, int b)

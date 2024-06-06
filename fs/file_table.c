@@ -148,6 +148,7 @@ over:
 	}
 	return ERR_PTR(-ENFILE);
 }
+EXPORT_SYMBOL_GPL(get_empty_filp);
 
 /**
  * alloc_file - allocate and initialize a 'struct file'
@@ -258,12 +259,13 @@ void flush_delayed_fput(void)
 {
 	delayed_fput(NULL);
 }
+EXPORT_SYMBOL_GPL(flush_delayed_fput);
 
 static DECLARE_DELAYED_WORK(delayed_fput_work, delayed_fput);
 
-void fput(struct file *file)
+void fput_many(struct file *file, unsigned int refs)
 {
-	if (atomic_long_dec_and_test(&file->f_count)) {
+	if (atomic_long_sub_and_test(refs, &file->f_count)) {
 		struct task_struct *task = current;
 
 		if (likely(!in_interrupt() && !(task->flags & PF_KTHREAD))) {
@@ -280,6 +282,11 @@ void fput(struct file *file)
 		if (llist_add(&file->f_u.fu_llist, &delayed_fput_list))
 			schedule_delayed_work(&delayed_fput_work, 1);
 	}
+}
+
+void fput(struct file *file)
+{
+	fput_many(file, 1);
 }
 
 /*
@@ -300,6 +307,7 @@ void __fput_sync(struct file *file)
 }
 
 EXPORT_SYMBOL(fput);
+EXPORT_SYMBOL_GPL(__fput_sync);
 
 void put_filp(struct file *file)
 {
@@ -308,6 +316,7 @@ void put_filp(struct file *file)
 		file_free(file);
 	}
 }
+EXPORT_SYMBOL_GPL(put_filp);
 
 void __init files_init(void)
 {

@@ -17,6 +17,7 @@
 #include <linux/clkdev.h>
 #include <linux/clk-provider.h>
 #include <linux/debugfs.h>
+#include <linux/dmi.h>
 #include <linux/idr.h>
 #include <linux/ioport.h>
 #include <linux/kernel.h>
@@ -130,16 +131,16 @@ static const struct mfd_cell intel_lpss_spi_cell = {
 static DEFINE_IDA(intel_lpss_devid_ida);
 static struct dentry *intel_lpss_debugfs;
 
-static int intel_lpss_request_dma_module(const char *name)
-{
-	static bool intel_lpss_dma_requested;
-
-	if (intel_lpss_dma_requested)
-		return 0;
-
-	intel_lpss_dma_requested = true;
-	return request_module("%s", name);
-}
+static const struct dmi_system_id mtrr_large_wc_region[] = {
+	{
+		.ident = "Dell Computer Corporation",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_MATCH(DMI_PRODUCT_NAME, "XPS 13 7390 2-in-1"),
+		},
+	},
+	{ }
+};
 
 static void intel_lpss_cache_ltr(struct intel_lpss *lpss)
 {
@@ -273,12 +274,15 @@ static void intel_lpss_init_dev(const struct intel_lpss *lpss)
 {
 	u32 value = LPSS_PRIV_SSP_REG_DIS_DMA_FIN;
 
+	/* Set the device in reset state */
+	writel(0, lpss->priv + LPSS_PRIV_RESETS);
+
 	intel_lpss_deassert_reset(lpss);
+
+	intel_lpss_set_remap_addr(lpss);
 
 	if (!intel_lpss_has_idma(lpss))
 		return;
-
-	intel_lpss_set_remap_addr(lpss);
 
 	/* Make sure that SPI multiblock DMA transfers are re-enabled */
 	if (lpss->type == LPSS_DEV_SPI)
@@ -394,8 +398,12 @@ int intel_lpss_probe(struct device *dev,
 	if (!lpss)
 		return -ENOMEM;
 
-	lpss->priv = devm_ioremap(dev, info->mem->start + LPSS_PRIV_OFFSET,
-				  LPSS_PRIV_SIZE);
+	if (dmi_check_system(mtrr_large_wc_region))
+		lpss->priv = devm_ioremap_uc(dev, info->mem->start + LPSS_PRIV_OFFSET,
+					     LPSS_PRIV_SIZE);
+	else
+		lpss->priv = devm_ioremap(dev, info->mem->start + LPSS_PRIV_OFFSET,
+					  LPSS_PRIV_SIZE);
 	if (!lpss->priv)
 		return -ENOMEM;
 
@@ -428,16 +436,6 @@ int intel_lpss_probe(struct device *dev,
 		dev_warn(dev, "Failed to create debugfs entries\n");
 
 	if (intel_lpss_has_idma(lpss)) {
-		/*
-		 * Ensure the DMA driver is loaded before the host
-		 * controller device appears, so that the host controller
-		 * driver can request its DMA channels as early as
-		 * possible.
-		 *
-		 * If the DMA module is not there that's OK as well.
-		 */
-		intel_lpss_request_dma_module(LPSS_IDMA64_DRIVER_NAME);
-
 		ret = mfd_add_devices(dev, lpss->devid, &intel_lpss_idma64_cell,
 				      1, info->mem, info->irq, NULL);
 		if (ret)
@@ -538,6 +536,7 @@ module_init(intel_lpss_init);
 
 static void __exit intel_lpss_exit(void)
 {
+	ida_destroy(&intel_lpss_devid_ida);
 	debugfs_remove(intel_lpss_debugfs);
 }
 module_exit(intel_lpss_exit);
@@ -548,3 +547,11 @@ MODULE_AUTHOR("Heikki Krogerus <heikki.krogerus@linux.intel.com>");
 MODULE_AUTHOR("Jarkko Nikula <jarkko.nikula@linux.intel.com>");
 MODULE_DESCRIPTION("Intel LPSS core driver");
 MODULE_LICENSE("GPL v2");
+/*
+ * Ensure the DMA driver is loaded before the host controller device appears,
+ * so that the host controller driver can request its DMA channels as early
+ * as possible.
+ *
+ * If the DMA module is not there that's OK as well.
+ */
+MODULE_SOFTDEP("pre: platform:" LPSS_IDMA64_DRIVER_NAME);

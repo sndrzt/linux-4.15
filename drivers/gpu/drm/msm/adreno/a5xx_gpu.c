@@ -30,7 +30,7 @@ static int zap_shader_load_mdt(struct msm_gpu *gpu, const char *fwname)
 {
 	struct device *dev = &gpu->pdev->dev;
 	const struct firmware *fw;
-	struct device_node *np;
+	struct device_node *np, *mem_np;
 	struct resource r;
 	phys_addr_t mem_phys;
 	ssize_t mem_size;
@@ -44,11 +44,13 @@ static int zap_shader_load_mdt(struct msm_gpu *gpu, const char *fwname)
 	if (!np)
 		return -ENODEV;
 
-	np = of_parse_phandle(np, "memory-region", 0);
-	if (!np)
+	mem_np = of_parse_phandle(np, "memory-region", 0);
+	of_node_put(np);
+	if (!mem_np)
 		return -EINVAL;
 
-	ret = of_address_to_resource(np, 0, &r);
+	ret = of_address_to_resource(mem_np, 0, &r);
+	of_node_put(mem_np);
 	if (ret)
 		return ret;
 
@@ -621,8 +623,6 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
 	if (adreno_gpu->info->quirks & ADRENO_QUIRK_TWO_PASS_USE_WFI)
 		gpu_rmw(gpu, REG_A5XX_PC_DBG_ECO_CNTL, 0, (1 << 8));
 
-	gpu_write(gpu, REG_A5XX_PC_DBG_ECO_CNTL, 0xc0200100);
-
 	/* Enable USE_RETENTION_FLOPS */
 	gpu_write(gpu, REG_A5XX_CP_CHICKEN_DBG, 0x02000000);
 
@@ -1135,8 +1135,8 @@ static int a5xx_pm_suspend(struct msm_gpu *gpu)
 
 static int a5xx_get_timestamp(struct msm_gpu *gpu, uint64_t *value)
 {
-	*value = gpu_read64(gpu, REG_A5XX_RBBM_PERFCTR_CP_0_LO,
-		REG_A5XX_RBBM_PERFCTR_CP_0_HI);
+	*value = gpu_read64(gpu, REG_A5XX_RBBM_ALWAYSON_COUNTER_LO,
+		REG_A5XX_RBBM_ALWAYSON_COUNTER_HI);
 
 	return 0;
 }
@@ -1210,7 +1210,8 @@ struct msm_gpu *a5xx_gpu_init(struct drm_device *dev)
 
 	a5xx_gpu->lm_leakage = 0x4E001A;
 
-	ret = adreno_gpu_init(dev, pdev, adreno_gpu, &funcs, 4);
+	/* Restricting nr_rings to 1 to temporarily disable preemption */
+	ret = adreno_gpu_init(dev, pdev, adreno_gpu, &funcs, 1);
 	if (ret) {
 		a5xx_destroy(&(a5xx_gpu->base.base));
 		return ERR_PTR(ret);

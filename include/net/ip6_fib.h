@@ -227,7 +227,7 @@ static inline bool rt6_get_cookie_safe(const struct rt6_info *rt,
 	fn = rcu_dereference(rt->rt6i_node);
 
 	if (fn) {
-		*cookie = fn->fn_sernum;
+		*cookie = READ_ONCE(fn->fn_sernum);
 		/* pairs with smp_wmb() in fib6_update_sernum_upto_root() */
 		smp_rmb();
 		status = true;
@@ -241,8 +241,7 @@ static inline u32 rt6_get_cookie(const struct rt6_info *rt)
 {
 	u32 cookie = 0;
 
-	if (rt->rt6i_flags & RTF_PCPU ||
-	    (unlikely(!list_empty(&rt->rt6i_uncached)) && rt->dst.from))
+	if (rt->dst.from)
 		rt = (struct rt6_info *)(rt->dst.from);
 
 	rt6_get_cookie_safe(rt, &cookie);

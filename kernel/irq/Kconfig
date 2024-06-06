@@ -80,6 +80,7 @@ config IRQ_FASTEOI_HIERARCHY_HANDLERS
 # Generic IRQ IPI support
 config GENERIC_IRQ_IPI
 	bool
+	select IRQ_DOMAIN_HIERARCHY
 
 # Generic MSI interrupt support
 config GENERIC_MSI_IRQ
@@ -116,6 +117,10 @@ config IRQ_DOMAIN_DEBUG
 # Support forced irq threading
 config IRQ_FORCED_THREADING
        bool
+
+config IRQ_FORCED_THREADING_DEFAULT
+	bool "Use IRQ threading by default"
+	depends on IRQ_FORCED_THREADING
 
 config SPARSE_IRQ
 	bool "Support sparse irq numbering" if MAY_HAVE_SPARSE_IRQ

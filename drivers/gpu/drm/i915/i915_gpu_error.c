@@ -231,6 +231,8 @@ static int compress_page(struct compress *c,
 
 		if (zlib_deflate(zstream, Z_SYNC_FLUSH) != Z_OK)
 			return -EIO;
+
+		cond_resched();
 	} while (zstream->avail_in);
 
 	/* Fallback to uncompressed if we increase size? */
@@ -287,6 +289,7 @@ static int compress_page(struct compress *c,
 	if (!i915_memcpy_from_wc(ptr, src, PAGE_SIZE))
 		memcpy(ptr, src, PAGE_SIZE);
 	dst->pages[dst->page_count++] = ptr;
+	cond_resched();
 
 	return 0;
 }
@@ -912,7 +915,7 @@ i915_error_object_create(struct drm_i915_private *i915,
 		ggtt->base.insert_page(&ggtt->base, dma, slot,
 				       I915_CACHE_NONE, 0);
 
-		s = io_mapping_map_atomic_wc(&ggtt->mappable, slot);
+		s = io_mapping_map_atomic_wc(&ggtt->iomap, slot);
 		ret = compress_page(&compress, (void  __force *)s, dst);
 		io_mapping_unmap_atomic(s);
 

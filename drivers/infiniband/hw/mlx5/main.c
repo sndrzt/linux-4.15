@@ -270,6 +270,9 @@ static int mlx5_query_port_roce(struct ib_device *device, u8 port_num,
 	if (err)
 		return err;
 
+	props->active_width     = IB_WIDTH_4X;
+	props->active_speed     = IB_SPEED_QDR;
+
 	translate_eth_proto_oper(eth_prot_oper, &props->active_speed,
 				 &props->active_width);
 
@@ -682,7 +685,8 @@ static int mlx5_ib_query_device(struct ib_device *ibdev,
 						MLX5_RX_HASH_SRC_PORT_TCP |
 						MLX5_RX_HASH_DST_PORT_TCP |
 						MLX5_RX_HASH_SRC_PORT_UDP |
-						MLX5_RX_HASH_DST_PORT_UDP;
+						MLX5_RX_HASH_DST_PORT_UDP |
+						MLX5_RX_HASH_INNER;
 			resp.response_length += sizeof(resp.rss_caps);
 		}
 	} else {
@@ -781,13 +785,17 @@ static int mlx5_ib_query_device(struct ib_device *ibdev,
 	}
 
 	if (MLX5_CAP_GEN(mdev, tag_matching)) {
-		props->tm_caps.max_rndv_hdr_size = MLX5_TM_MAX_RNDV_MSG_SIZE;
 		props->tm_caps.max_num_tags =
 			(1 << MLX5_CAP_GEN(mdev, log_tag_matching_list_sz)) - 1;
-		props->tm_caps.flags = IB_TM_CAP_RC;
 		props->tm_caps.max_ops =
 			1 << MLX5_CAP_GEN(mdev, log_max_qp_sz);
 		props->tm_caps.max_sge = MLX5_TM_MAX_SGE;
+	}
+
+	if (MLX5_CAP_GEN(mdev, tag_matching) &&
+	    MLX5_CAP_GEN(mdev, rndv_offload_rc)) {
+		props->tm_caps.flags = IB_TM_CAP_RNDV_RC;
+		props->tm_caps.max_rndv_hdr_size = MLX5_TM_MAX_RNDV_MSG_SIZE;
 	}
 
 	if (MLX5_CAP_GEN(dev->mdev, cq_moderation)) {
@@ -914,31 +922,26 @@ enum mlx5_ib_width {
 	MLX5_IB_WIDTH_12X	= 1 << 4
 };
 
-static int translate_active_width(struct ib_device *ibdev, u8 active_width,
+static void translate_active_width(struct ib_device *ibdev, u8 active_width,
 				  u8 *ib_width)
 {
 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
-	int err = 0;
 
-	if (active_width & MLX5_IB_WIDTH_1X) {
+	if (active_width & MLX5_IB_WIDTH_1X)
 		*ib_width = IB_WIDTH_1X;
-	} else if (active_width & MLX5_IB_WIDTH_2X) {
-		mlx5_ib_dbg(dev, "active_width %d is not supported by IB spec\n",
-			    (int)active_width);
-		err = -EINVAL;
-	} else if (active_width & MLX5_IB_WIDTH_4X) {
+	else if (active_width & MLX5_IB_WIDTH_4X)
 		*ib_width = IB_WIDTH_4X;
-	} else if (active_width & MLX5_IB_WIDTH_8X) {
+	else if (active_width & MLX5_IB_WIDTH_8X)
 		*ib_width = IB_WIDTH_8X;
-	} else if (active_width & MLX5_IB_WIDTH_12X) {
+	else if (active_width & MLX5_IB_WIDTH_12X)
 		*ib_width = IB_WIDTH_12X;
-	} else {
-		mlx5_ib_dbg(dev, "Invalid active_width %d\n",
+	else {
+		mlx5_ib_dbg(dev, "Invalid active_width %d, setting width to default value: 4x\n",
 			    (int)active_width);
-		err = -EINVAL;
+		*ib_width = IB_WIDTH_4X;
 	}
 
-	return err;
+	return;
 }
 
 static int mlx5_mtu_to_ib_mtu(int mtu)
@@ -1046,10 +1049,8 @@ static int mlx5_query_hca_port(struct ib_device *ibdev, u8 port,
 	if (err)
 		goto out;
 
-	err = translate_active_width(ibdev, ib_link_width_oper,
-				     &props->active_width);
-	if (err)
-		goto out;
+	translate_active_width(ibdev, ib_link_width_oper, &props->active_width);
+
 	err = mlx5_query_port_ib_proto_oper(mdev, &props->active_speed, port);
 	if (err)
 		goto out;
@@ -1698,6 +1699,8 @@ static void mlx5_ib_disassociate_ucontext(struct ib_ucontext *ibcontext)
 	 * mlx5_ib_vma_close.
 	 */
 	down_write(&owning_mm->mmap_sem);
+	if (!mmget_still_valid(owning_mm))
+		goto skip_mm;
 	mutex_lock(&context->vma_private_list_mutex);
 	list_for_each_entry_safe(vma_private, n, &context->vma_private_list,
 				 list) {
@@ -1714,6 +1717,7 @@ static void mlx5_ib_disassociate_ucontext(struct ib_ucontext *ibcontext)
 		kfree(vma_private);
 	}
 	mutex_unlock(&context->vma_private_list_mutex);
+skip_mm:
 	up_write(&owning_mm->mmap_sem);
 	mmput(owning_mm);
 	put_task_struct(owning_process);
@@ -3933,7 +3937,7 @@ mlx5_ib_get_vector_affinity(struct ib_device *ibdev, int comp_vector)
 {
 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
 
-	return mlx5_get_vector_affinity(dev->mdev, comp_vector);
+	return mlx5_get_vector_affinity_hint(dev->mdev, comp_vector);
 }
 
 static void *mlx5_ib_add(struct mlx5_core_dev *mdev)

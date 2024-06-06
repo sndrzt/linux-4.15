@@ -25,6 +25,7 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/task_stack.h>
 #include <linux/mm.h>
+#include <linux/nospec.h>
 #include <linux/smp.h>
 #include <linux/ptrace.h>
 #include <linux/user.h>
@@ -249,15 +250,20 @@ static struct perf_event *ptrace_hbp_get_event(unsigned int note_type,
 
 	switch (note_type) {
 	case NT_ARM_HW_BREAK:
-		if (idx < ARM_MAX_BRP)
-			bp = tsk->thread.debug.hbp_break[idx];
+		if (idx >= ARM_MAX_BRP)
+			goto out;
+		idx = array_index_nospec(idx, ARM_MAX_BRP);
+		bp = tsk->thread.debug.hbp_break[idx];
 		break;
 	case NT_ARM_HW_WATCH:
-		if (idx < ARM_MAX_WRP)
-			bp = tsk->thread.debug.hbp_watch[idx];
+		if (idx >= ARM_MAX_WRP)
+			goto out;
+		idx = array_index_nospec(idx, ARM_MAX_WRP);
+		bp = tsk->thread.debug.hbp_watch[idx];
 		break;
 	}
 
+out:
 	return bp;
 }
 
@@ -270,19 +276,22 @@ static int ptrace_hbp_set_event(unsigned int note_type,
 
 	switch (note_type) {
 	case NT_ARM_HW_BREAK:
-		if (idx < ARM_MAX_BRP) {
-			tsk->thread.debug.hbp_break[idx] = bp;
-			err = 0;
-		}
+		if (idx >= ARM_MAX_BRP)
+			goto out;
+		idx = array_index_nospec(idx, ARM_MAX_BRP);
+		tsk->thread.debug.hbp_break[idx] = bp;
+		err = 0;
 		break;
 	case NT_ARM_HW_WATCH:
-		if (idx < ARM_MAX_WRP) {
-			tsk->thread.debug.hbp_watch[idx] = bp;
-			err = 0;
-		}
+		if (idx >= ARM_MAX_WRP)
+			goto out;
+		idx = array_index_nospec(idx, ARM_MAX_WRP);
+		tsk->thread.debug.hbp_watch[idx] = bp;
+		err = 0;
 		break;
 	}
 
+out:
 	return err;
 }
 
@@ -617,6 +626,13 @@ static int gpr_set(struct task_struct *target, const struct user_regset *regset,
 	return 0;
 }
 
+static int fpr_active(struct task_struct *target, const struct user_regset *regset)
+{
+	if (!system_supports_fpsimd())
+		return -ENODEV;
+	return regset->n;
+}
+
 /*
  * TODO: update fp accessors for lazy context switching (sync/flush hwstate)
  */
@@ -639,6 +655,9 @@ static int fpr_get(struct task_struct *target, const struct user_regset *regset,
 		   unsigned int pos, unsigned int count,
 		   void *kbuf, void __user *ubuf)
 {
+	if (!system_supports_fpsimd())
+		return -EINVAL;
+
 	if (target == current)
 		fpsimd_preserve_current_state();
 
@@ -677,6 +696,9 @@ static int fpr_set(struct task_struct *target, const struct user_regset *regset,
 		   const void *kbuf, const void __user *ubuf)
 {
 	int ret;
+
+	if (!system_supports_fpsimd())
+		return -EINVAL;
 
 	ret = __fpr_set(target, regset, pos, count, kbuf, ubuf, 0);
 	if (ret)
@@ -983,6 +1005,7 @@ static const struct user_regset aarch64_regsets[] = {
 		 */
 		.size = sizeof(u32),
 		.align = sizeof(u32),
+		.active = fpr_active,
 		.get = fpr_get,
 		.set = fpr_set
 	},
@@ -1074,6 +1097,7 @@ static int compat_gpr_get(struct task_struct *target,
 			break;
 		case 16:
 			reg = task_pt_regs(target)->pstate;
+			reg = pstate_to_compat_psr(reg);
 			break;
 		case 17:
 			reg = task_pt_regs(target)->orig_x0;
@@ -1141,6 +1165,7 @@ static int compat_gpr_set(struct task_struct *target,
 			newregs.pc = reg;
 			break;
 		case 16:
+			reg = compat_psr_to_pstate(reg);
 			newregs.pstate = reg;
 			break;
 		case 17:
@@ -1168,6 +1193,9 @@ static int compat_vfp_get(struct task_struct *target,
 	struct user_fpsimd_state *uregs;
 	compat_ulong_t fpscr;
 	int ret, vregs_end_pos;
+
+	if (!system_supports_fpsimd())
+		return -EINVAL;
 
 	uregs = &target->thread.fpsimd_state.user_fpsimd;
 
@@ -1201,6 +1229,9 @@ static int compat_vfp_set(struct task_struct *target,
 	struct user_fpsimd_state *uregs;
 	compat_ulong_t fpscr;
 	int ret, vregs_end_pos;
+
+	if (!system_supports_fpsimd())
+		return -EINVAL;
 
 	uregs = &target->thread.fpsimd_state.user_fpsimd;
 
@@ -1259,6 +1290,7 @@ static const struct user_regset aarch32_regsets[] = {
 		.n = VFP_STATE_SIZE / sizeof(compat_ulong_t),
 		.size = sizeof(compat_ulong_t),
 		.align = sizeof(compat_ulong_t),
+		.active = fpr_active,
 		.get = compat_vfp_get,
 		.set = compat_vfp_set
 	},
@@ -1458,9 +1490,7 @@ static int compat_ptrace_gethbpregs(struct task_struct *tsk, compat_long_t num,
 {
 	int ret;
 	u32 kdata;
-	mm_segment_t old_fs = get_fs();
 
-	set_fs(KERNEL_DS);
 	/* Watchpoint */
 	if (num < 0) {
 		ret = compat_ptrace_hbp_get(NT_ARM_HW_WATCH, tsk, num, &kdata);
@@ -1471,7 +1501,6 @@ static int compat_ptrace_gethbpregs(struct task_struct *tsk, compat_long_t num,
 	} else {
 		ret = compat_ptrace_hbp_get(NT_ARM_HW_BREAK, tsk, num, &kdata);
 	}
-	set_fs(old_fs);
 
 	if (!ret)
 		ret = put_user(kdata, data);
@@ -1484,7 +1513,6 @@ static int compat_ptrace_sethbpregs(struct task_struct *tsk, compat_long_t num,
 {
 	int ret;
 	u32 kdata = 0;
-	mm_segment_t old_fs = get_fs();
 
 	if (num == 0)
 		return 0;
@@ -1493,12 +1521,10 @@ static int compat_ptrace_sethbpregs(struct task_struct *tsk, compat_long_t num,
 	if (ret)
 		return ret;
 
-	set_fs(KERNEL_DS);
 	if (num < 0)
 		ret = compat_ptrace_hbp_set(NT_ARM_HW_WATCH, tsk, num, &kdata);
 	else
 		ret = compat_ptrace_hbp_set(NT_ARM_HW_BREAK, tsk, num, &kdata);
-	set_fs(old_fs);
 
 	return ret;
 }
@@ -1663,15 +1689,20 @@ asmlinkage void syscall_trace_exit(struct pt_regs *regs)
 }
 
 /*
- * Bits which are always architecturally RES0 per ARM DDI 0487A.h
+ * SPSR_ELx bits which are always architecturally RES0 per ARM DDI 0487D.a.
+ * We permit userspace to set SSBS (AArch64 bit 12, AArch32 bit 23) which is
+ * not described in ARM DDI 0487D.a.
+ * We treat PAN and UAO as RES0 bits, as they are meaningless at EL0, and may
+ * be allocated an EL0 meaning in future.
  * Userspace cannot use these until they have an architectural meaning.
+ * Note that this follows the SPSR_ELx format, not the AArch32 PSR format.
  * We also reserve IL for the kernel; SS is handled dynamically.
  */
 #define SPSR_EL1_AARCH64_RES0_BITS \
-	(GENMASK_ULL(63,32) | GENMASK_ULL(27, 22) | GENMASK_ULL(20, 10) | \
-	 GENMASK_ULL(5, 5))
+	(GENMASK_ULL(63, 32) | GENMASK_ULL(27, 25) | GENMASK_ULL(23, 22) | \
+	 GENMASK_ULL(20, 13) | GENMASK_ULL(11, 10) | GENMASK_ULL(5, 5))
 #define SPSR_EL1_AARCH32_RES0_BITS \
-	(GENMASK_ULL(63,32) | GENMASK_ULL(24, 22) | GENMASK_ULL(20,20))
+	(GENMASK_ULL(63, 32) | GENMASK_ULL(22, 22) | GENMASK_ULL(20, 20))
 
 static int valid_compat_regs(struct user_pt_regs *regs)
 {
@@ -1729,8 +1760,8 @@ static int valid_native_regs(struct user_pt_regs *regs)
  */
 int valid_user_regs(struct user_pt_regs *regs, struct task_struct *task)
 {
-	if (!test_tsk_thread_flag(task, TIF_SINGLESTEP))
-		regs->pstate &= ~DBG_SPSR_SS;
+	/* https://lore.kernel.org/lkml/20191118131525.GA4180@willie-the-truck */
+	user_regs_reset_single_step(regs, task);
 
 	if (is_compat_thread(task_thread_info(task)))
 		return valid_compat_regs(regs);

@@ -13,6 +13,7 @@
 #include <linux/suspend.h>
 #include <linux/scatterlist.h>
 #include <linux/kdebug.h>
+#include <linux/cpu.h>
 
 #include <crypto/hash.h>
 
@@ -51,6 +52,12 @@ static int set_up_temporary_text_mapping(pgd_t *pgd)
 	pmd_t *pmd;
 	pud_t *pud;
 	p4d_t *p4d;
+	pgprot_t pgtable_prot = __pgprot(_KERNPG_TABLE);
+	pgprot_t pmd_text_prot = __pgprot(__PAGE_KERNEL_LARGE_EXEC);
+
+	/* Filter out unsupported __PAGE_KERNEL* bits: */
+	pgprot_val(pmd_text_prot) &= __default_kernel_pte_mask;
+	pgprot_val(pgtable_prot)  &= __default_kernel_pte_mask;
 
 	/*
 	 * The new mapping only has to cover the page containing the image
@@ -81,15 +88,19 @@ static int set_up_temporary_text_mapping(pgd_t *pgd)
 		return -ENOMEM;
 
 	set_pmd(pmd + pmd_index(restore_jump_address),
-		__pmd((jump_address_phys & PMD_MASK) | __PAGE_KERNEL_LARGE_EXEC));
+		__pmd((jump_address_phys & PMD_MASK) | pgprot_val(pmd_text_prot)));
 	set_pud(pud + pud_index(restore_jump_address),
-		__pud(__pa(pmd) | _KERNPG_TABLE));
+		__pud(__pa(pmd) | pgprot_val(pgtable_prot)));
 	if (IS_ENABLED(CONFIG_X86_5LEVEL)) {
-		set_p4d(p4d + p4d_index(restore_jump_address), __p4d(__pa(pud) | _KERNPG_TABLE));
-		set_pgd(pgd + pgd_index(restore_jump_address), __pgd(__pa(p4d) | _KERNPG_TABLE));
+		p4d_t new_p4d = __p4d(__pa(pud) | pgprot_val(pgtable_prot));
+		pgd_t new_pgd = __pgd(__pa(p4d) | pgprot_val(pgtable_prot));
+
+		set_p4d(p4d + p4d_index(restore_jump_address), new_p4d);
+		set_pgd(pgd + pgd_index(restore_jump_address), new_pgd);
 	} else {
 		/* No p4d for 4-level paging: point the pgd to the pud page table */
-		set_pgd(pgd + pgd_index(restore_jump_address), __pgd(__pa(pud) | _KERNPG_TABLE));
+		pgd_t new_pgd = __pgd(__pa(pud) | pgprot_val(pgtable_prot));
+		set_pgd(pgd + pgd_index(restore_jump_address), new_pgd);
 	}
 
 	return 0;
@@ -174,7 +185,7 @@ out:
 	return 0;
 }
 
-int swsusp_arch_resume(void)
+asmlinkage int swsusp_arch_resume(void)
 {
 	int error;
 
@@ -249,9 +260,9 @@ static int get_e820_md5(struct e820_table *table, void *buf)
 	return ret;
 }
 
-static void hibernation_e820_save(void *buf)
+static int hibernation_e820_save(void *buf)
 {
-	get_e820_md5(e820_table_firmware, buf);
+	return get_e820_md5(e820_table_firmware, buf);
 }
 
 static bool hibernation_e820_mismatch(void *buf)
@@ -271,8 +282,9 @@ static bool hibernation_e820_mismatch(void *buf)
 	return memcmp(result, buf, MD5_DIGEST_SIZE) ? true : false;
 }
 #else
-static void hibernation_e820_save(void *buf)
+static int hibernation_e820_save(void *buf)
 {
+	return 0;
 }
 
 static bool hibernation_e820_mismatch(void *buf)
@@ -317,9 +329,7 @@ int arch_hibernation_header_save(void *addr, unsigned int max_size)
 
 	rdr->magic = RESTORE_MAGIC;
 
-	hibernation_e820_save(rdr->e820_digest);
-
-	return 0;
+	return hibernation_e820_save(rdr->e820_digest);
 }
 
 /**
@@ -346,4 +356,36 @@ int arch_hibernation_header_restore(void *addr)
 	}
 
 	return 0;
+}
+
+int arch_resume_nosmt(void)
+{
+	int ret = 0;
+	/*
+	 * We reached this while coming out of hibernation. This means
+	 * that SMT siblings are sleeping in hlt, as mwait is not safe
+	 * against control transition during resume (see comment in
+	 * hibernate_resume_nonboot_cpu_disable()).
+	 *
+	 * If the resumed kernel has SMT disabled, we have to take all the
+	 * SMT siblings out of hlt, and offline them again so that they
+	 * end up in mwait proper.
+	 *
+	 * Called with hotplug disabled.
+	 */
+	cpu_hotplug_enable();
+	if (cpu_smt_control == CPU_SMT_DISABLED ||
+			cpu_smt_control == CPU_SMT_FORCE_DISABLED) {
+		enum cpuhp_smt_control old = cpu_smt_control;
+
+		ret = cpuhp_smt_enable();
+		if (ret)
+			goto out;
+		ret = cpuhp_smt_disable(old);
+		if (ret)
+			goto out;
+	}
+out:
+	cpu_hotplug_disable();
+	return ret;
 }

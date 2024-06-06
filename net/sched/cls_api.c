@@ -30,6 +30,8 @@
 #include <net/pkt_sched.h>
 #include <net/pkt_cls.h>
 
+extern const struct nla_policy rtm_tca_policy[TCA_MAX + 1];
+
 /* The list of all installed classifier types */
 static LIST_HEAD(tcf_proto_base);
 
@@ -102,9 +104,10 @@ int unregister_tcf_proto_ops(struct tcf_proto_ops *ops)
 }
 EXPORT_SYMBOL(unregister_tcf_proto_ops);
 
-bool tcf_queue_work(struct work_struct *work)
+bool tcf_queue_work(struct rcu_work *rwork, work_func_t func)
 {
-	return queue_work(tc_filter_wq, work);
+	INIT_RCU_WORK(rwork, func);
+	return queue_rcu_work(tc_filter_wq, rwork);
 }
 EXPORT_SYMBOL(tcf_queue_work);
 
@@ -150,8 +153,8 @@ static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
 		} else {
 			err = -ENOENT;
 		}
-		goto errout;
 #endif
+		goto errout;
 	}
 	tp->classify = tp->ops->classify;
 	tp->protocol = protocol;
@@ -217,8 +220,12 @@ static void tcf_chain_flush(struct tcf_chain *chain)
 
 static void tcf_chain_destroy(struct tcf_chain *chain)
 {
+	struct tcf_block *block = chain->block;
+
 	list_del(&chain->list);
 	kfree(chain);
+	if (list_empty(&block->chain_list))
+		kfree(block);
 }
 
 static void tcf_chain_hold(struct tcf_chain *chain)
@@ -329,49 +336,34 @@ int tcf_block_get(struct tcf_block **p_block,
 }
 EXPORT_SYMBOL(tcf_block_get);
 
-static void tcf_block_put_final(struct work_struct *work)
-{
-	struct tcf_block *block = container_of(work, struct tcf_block, work);
-	struct tcf_chain *chain, *tmp;
-
-	rtnl_lock();
-
-	/* At this point, all the chains should have refcnt == 1. */
-	list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
-		tcf_chain_put(chain);
-	rtnl_unlock();
-	kfree(block);
-}
-
 /* XXX: Standalone actions are not allowed to jump to any chain, and bound
  * actions should be all removed after flushing.
  */
 void tcf_block_put_ext(struct tcf_block *block, struct Qdisc *q,
 		       struct tcf_block_ext_info *ei)
 {
-	struct tcf_chain *chain;
+	struct tcf_chain *chain, *tmp;
 
 	if (!block)
 		return;
-	/* Hold a refcnt for all chains, except 0, so that they don't disappear
+	/* Hold a refcnt for all chains, so that they don't disappear
 	 * while we are iterating.
 	 */
 	list_for_each_entry(chain, &block->chain_list, list)
-		if (chain->index)
-			tcf_chain_hold(chain);
+		tcf_chain_hold(chain);
 
 	list_for_each_entry(chain, &block->chain_list, list)
 		tcf_chain_flush(chain);
 
 	tcf_block_offload_unbind(block, q, ei);
 
-	INIT_WORK(&block->work, tcf_block_put_final);
-	/* Wait for existing RCU callbacks to cool down, make sure their works
-	 * have been queued before this. We can not flush pending works here
-	 * because we are holding the RTNL lock.
-	 */
-	rcu_barrier();
-	tcf_queue_work(&block->work);
+	/* At this point, all the chains should have refcnt >= 1. */
+	list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
+		tcf_chain_put(chain);
+
+	/* Finally, put chain 0 and allow block to be freed. */
+	chain = list_first_entry(&block->chain_list, struct tcf_chain, list);
+	tcf_chain_put(chain);
 }
 EXPORT_SYMBOL(tcf_block_put_ext);
 
@@ -496,7 +488,6 @@ static int tcf_block_cb_call(struct tcf_block *block, enum tc_setup_type type,
 int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 		 struct tcf_result *res, bool compat_mode)
 {
-	__be16 protocol = tc_skb_protocol(skb);
 #ifdef CONFIG_NET_CLS_ACT
 	const int max_reclassify_loop = 4;
 	const struct tcf_proto *orig_tp = tp;
@@ -506,6 +497,7 @@ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 reclassify:
 #endif
 	for (; tp; tp = rcu_dereference_bh(tp->next)) {
+		__be16 protocol = tc_skb_protocol(skb);
 		int err;
 
 		if (tp->protocol != protocol &&
@@ -537,7 +529,6 @@ reset:
 	}
 
 	tp = first_tp;
-	protocol = tc_skb_protocol(skb);
 	goto reclassify;
 #endif
 }
@@ -741,7 +732,7 @@ static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
 replay:
 	tp_created = 0;
 
-	err = nlmsg_parse(n, sizeof(*t), tca, TCA_MAX, NULL, extack);
+	err = nlmsg_parse(n, sizeof(*t), tca, TCA_MAX, rtm_tca_policy, extack);
 	if (err < 0)
 		return err;
 
@@ -924,6 +915,9 @@ replay:
 			tcf_chain_tp_insert(chain, &chain_info, tp);
 		tfilter_notify(net, skb, n, tp, q, parent, fh,
 			       RTM_NEWTFILTER, false);
+		/* q pointer is NULL for shared blocks */
+		if (q)
+			q->flags &= ~TCQ_F_CAN_BYPASS;
 	} else {
 		if (tp_created)
 			tcf_proto_destroy(tp);
@@ -1026,7 +1020,8 @@ static int tc_dump_tfilter(struct sk_buff *skb, struct netlink_callback *cb)
 	if (nlmsg_len(cb->nlh) < sizeof(*tcm))
 		return skb->len;
 
-	err = nlmsg_parse(cb->nlh, sizeof(*tcm), tca, TCA_MAX, NULL, NULL);
+	err = nlmsg_parse(cb->nlh, sizeof(*tcm), tca, TCA_MAX, rtm_tca_policy,
+			  NULL);
 	if (err)
 		return err;
 
@@ -1065,13 +1060,18 @@ static int tc_dump_tfilter(struct sk_buff *skb, struct netlink_callback *cb)
 		    nla_get_u32(tca[TCA_CHAIN]) != chain->index)
 			continue;
 		if (!tcf_chain_dump(chain, q, parent, skb, cb,
-				    index_start, &index))
+				    index_start, &index)) {
+			err = -EMSGSIZE;
 			break;
+		}
 	}
 
 	cb->args[0] = index;
 
 out:
+	/* If we did no progress, the error (EMSGSIZE) is real */
+	if (skb->len == 0 && err)
+		return err;
 	return skb->len;
 }
 
@@ -1119,7 +1119,6 @@ int tcf_exts_validate(struct net *net, struct tcf_proto *tp, struct nlattr **tb,
 				exts->actions[i++] = act;
 			exts->nr_actions = i;
 		}
-		exts->net = net;
 	}
 #else
 	if ((exts->action && tb[exts->action]) ||
@@ -1247,7 +1246,7 @@ int tc_setup_cb_call(struct tcf_block *block, struct tcf_exts *exts,
 		return ret;
 	ok_count = ret;
 
-	if (!exts)
+	if (!exts || ok_count)
 		return ok_count;
 	ret = tc_exts_setup_cb_egdev_call(exts, type, type_data, err_stop);
 	if (ret < 0)

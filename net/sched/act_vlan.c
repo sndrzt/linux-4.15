@@ -161,6 +161,8 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 			case htons(ETH_P_8021AD):
 				break;
 			default:
+				if (exists)
+					tcf_idr_release(*a, bind);
 				return -EPROTONOSUPPORT;
 			}
 		} else {
@@ -225,7 +227,8 @@ static void tcf_vlan_cleanup(struct tc_action *a, int bind)
 	struct tcf_vlan_params *p;
 
 	p = rcu_dereference_protected(v->vlan_p, 1);
-	kfree_rcu(p, rcu);
+	if (p)
+		kfree_rcu(p, rcu);
 }
 
 static int tcf_vlan_dump(struct sk_buff *skb, struct tc_action *a,
@@ -298,7 +301,7 @@ static __net_init int vlan_init_net(struct net *net)
 {
 	struct tc_action_net *tn = net_generic(net, vlan_net_id);
 
-	return tc_action_net_init(tn, &act_vlan_ops);
+	return tc_action_net_init(net, tn, &act_vlan_ops);
 }
 
 static void __net_exit vlan_exit_net(struct net *net)

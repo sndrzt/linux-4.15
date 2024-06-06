@@ -99,7 +99,7 @@ struct rxrpc_connection *rxrpc_find_connection_rcu(struct rxrpc_local *local,
 	k.epoch	= sp->hdr.epoch;
 	k.cid	= sp->hdr.cid & RXRPC_CIDMASK;
 
-	if (sp->hdr.flags & RXRPC_CLIENT_INITIATED) {
+	if (rxrpc_to_server(sp)) {
 		/* We need to look up service connections by the full protocol
 		 * parameter set.  We look up the peer first as an intermediate
 		 * step and then the connection from the peer's tree.
@@ -205,9 +205,11 @@ void rxrpc_disconnect_call(struct rxrpc_call *call)
 
 	call->peer->cong_cwnd = call->cong_cwnd;
 
-	spin_lock_bh(&conn->params.peer->lock);
-	hlist_del_init(&call->error_link);
-	spin_unlock_bh(&conn->params.peer->lock);
+	if (!hlist_unhashed(&call->error_link)) {
+		spin_lock_bh(&conn->params.peer->lock);
+		hlist_del_init(&call->error_link);
+		spin_unlock_bh(&conn->params.peer->lock);
+	}
 
 	if (rxrpc_is_client_call(call))
 		return rxrpc_disconnect_client_call(call);
@@ -216,9 +218,8 @@ void rxrpc_disconnect_call(struct rxrpc_call *call)
 	__rxrpc_disconnect_call(conn, call);
 	spin_unlock(&conn->channel_lock);
 
-	call->conn = NULL;
+	set_bit(RXRPC_CALL_DISCONNECTED, &call->flags);
 	conn->idle_timestamp = jiffies;
-	rxrpc_put_connection(conn);
 }
 
 /*
@@ -388,7 +389,7 @@ void rxrpc_service_connection_reaper(struct work_struct *work)
 		if (conn->state == RXRPC_CONN_SERVICE_PREALLOC)
 			continue;
 
-		if (rxnet->live) {
+		if (rxnet->live && !conn->params.local->dead) {
 			idle_timestamp = READ_ONCE(conn->idle_timestamp);
 			expire_at = idle_timestamp + rxrpc_connection_expiry * HZ;
 			if (conn->params.local->service_closed)

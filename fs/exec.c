@@ -63,6 +63,8 @@
 #include <linux/compat.h>
 #include <linux/vmalloc.h>
 
+#include <trace/events/fs.h>
+
 #include <linux/uaccess.h>
 #include <asm/mmu_context.h>
 #include <asm/tlb.h>
@@ -109,6 +111,14 @@ bool path_noexec(const struct path *path)
 	return (path->mnt->mnt_flags & MNT_NOEXEC) ||
 	       (path->mnt->mnt_sb->s_iflags & SB_I_NOEXEC);
 }
+EXPORT_SYMBOL_GPL(path_noexec);
+
+bool path_nosuid(const struct path *path)
+{
+	return !mnt_may_suid(path->mnt) ||
+	       (path->mnt->mnt_sb->s_iflags & SB_I_NOSUID);
+}
+EXPORT_SYMBOL(path_nosuid);
 
 #ifdef CONFIG_USELIB
 /*
@@ -290,7 +300,7 @@ static int __bprm_mm_init(struct linux_binprm *bprm)
 	struct vm_area_struct *vma = NULL;
 	struct mm_struct *mm = bprm->mm;
 
-	bprm->vma = vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
+	bprm->vma = vma = vm_area_alloc(mm);
 	if (!vma)
 		return -ENOMEM;
 
@@ -298,7 +308,6 @@ static int __bprm_mm_init(struct linux_binprm *bprm)
 		err = -EINTR;
 		goto err_free;
 	}
-	vma->vm_mm = mm;
 
 	/*
 	 * Place the stack at the largest stack address the architecture
@@ -311,7 +320,6 @@ static int __bprm_mm_init(struct linux_binprm *bprm)
 	vma->vm_start = vma->vm_end - PAGE_SIZE;
 	vma->vm_flags = VM_SOFTDIRTY | VM_STACK_FLAGS | VM_STACK_INCOMPLETE_SETUP;
 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
-	INIT_LIST_HEAD(&vma->anon_vma_chain);
 
 	err = insert_vm_struct(mm, vma);
 	if (err)
@@ -326,7 +334,7 @@ err:
 	up_write(&mm->mmap_sem);
 err_free:
 	bprm->vma = NULL;
-	kmem_cache_free(vm_area_cachep, vma);
+	vm_area_free(vma);
 	return err;
 }
 
@@ -864,6 +872,8 @@ static struct file *do_open_execat(int fd, struct filename *name, int flags)
 	if (name->name[0] != '\0')
 		fsnotify_open(file);
 
+	trace_open_exec(name->name);
+
 out:
 	return file;
 
@@ -925,7 +935,7 @@ int kernel_read_file(struct file *file, void **buf, loff_t *size,
 		bytes = kernel_read(file, *buf + pos, i_size - pos, &pos);
 		if (bytes < 0) {
 			ret = bytes;
-			goto out;
+			goto out_free;
 		}
 
 		if (bytes == 0)
@@ -980,7 +990,7 @@ int kernel_read_file_from_fd(int fd, void **buf, loff_t *size, loff_t max_size,
 	struct fd f = fdget(fd);
 	int ret = -EBADF;
 
-	if (!f.file)
+	if (!f.file || !(f.file->f_mode & FMODE_READ))
 		goto out;
 
 	ret = kernel_read_file(f.file, buf, size, max_size, id);
@@ -1007,7 +1017,7 @@ static int exec_mmap(struct mm_struct *mm)
 	/* Notify parent that we're no longer interested in the old VM */
 	tsk = current;
 	old_mm = current->mm;
-	mm_release(tsk, old_mm);
+	exec_mm_release(tsk, old_mm);
 
 	if (old_mm) {
 		sync_mm_rss(old_mm);
@@ -1024,10 +1034,23 @@ static int exec_mmap(struct mm_struct *mm)
 		}
 	}
 	task_lock(tsk);
+
+	local_irq_disable();
 	active_mm = tsk->active_mm;
-	tsk->mm = mm;
 	tsk->active_mm = mm;
+	tsk->mm = mm;
+	/*
+	 * This prevents preemption while active_mm is being loaded and
+	 * it and mm are being updated, which could cause problems for
+	 * lazy tlb mm refcounting when these are updated by context
+	 * switches. Not all architectures can handle irqs off over
+	 * activate_mm yet.
+	 */
+	if (!IS_ENABLED(CONFIG_ARCH_WANT_IRQS_OFF_ACTIVATE_MM))
+		local_irq_enable();
 	activate_mm(active_mm, mm);
+	if (IS_ENABLED(CONFIG_ARCH_WANT_IRQS_OFF_ACTIVATE_MM))
+		local_irq_enable();
 	tsk->mm->vmacache_seqnum = 0;
 	vmacache_flush(tsk);
 	task_unlock(tsk);
@@ -1264,6 +1287,8 @@ int flush_old_exec(struct linux_binprm * bprm)
 	 */
 	set_mm_exe_file(bprm->mm, bprm->file);
 
+	would_dump(bprm, bprm->file);
+
 	/*
 	 * Release all of the old mmap stuff
 	 */
@@ -1373,7 +1398,7 @@ void setup_new_exec(struct linux_binprm * bprm)
 
 	/* An exec changes our domain. We are no longer part of the thread
 	   group */
-	current->self_exec_id++;
+	WRITE_ONCE(current->self_exec_id, current->self_exec_id + 1);
 	flush_signal_handlers(current, 0);
 }
 EXPORT_SYMBOL(setup_new_exec);
@@ -1507,7 +1532,7 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
 	bprm->cred->euid = current_euid();
 	bprm->cred->egid = current_egid();
 
-	if (!mnt_may_suid(bprm->file->f_path.mnt))
+	if (path_nosuid(&bprm->file->f_path))
 		return;
 
 	if (task_no_new_privs(current))
@@ -1773,6 +1798,9 @@ static int do_execveat_common(int fd, struct filename *filename,
 		goto out_unmark;
 
 	bprm->argc = count(argv, MAX_ARG_STRINGS);
+	if (bprm->argc == 0)
+		pr_warn_once("process '%s' launched '%s' with NULL argv: empty string added\n",
+			     current->comm, bprm->filename);
 	if ((retval = bprm->argc) < 0)
 		goto out;
 
@@ -1797,7 +1825,19 @@ static int do_execveat_common(int fd, struct filename *filename,
 	if (retval < 0)
 		goto out;
 
-	would_dump(bprm, bprm->file);
+	/*
+	 * When argv is empty, add an empty string ("") as argv[0] to
+	 * ensure confused userspace programs that start processing
+	 * from argv[1] won't end up walking envp. See also
+	 * bprm_stack_limits().
+	 */
+	if (bprm->argc == 0) {
+		const char *argv[] = { "", NULL };
+		retval = copy_strings_kernel(1, argv, bprm);
+		if (retval < 0)
+			goto out;
+		bprm->argc = 1;
+	}
 
 	retval = exec_binprm(bprm);
 	if (retval < 0)
@@ -1808,7 +1848,7 @@ static int do_execveat_common(int fd, struct filename *filename,
 	current->in_execve = 0;
 	membarrier_execve(current);
 	acct_update_integrals(current);
-	task_numa_free(current);
+	task_numa_free(current, false);
 	free_bprm(bprm);
 	kfree(pathbuf);
 	putname(filename);

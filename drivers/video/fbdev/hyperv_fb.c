@@ -252,7 +252,7 @@ static inline int synthvid_send(struct hv_device *hdev,
 			       VM_PKT_DATA_INBAND, 0);
 
 	if (ret)
-		pr_err("Unable to send packet via vmbus\n");
+		pr_err_ratelimited("Unable to send packet via vmbus; error %d\n", ret);
 
 	return ret;
 }
@@ -712,7 +712,10 @@ static int hvfb_getmem(struct hv_device *hdev, struct fb_info *info)
 		goto err1;
 	}
 
-	fb_virt = ioremap(par->mem->start, screen_fb_size);
+	/*
+	 * Map the VRAM cacheable for performance.
+	 */
+	fb_virt = ioremap_wc(par->mem->start, screen_fb_size);
 	if (!fb_virt)
 		goto err2;
 

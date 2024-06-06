@@ -163,6 +163,7 @@ struct mv_xor_v2_device {
 	void __iomem *dma_base;
 	void __iomem *glob_base;
 	struct clk *clk;
+	struct clk *reg_clk;
 	struct tasklet_struct irq_tasklet;
 	struct list_head free_sw_desc;
 	struct dma_device dmadev;
@@ -749,13 +750,26 @@ static int mv_xor_v2_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	xor_dev->reg_clk = devm_clk_get(&pdev->dev, "reg");
+	if (PTR_ERR(xor_dev->reg_clk) != -ENOENT) {
+		if (!IS_ERR(xor_dev->reg_clk)) {
+			ret = clk_prepare_enable(xor_dev->reg_clk);
+			if (ret)
+				return ret;
+		} else {
+			return PTR_ERR(xor_dev->reg_clk);
+		}
+	}
+
 	xor_dev->clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(xor_dev->clk) && PTR_ERR(xor_dev->clk) == -EPROBE_DEFER)
-		return -EPROBE_DEFER;
+	if (IS_ERR(xor_dev->clk) && PTR_ERR(xor_dev->clk) == -EPROBE_DEFER) {
+		ret = EPROBE_DEFER;
+		goto disable_reg_clk;
+	}
 	if (!IS_ERR(xor_dev->clk)) {
 		ret = clk_prepare_enable(xor_dev->clk);
 		if (ret)
-			return ret;
+			goto disable_reg_clk;
 	}
 
 	ret = platform_msi_domain_alloc_irqs(&pdev->dev, 1,
@@ -764,8 +778,10 @@ static int mv_xor_v2_probe(struct platform_device *pdev)
 		goto disable_clk;
 
 	msi_desc = first_msi_entry(&pdev->dev);
-	if (!msi_desc)
+	if (!msi_desc) {
+		ret = -ENODEV;
 		goto free_msi_irqs;
+	}
 
 	ret = devm_request_irq(&pdev->dev, msi_desc->irq,
 			       mv_xor_v2_interrupt_handler, 0,
@@ -866,8 +882,9 @@ free_hw_desq:
 free_msi_irqs:
 	platform_msi_domain_free_irqs(&pdev->dev);
 disable_clk:
-	if (!IS_ERR(xor_dev->clk))
-		clk_disable_unprepare(xor_dev->clk);
+	clk_disable_unprepare(xor_dev->clk);
+disable_reg_clk:
+	clk_disable_unprepare(xor_dev->reg_clk);
 	return ret;
 }
 
@@ -883,7 +900,10 @@ static int mv_xor_v2_remove(struct platform_device *pdev)
 
 	platform_msi_domain_free_irqs(&pdev->dev);
 
+	tasklet_kill(&xor_dev->irq_tasklet);
+
 	clk_disable_unprepare(xor_dev->clk);
+	clk_disable_unprepare(xor_dev->reg_clk);
 
 	return 0;
 }

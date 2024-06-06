@@ -232,6 +232,14 @@ nfp_flower_calculate_key_layers(struct nfp_fl_key_ls *ret_key_ls,
 		case cpu_to_be16(ETH_P_ARP):
 			return -EOPNOTSUPP;
 
+		case cpu_to_be16(ETH_P_MPLS_UC):
+		case cpu_to_be16(ETH_P_MPLS_MC):
+			if (!(key_layer & NFP_FLOWER_LAYER_MAC)) {
+				key_layer |= NFP_FLOWER_LAYER_MAC;
+				key_size += sizeof(struct nfp_flower_mac_mpls);
+			}
+			break;
+
 		/* Will be included in layer 2. */
 		case cpu_to_be16(ETH_P_8021Q):
 			break;
@@ -325,6 +333,7 @@ static int
 nfp_flower_add_offload(struct nfp_app *app, struct net_device *netdev,
 		       struct tc_cls_flower_offload *flow, bool egress)
 {
+	struct nfp_port *port = nfp_port_from_netdev(netdev);
 	struct nfp_flower_priv *priv = app->priv;
 	struct nfp_fl_payload *flow_pay;
 	struct nfp_fl_key_ls *key_layer;
@@ -364,6 +373,7 @@ nfp_flower_add_offload(struct nfp_app *app, struct net_device *netdev,
 	INIT_HLIST_NODE(&flow_pay->link);
 	flow_pay->tc_flower_cookie = flow->cookie;
 	hash_add_rcu(priv->flow_table, &flow_pay->link, flow->cookie);
+	port->tc_offload_cnt++;
 
 	/* Deallocate flow payload when flower rule has been destroyed. */
 	kfree(key_layer);
@@ -395,6 +405,7 @@ static int
 nfp_flower_del_offload(struct nfp_app *app, struct net_device *netdev,
 		       struct tc_cls_flower_offload *flow)
 {
+	struct nfp_port *port = nfp_port_from_netdev(netdev);
 	struct nfp_fl_payload *nfp_flow;
 	int err;
 
@@ -416,6 +427,7 @@ nfp_flower_del_offload(struct nfp_app *app, struct net_device *netdev,
 
 err_free_flow:
 	hash_del_rcu(&nfp_flow->link);
+	port->tc_offload_cnt--;
 	kfree(nfp_flow->action_data);
 	kfree(nfp_flow->mask_data);
 	kfree(nfp_flow->unmasked_data);

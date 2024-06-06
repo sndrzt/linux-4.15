@@ -138,18 +138,23 @@ static bool ip6_parse_tlv(const struct tlvtype_proc *procs,
 	len -= 2;
 
 	while (len > 0) {
-		int optlen = nh[off + 1] + 2;
-		int i;
+		int optlen, i;
 
-		switch (nh[off]) {
-		case IPV6_TLV_PAD1:
-			optlen = 1;
+		if (nh[off] == IPV6_TLV_PAD1) {
 			padlen++;
 			if (padlen > 7)
 				goto bad;
-			break;
+			off++;
+			len--;
+			continue;
+		}
+		if (len < 2)
+			goto bad;
+		optlen = nh[off + 1] + 2;
+		if (optlen > len)
+			goto bad;
 
-		case IPV6_TLV_PADN:
+		if (nh[off] == IPV6_TLV_PADN) {
 			/* RFC 2460 states that the purpose of PadN is
 			 * to align the containing header to multiples
 			 * of 8. 7 is therefore the highest valid value.
@@ -166,12 +171,7 @@ static bool ip6_parse_tlv(const struct tlvtype_proc *procs,
 				if (nh[off + i] != 0)
 					goto bad;
 			}
-			break;
-
-		default: /* Other TLV code so scan list */
-			if (optlen > len)
-				goto bad;
-
+		} else {
 			tlv_count++;
 			if (tlv_count > max_count)
 				goto bad;
@@ -191,7 +191,6 @@ static bool ip6_parse_tlv(const struct tlvtype_proc *procs,
 				return false;
 
 			padlen = 0;
-			break;
 		}
 		off += optlen;
 		len -= optlen;
@@ -308,7 +307,7 @@ fail_and_free:
 #endif
 
 	if (ip6_parse_tlv(tlvprocdestopt_lst, skb,
-			  init_net.ipv6.sysctl.max_dst_opts_cnt)) {
+			  net->ipv6.sysctl.max_dst_opts_cnt)) {
 		skb->transport_header += extlen;
 		opt = IP6CB(skb);
 #if IS_ENABLED(CONFIG_IPV6_MIP6)
@@ -861,7 +860,7 @@ fail_and_free:
 
 	opt->flags |= IP6SKB_HOPBYHOP;
 	if (ip6_parse_tlv(tlvprochopopt_lst, skb,
-			  init_net.ipv6.sysctl.max_hbh_opts_cnt)) {
+			  net->ipv6.sysctl.max_hbh_opts_cnt)) {
 		skb->transport_header += extlen;
 		opt = IP6CB(skb);
 		opt->nhoff = sizeof(struct ipv6hdr);
@@ -1028,29 +1027,21 @@ ipv6_dup_options(struct sock *sk, struct ipv6_txoptions *opt)
 }
 EXPORT_SYMBOL_GPL(ipv6_dup_options);
 
-static int ipv6_renew_option(void *ohdr,
-			     struct ipv6_opt_hdr __user *newopt, int newoptlen,
-			     int inherit,
-			     struct ipv6_opt_hdr **hdr,
-			     char **p)
+static void ipv6_renew_option(int renewtype,
+			      struct ipv6_opt_hdr **dest,
+			      struct ipv6_opt_hdr *old,
+			      struct ipv6_opt_hdr *new,
+			      int newtype, char **p)
 {
-	if (inherit) {
-		if (ohdr) {
-			memcpy(*p, ohdr, ipv6_optlen((struct ipv6_opt_hdr *)ohdr));
-			*hdr = (struct ipv6_opt_hdr *)*p;
-			*p += CMSG_ALIGN(ipv6_optlen(*hdr));
-		}
-	} else {
-		if (newopt) {
-			if (copy_from_user(*p, newopt, newoptlen))
-				return -EFAULT;
-			*hdr = (struct ipv6_opt_hdr *)*p;
-			if (ipv6_optlen(*hdr) > newoptlen)
-				return -EINVAL;
-			*p += CMSG_ALIGN(newoptlen);
-		}
-	}
-	return 0;
+	struct ipv6_opt_hdr *src;
+
+	src = (renewtype == newtype ? new : old);
+	if (!src)
+		return;
+
+	memcpy(*p, src, ipv6_optlen(src));
+	*dest = (struct ipv6_opt_hdr *)*p;
+	*p += CMSG_ALIGN(ipv6_optlen(*dest));
 }
 
 /**
@@ -1076,13 +1067,11 @@ static int ipv6_renew_option(void *ohdr,
  */
 struct ipv6_txoptions *
 ipv6_renew_options(struct sock *sk, struct ipv6_txoptions *opt,
-		   int newtype,
-		   struct ipv6_opt_hdr __user *newopt, int newoptlen)
+		   int newtype, struct ipv6_opt_hdr *newopt)
 {
 	int tot_len = 0;
 	char *p;
 	struct ipv6_txoptions *opt2;
-	int err;
 
 	if (opt) {
 		if (newtype != IPV6_HOPOPTS && opt->hopopt)
@@ -1095,8 +1084,8 @@ ipv6_renew_options(struct sock *sk, struct ipv6_txoptions *opt,
 			tot_len += CMSG_ALIGN(ipv6_optlen(opt->dst1opt));
 	}
 
-	if (newopt && newoptlen)
-		tot_len += CMSG_ALIGN(newoptlen);
+	if (newopt)
+		tot_len += CMSG_ALIGN(ipv6_optlen(newopt));
 
 	if (!tot_len)
 		return NULL;
@@ -1111,29 +1100,19 @@ ipv6_renew_options(struct sock *sk, struct ipv6_txoptions *opt,
 	opt2->tot_len = tot_len;
 	p = (char *)(opt2 + 1);
 
-	err = ipv6_renew_option(opt ? opt->hopopt : NULL, newopt, newoptlen,
-				newtype != IPV6_HOPOPTS,
-				&opt2->hopopt, &p);
-	if (err)
-		goto out;
-
-	err = ipv6_renew_option(opt ? opt->dst0opt : NULL, newopt, newoptlen,
-				newtype != IPV6_RTHDRDSTOPTS,
-				&opt2->dst0opt, &p);
-	if (err)
-		goto out;
-
-	err = ipv6_renew_option(opt ? opt->srcrt : NULL, newopt, newoptlen,
-				newtype != IPV6_RTHDR,
-				(struct ipv6_opt_hdr **)&opt2->srcrt, &p);
-	if (err)
-		goto out;
-
-	err = ipv6_renew_option(opt ? opt->dst1opt : NULL, newopt, newoptlen,
-				newtype != IPV6_DSTOPTS,
-				&opt2->dst1opt, &p);
-	if (err)
-		goto out;
+	ipv6_renew_option(IPV6_HOPOPTS, &opt2->hopopt,
+			  (opt ? opt->hopopt : NULL),
+			  newopt, newtype, &p);
+	ipv6_renew_option(IPV6_RTHDRDSTOPTS, &opt2->dst0opt,
+			  (opt ? opt->dst0opt : NULL),
+			  newopt, newtype, &p);
+	ipv6_renew_option(IPV6_RTHDR,
+			  (struct ipv6_opt_hdr **)&opt2->srcrt,
+			  (opt ? (struct ipv6_opt_hdr *)opt->srcrt : NULL),
+			  newopt, newtype, &p);
+	ipv6_renew_option(IPV6_DSTOPTS, &opt2->dst1opt,
+			  (opt ? opt->dst1opt : NULL),
+			  newopt, newtype, &p);
 
 	opt2->opt_nflen = (opt2->hopopt ? ipv6_optlen(opt2->hopopt) : 0) +
 			  (opt2->dst0opt ? ipv6_optlen(opt2->dst0opt) : 0) +
@@ -1141,37 +1120,6 @@ ipv6_renew_options(struct sock *sk, struct ipv6_txoptions *opt,
 	opt2->opt_flen = (opt2->dst1opt ? ipv6_optlen(opt2->dst1opt) : 0);
 
 	return opt2;
-out:
-	sock_kfree_s(sk, opt2, opt2->tot_len);
-	return ERR_PTR(err);
-}
-
-/**
- * ipv6_renew_options_kern - replace a specific ext hdr with a new one.
- *
- * @sk: sock from which to allocate memory
- * @opt: original options
- * @newtype: option type to replace in @opt
- * @newopt: new option of type @newtype to replace (kernel-mem)
- * @newoptlen: length of @newopt
- *
- * See ipv6_renew_options().  The difference is that @newopt is
- * kernel memory, rather than user memory.
- */
-struct ipv6_txoptions *
-ipv6_renew_options_kern(struct sock *sk, struct ipv6_txoptions *opt,
-			int newtype, struct ipv6_opt_hdr *newopt,
-			int newoptlen)
-{
-	struct ipv6_txoptions *ret_val;
-	const mm_segment_t old_fs = get_fs();
-
-	set_fs(KERNEL_DS);
-	ret_val = ipv6_renew_options(sk, opt, newtype,
-				     (struct ipv6_opt_hdr __user *)newopt,
-				     newoptlen);
-	set_fs(old_fs);
-	return ret_val;
 }
 
 struct ipv6_txoptions *ipv6_fixup_options(struct ipv6_txoptions *opt_space,

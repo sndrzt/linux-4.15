@@ -432,11 +432,16 @@ static void xgbe_an73_disable(struct xgbe_prv_data *pdata)
 	xgbe_an73_set(pdata, false, false);
 	xgbe_an73_disable_interrupts(pdata);
 
+	pdata->an_start = 0;
+
 	netif_dbg(pdata, link, pdata->netdev, "CL73 AN disabled\n");
 }
 
 static void xgbe_an_restart(struct xgbe_prv_data *pdata)
 {
+	if (pdata->phy_if.phy_impl.an_pre)
+		pdata->phy_if.phy_impl.an_pre(pdata);
+
 	switch (pdata->an_mode) {
 	case XGBE_AN_MODE_CL73:
 	case XGBE_AN_MODE_CL73_REDRV:
@@ -453,6 +458,9 @@ static void xgbe_an_restart(struct xgbe_prv_data *pdata)
 
 static void xgbe_an_disable(struct xgbe_prv_data *pdata)
 {
+	if (pdata->phy_if.phy_impl.an_post)
+		pdata->phy_if.phy_impl.an_post(pdata);
+
 	switch (pdata->an_mode) {
 	case XGBE_AN_MODE_CL73:
 	case XGBE_AN_MODE_CL73_REDRV:
@@ -504,12 +512,13 @@ static enum xgbe_an xgbe_an73_tx_training(struct xgbe_prv_data *pdata,
 		reg |= XGBE_KR_TRAINING_START;
 		XMDIO_WRITE(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_10GBR_PMD_CTRL,
 			    reg);
-
-		if (pdata->phy_if.phy_impl.kr_training_post)
-			pdata->phy_if.phy_impl.kr_training_post(pdata);
+		pdata->kr_start_time = jiffies;
 
 		netif_dbg(pdata, link, pdata->netdev,
 			  "KR training initiated\n");
+
+		if (pdata->phy_if.phy_impl.kr_training_post)
+			pdata->phy_if.phy_impl.kr_training_post(pdata);
 	}
 
 	return XGBE_AN_PAGE_RECEIVED;
@@ -637,11 +646,13 @@ static enum xgbe_an xgbe_an73_incompat_link(struct xgbe_prv_data *pdata)
 			return XGBE_AN_NO_LINK;
 	}
 
-	xgbe_an73_disable(pdata);
+	xgbe_an_disable(pdata);
 
 	xgbe_switch_mode(pdata);
 
-	xgbe_an73_restart(pdata);
+	pdata->an_result = XGBE_AN_READY;
+
+	xgbe_an_restart(pdata);
 
 	return XGBE_AN_INCOMPAT_LINK;
 }
@@ -820,6 +831,9 @@ static void xgbe_an37_state_machine(struct xgbe_prv_data *pdata)
 		pdata->an_result = pdata->an_state;
 		pdata->an_state = XGBE_AN_READY;
 
+		if (pdata->phy_if.phy_impl.an_post)
+			pdata->phy_if.phy_impl.an_post(pdata);
+
 		netif_dbg(pdata, link, pdata->netdev, "CL37 AN result: %s\n",
 			  xgbe_state_as_string(pdata->an_result));
 	}
@@ -902,6 +916,9 @@ again:
 		pdata->kr_state = XGBE_RX_BPA;
 		pdata->kx_state = XGBE_RX_BPA;
 		pdata->an_start = 0;
+
+		if (pdata->phy_if.phy_impl.an_post)
+			pdata->phy_if.phy_impl.an_post(pdata);
 
 		netif_dbg(pdata, link, pdata->netdev, "CL73 AN result: %s\n",
 			  xgbe_state_as_string(pdata->an_result));
@@ -1114,14 +1131,14 @@ static void xgbe_phy_adjust_link(struct xgbe_prv_data *pdata)
 
 		if (pdata->tx_pause != pdata->phy.tx_pause) {
 			new_state = 1;
-			pdata->hw_if.config_tx_flow_control(pdata);
 			pdata->tx_pause = pdata->phy.tx_pause;
+			pdata->hw_if.config_tx_flow_control(pdata);
 		}
 
 		if (pdata->rx_pause != pdata->phy.rx_pause) {
 			new_state = 1;
-			pdata->hw_if.config_rx_flow_control(pdata);
 			pdata->rx_pause = pdata->phy.rx_pause;
+			pdata->hw_if.config_rx_flow_control(pdata);
 		}
 
 		/* Speed support */
@@ -1272,9 +1289,30 @@ static bool xgbe_phy_aneg_done(struct xgbe_prv_data *pdata)
 static void xgbe_check_link_timeout(struct xgbe_prv_data *pdata)
 {
 	unsigned long link_timeout;
+	unsigned long kr_time;
+	int wait;
 
 	link_timeout = pdata->link_check + (XGBE_LINK_TIMEOUT * HZ);
 	if (time_after(jiffies, link_timeout)) {
+		if ((xgbe_cur_mode(pdata) == XGBE_MODE_KR) &&
+		    pdata->phy.autoneg == AUTONEG_ENABLE) {
+			/* AN restart should not happen while KR training is in progress.
+			 * The while loop ensures no AN restart during KR training,
+			 * waits up to 500ms and AN restart is triggered only if KR
+			 * training is failed.
+			 */
+			wait = XGBE_KR_TRAINING_WAIT_ITER;
+			while (wait--) {
+				kr_time = pdata->kr_start_time +
+					  msecs_to_jiffies(XGBE_AN_MS_TIMEOUT);
+				if (time_after(jiffies, kr_time))
+					break;
+				/* AN restart is not required, if AN result is COMPLETE */
+				if (pdata->an_result == XGBE_AN_COMPLETE)
+					return;
+				usleep_range(10000, 11000);
+			}
+		}
 		netif_dbg(pdata, link, pdata->netdev, "AN link timeout\n");
 		xgbe_phy_config_aneg(pdata);
 	}
@@ -1341,7 +1379,7 @@ static void xgbe_phy_status(struct xgbe_prv_data *pdata)
 							     &an_restart);
 	if (an_restart) {
 		xgbe_phy_config_aneg(pdata);
-		return;
+		goto adjust_link;
 	}
 
 	if (pdata->phy.link) {
@@ -1386,13 +1424,14 @@ static void xgbe_phy_stop(struct xgbe_prv_data *pdata)
 	/* Disable auto-negotiation */
 	xgbe_an_disable_all(pdata);
 
-	if (pdata->dev_irq != pdata->an_irq)
+	if (pdata->dev_irq != pdata->an_irq) {
 		devm_free_irq(pdata->dev, pdata->an_irq, pdata);
+		tasklet_kill(&pdata->tasklet_an);
+	}
 
 	pdata->phy_if.phy_impl.stop(pdata);
 
 	pdata->phy.link = 0;
-	netif_carrier_off(pdata->netdev);
 
 	xgbe_phy_adjust_link(pdata);
 }

@@ -640,7 +640,7 @@ void elv_drain_elevator(struct request_queue *q)
 
 	while (e->type->ops.sq.elevator_dispatch_fn(q, 1))
 		;
-	if (q->nr_sorted && printed++ < 10) {
+	if (q->nr_sorted && !blk_queue_is_zoned(q) && printed++ < 10 ) {
 		printk(KERN_ERR "%s: forced dispatching is broken "
 		       "(nr_sorted=%u), please report this\n",
 		       q->elevator->type->elevator_name, q->nr_sorted);
@@ -968,6 +968,7 @@ static int elevator_switch_mq(struct request_queue *q,
 	int ret;
 
 	blk_mq_freeze_queue(q);
+	blk_mq_quiesce_queue(q);
 
 	if (q->elevator) {
 		if (q->elevator->registered)
@@ -994,6 +995,7 @@ static int elevator_switch_mq(struct request_queue *q,
 		blk_add_trace_msg(q, "elv switch: none");
 
 out:
+	blk_mq_unquiesce_queue(q);
 	blk_mq_unfreeze_queue(q);
 	return ret;
 }
@@ -1079,8 +1081,11 @@ static int __elevator_change(struct request_queue *q, const char *name)
 	/*
 	 * Special case for mq, turn off scheduling
 	 */
-	if (q->mq_ops && !strncmp(name, "none", 4))
+	if (q->mq_ops && !strncmp(name, "none", 4)) {
+		if (!q->elevator)
+			return 0;
 		return elevator_switch(q, NULL);
+	}
 
 	strlcpy(elevator_name, name, sizeof(elevator_name));
 	e = elevator_get(q, strstrip(elevator_name), true);

@@ -429,6 +429,18 @@ static void adv7511_hpd_work(struct work_struct *work)
 	else
 		status = connector_status_disconnected;
 
+	/*
+	 * The bridge resets its registers on unplug. So when we get a plug
+	 * event and we're already supposed to be powered, cycle the bridge to
+	 * restore its state.
+	 */
+	if (status == connector_status_connected &&
+	    adv7511->connector.status == connector_status_disconnected &&
+	    adv7511->powered) {
+		regcache_mark_dirty(adv7511->regmap);
+		adv7511_power_on(adv7511);
+	}
+
 	if (adv7511->connector.status != status) {
 		adv7511->connector.status = status;
 		if (status == connector_status_disconnected)
@@ -450,7 +462,20 @@ static int adv7511_irq_process(struct adv7511 *adv7511, bool process_hpd)
 	if (ret < 0)
 		return ret;
 
+#ifdef CONFIG_ADV7511_SNAPDRAGON_HACKS
+	/*
+	 * Don't clear HPD flag right now, let it be cleared later in
+	 * adv7511_detect(). If we don't do this, adv7511_detect
+	 * (i.e. the connector's detect op) doesn't realize that we need to
+	 * re-enable the display.
+	 *
+	 * Problem with this fix: Can not clearing this flag before returning
+	 * IRQ_HANDLED cause spurious interrupts?
+	 */
+	regmap_write(adv7511->regmap, ADV7511_REG_INT(0), irq0 & ~ADV7511_INT0_HPD);
+#else
 	regmap_write(adv7511->regmap, ADV7511_REG_INT(0), irq0);
+#endif
 	regmap_write(adv7511->regmap, ADV7511_REG_INT(1), irq1);
 
 	if (process_hpd && irq0 & ADV7511_INT0_HPD && adv7511->bridge.encoder)
@@ -487,7 +512,17 @@ static int adv7511_wait_for_edid(struct adv7511 *adv7511, int timeout)
 {
 	int ret;
 
-	if (adv7511->i2c_main->irq) {
+#ifdef CONFIG_ADV7511_SNAPDRAGON_HACKS
+	/*
+	 * HACK: EDID-Ready interrupt doesn't seem to happen if we try to do
+	 * "power-on - read EDID - power-off" consecutively really fast.
+	 * Inserting a delay after powering on ADV7511 improves things a
+	 * bit but doesn't solve it entirely.
+	 */
+	 if (0 /*adv7511->i2c_main->irq*/) {
+#else
+	 if (adv7511->i2c_main->irq) {
+#endif
 		ret = wait_event_interruptible_timeout(adv7511->wq,
 				adv7511->edid_read, msecs_to_jiffies(timeout));
 	} else {
@@ -735,11 +770,11 @@ static void adv7511_mode_set(struct adv7511 *adv7511,
 			vsync_polarity = 1;
 	}
 
-	if (mode->vrefresh <= 24000)
+	if (drm_mode_vrefresh(mode) <= 24)
 		low_refresh_rate = ADV7511_LOW_REFRESH_RATE_24HZ;
-	else if (mode->vrefresh <= 25000)
+	else if (drm_mode_vrefresh(mode) <= 25)
 		low_refresh_rate = ADV7511_LOW_REFRESH_RATE_25HZ;
-	else if (mode->vrefresh <= 30000)
+	else if (drm_mode_vrefresh(mode) <= 30)
 		low_refresh_rate = ADV7511_LOW_REFRESH_RATE_30HZ;
 	else
 		low_refresh_rate = ADV7511_LOW_REFRESH_RATE_NONE;
@@ -1204,6 +1239,7 @@ static int adv7511_probe(struct i2c_client *i2c, const struct i2c_device_id *id)
 	return 0;
 
 err_unregister_cec:
+	cec_unregister_adapter(adv7511->cec_adap);
 	i2c_unregister_device(adv7511->i2c_cec);
 	if (adv7511->cec_clk)
 		clk_disable_unprepare(adv7511->cec_clk);
@@ -1276,10 +1312,21 @@ static struct i2c_driver adv7511_driver = {
 
 static int __init adv7511_init(void)
 {
-	if (IS_ENABLED(CONFIG_DRM_MIPI_DSI))
-		mipi_dsi_driver_register(&adv7533_dsi_driver);
+	int ret;
 
-	return i2c_add_driver(&adv7511_driver);
+	if (IS_ENABLED(CONFIG_DRM_MIPI_DSI)) {
+		ret = mipi_dsi_driver_register(&adv7533_dsi_driver);
+		if (ret)
+			return ret;
+	}
+
+	ret = i2c_add_driver(&adv7511_driver);
+	if (ret) {
+		if (IS_ENABLED(CONFIG_DRM_MIPI_DSI))
+			mipi_dsi_driver_unregister(&adv7533_dsi_driver);
+	}
+
+	return ret;
 }
 module_init(adv7511_init);
 

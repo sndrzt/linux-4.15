@@ -1,11 +1,13 @@
-#!/bin/sh
+#!/bin/bash
 #
 # This test is for checking rtnetlink callpaths, and get as much coverage as possible.
 #
 # set -e
 
 devdummy="test-dummy0"
-ret=0
+
+# Kselftest framework requirement - SKIP code is 4.
+ksft_skip=4
 
 # set global exit status, but never reset nonzero one.
 check_err()
@@ -63,7 +65,7 @@ kci_test_bridge()
 	devbr="test-br0"
 	vlandev="testbr-vlan1"
 
-	ret=0
+	local ret=0
 	ip link add name "$devbr" type bridge
 	check_err $?
 
@@ -110,7 +112,7 @@ kci_test_gre()
 	rem=10.42.42.1
 	loc=10.0.0.1
 
-	ret=0
+	local ret=0
 	ip tunnel add $gredev mode gre remote $rem local $loc ttl 1
 	check_err $?
 	ip link set $gredev up
@@ -146,7 +148,7 @@ kci_test_gre()
 kci_test_tc()
 {
 	dev=lo
-	ret=0
+	local ret=0
 
 	tc qdisc add dev "$dev" root handle 1: htb
 	check_err $?
@@ -181,7 +183,7 @@ kci_test_tc()
 
 kci_test_polrouting()
 {
-	ret=0
+	local ret=0
 	ip rule add fwmark 1 lookup 100
 	check_err $?
 	ip route add local 0.0.0.0/0 dev lo table 100
@@ -202,7 +204,7 @@ kci_test_polrouting()
 
 kci_test_route_get()
 {
-	ret=0
+	local ret=0
 
 	ip route get 127.0.0.1 > /dev/null
 	check_err $?
@@ -231,9 +233,29 @@ kci_test_route_get()
 	echo "PASS: route get"
 }
 
+kci_test_addrlft()
+{
+	for i in $(seq 10 100) ;do
+		lft=$(((RANDOM%3) + 1))
+		ip addr add 10.23.11.$i/32 dev "$devdummy" preferred_lft $lft valid_lft $((lft+1))
+		check_err $?
+	done
+
+	sleep 5
+
+	ip addr show dev "$devdummy" | grep "10.23.11."
+	if [ $? -eq 0 ]; then
+		echo "FAIL: preferred_lft addresses remaining"
+		check_err 1
+		return
+	fi
+
+	echo "PASS: preferred_lft addresses have expired"
+}
+
 kci_test_addrlabel()
 {
-	ret=0
+	local ret=0
 
 	ip addrlabel add prefix dead::/64 dev lo label 1
 	check_err $?
@@ -273,7 +295,7 @@ kci_test_addrlabel()
 
 kci_test_ifalias()
 {
-	ret=0
+	local ret=0
 	namewant=$(uuidgen)
 	syspathname="/sys/class/net/$devdummy/ifalias"
 
@@ -328,12 +350,12 @@ kci_test_ifalias()
 kci_test_vrf()
 {
 	vrfname="test-vrf"
-	ret=0
+	local ret=0
 
 	ip link show type vrf 2>/dev/null
 	if [ $? -ne 0 ]; then
 		echo "SKIP: vrf: iproute2 too old"
-		return 0
+		return $ksft_skip
 	fi
 
 	ip link add "$vrfname" type vrf table 10
@@ -368,7 +390,7 @@ kci_test_vrf()
 
 kci_test_encap_vxlan()
 {
-	ret=0
+	local ret=0
 	vxlan="test-vxlan0"
 	vlan="test-vlan0"
 	testns="$1"
@@ -402,16 +424,21 @@ kci_test_encap_vxlan()
 
 kci_test_encap_fou()
 {
-	ret=0
+	local ret=0
 	name="test-fou"
 	testns="$1"
 
 	ip fou help 2>&1 |grep -q 'Usage: ip fou'
 	if [ $? -ne 0 ];then
 		echo "SKIP: fou: iproute2 too old"
-		return 1
+		return $ksft_skip
 	fi
 
+	if ! /sbin/modprobe -q -n fou; then
+		echo "SKIP: module fou is not found"
+		return $ksft_skip
+	fi
+	/sbin/modprobe -q fou
 	ip netns exec "$testns" ip fou add port 7777 ipproto 47 2>/dev/null
 	if [ $? -ne 0 ];then
 		echo "FAIL: can't add fou port 7777, skipping test"
@@ -439,12 +466,12 @@ kci_test_encap_fou()
 kci_test_encap()
 {
 	testns="testns"
-	ret=0
+	local ret=0
 
 	ip netns add "$testns"
 	if [ $? -ne 0 ]; then
 		echo "SKIP encap tests: cannot add net namespace $testns"
-		return 1
+		return $ksft_skip
 	fi
 
 	ip netns exec "$testns" ip link set lo up
@@ -456,20 +483,23 @@ kci_test_encap()
 	check_err $?
 
 	kci_test_encap_vxlan "$testns"
+	check_err $?
 	kci_test_encap_fou "$testns"
+	check_err $?
 
 	ip netns del "$testns"
+	return $ret
 }
 
 kci_test_macsec()
 {
 	msname="test_macsec0"
-	ret=0
+	local ret=0
 
 	ip macsec help 2>&1 | grep -q "^Usage: ip macsec"
 	if [ $? -ne 0 ]; then
 		echo "SKIP: macsec: iproute2 too old"
-		return 0
+		return $ksft_skip
 	fi
 
 	ip link add link "$devdummy" "$msname" type macsec port 42 encrypt on
@@ -504,6 +534,7 @@ kci_test_macsec()
 
 kci_test_rtnl()
 {
+	local ret=0
 	kci_add_dummy
 	if [ $ret -ne 0 ];then
 		echo "FAIL: cannot add dummy interface"
@@ -511,33 +542,46 @@ kci_test_rtnl()
 	fi
 
 	kci_test_polrouting
+	check_err $?
 	kci_test_route_get
+	check_err $?
+	kci_test_addrlft
+	check_err $?
 	kci_test_tc
+	check_err $?
 	kci_test_gre
+	check_err $?
 	kci_test_bridge
+	check_err $?
 	kci_test_addrlabel
+	check_err $?
 	kci_test_ifalias
+	check_err $?
 	kci_test_vrf
+	check_err $?
 	kci_test_encap
+	check_err $?
 	kci_test_macsec
+	check_err $?
 
 	kci_del_dummy
+	return $ret
 }
 
 #check for needed privileges
 if [ "$(id -u)" -ne 0 ];then
 	echo "SKIP: Need root privileges"
-	exit 0
+	exit $ksft_skip
 fi
 
 for x in ip tc;do
 	$x -Version 2>/dev/null >/dev/null
 	if [ $? -ne 0 ];then
 		echo "SKIP: Could not run test without the $x tool"
-		exit 0
+		exit $ksft_skip
 	fi
 done
 
 kci_test_rtnl
 
-exit $ret
+exit $?

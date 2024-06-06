@@ -56,14 +56,12 @@ nfp_flower_compile_meta_tci(struct nfp_flower_meta_two *frame,
 						      FLOW_DISSECTOR_KEY_VLAN,
 						      target);
 		/* Populate the tci field. */
-		if (flow_vlan->vlan_id) {
-			tmp_tci = FIELD_PREP(NFP_FLOWER_MASK_VLAN_PRIO,
-					     flow_vlan->vlan_priority) |
-				  FIELD_PREP(NFP_FLOWER_MASK_VLAN_VID,
-					     flow_vlan->vlan_id) |
-				  NFP_FLOWER_MASK_VLAN_CFI;
-			frame->tci = cpu_to_be16(tmp_tci);
-		}
+		tmp_tci = NFP_FLOWER_MASK_VLAN_PRESENT;
+		tmp_tci |= FIELD_PREP(NFP_FLOWER_MASK_VLAN_PRIO,
+				      flow_vlan->vlan_priority) |
+			   FIELD_PREP(NFP_FLOWER_MASK_VLAN_VID,
+				      flow_vlan->vlan_id);
+		frame->tci = cpu_to_be16(tmp_tci);
 	}
 }
 
@@ -125,6 +123,20 @@ nfp_flower_compile_mac(struct nfp_flower_mac_mpls *frame,
 			 NFP_FLOWER_MASK_MPLS_Q;
 
 		frame->mpls_lse = cpu_to_be32(t_mpls);
+	} else if (dissector_uses_key(flow->dissector,
+				      FLOW_DISSECTOR_KEY_BASIC)) {
+		/* Check for mpls ether type and set NFP_FLOWER_MASK_MPLS_Q
+		 * bit, which indicates an mpls ether type but without any
+		 * mpls fields.
+		 */
+		struct flow_dissector_key_basic *key_basic;
+
+		key_basic = skb_flow_dissector_target(flow->dissector,
+						      FLOW_DISSECTOR_KEY_BASIC,
+						      flow->key);
+		if (key_basic->n_proto == cpu_to_be16(ETH_P_MPLS_UC) ||
+		    key_basic->n_proto == cpu_to_be16(ETH_P_MPLS_MC))
+			frame->mpls_lse = cpu_to_be32(NFP_FLOWER_MASK_MPLS_Q);
 	}
 }
 

@@ -71,10 +71,7 @@ struct cls_fl_head {
 	bool mask_assigned;
 	struct list_head filters;
 	struct rhashtable_params ht_params;
-	union {
-		struct work_struct work;
-		struct rcu_head	rcu;
-	};
+	struct rcu_work rwork;
 	struct idr handle_idr;
 };
 
@@ -87,10 +84,7 @@ struct cls_fl_filter {
 	struct list_head list;
 	u32 handle;
 	u32 flags;
-	union {
-		struct work_struct work;
-		struct rcu_head	rcu;
-	};
+	struct rcu_work rwork;
 	struct net_device *hw_dev;
 };
 
@@ -159,6 +153,7 @@ static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 	if (!atomic_read(&head->ht.nelems))
 		return -1;
 
+	flow_dissector_init_keys(&skb_key.control, &skb_key.basic);
 	fl_clear_masked_range(&skb_key, &head->mask);
 
 	skb_key.indev_ifindex = skb->skb_iif;
@@ -202,19 +197,12 @@ static void __fl_destroy_filter(struct cls_fl_filter *f)
 
 static void fl_destroy_filter_work(struct work_struct *work)
 {
-	struct cls_fl_filter *f = container_of(work, struct cls_fl_filter, work);
+	struct cls_fl_filter *f = container_of(to_rcu_work(work),
+					struct cls_fl_filter, rwork);
 
 	rtnl_lock();
 	__fl_destroy_filter(f);
 	rtnl_unlock();
-}
-
-static void fl_destroy_filter(struct rcu_head *head)
-{
-	struct cls_fl_filter *f = container_of(head, struct cls_fl_filter, rcu);
-
-	INIT_WORK(&f->work, fl_destroy_filter_work);
-	tcf_queue_work(&f->work);
 }
 
 static void fl_hw_destroy_filter(struct tcf_proto *tp, struct cls_fl_filter *f)
@@ -289,27 +277,20 @@ static void __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f)
 		fl_hw_destroy_filter(tp, f);
 	tcf_unbind_filter(tp, &f->res);
 	if (tcf_exts_get_net(&f->exts))
-		call_rcu(&f->rcu, fl_destroy_filter);
+		tcf_queue_work(&f->rwork, fl_destroy_filter_work);
 	else
 		__fl_destroy_filter(f);
 }
 
 static void fl_destroy_sleepable(struct work_struct *work)
 {
-	struct cls_fl_head *head = container_of(work, struct cls_fl_head,
-						work);
+	struct cls_fl_head *head = container_of(to_rcu_work(work),
+						struct cls_fl_head,
+						rwork);
 	if (head->mask_assigned)
 		rhashtable_destroy(&head->ht);
 	kfree(head);
 	module_put(THIS_MODULE);
-}
-
-static void fl_destroy_rcu(struct rcu_head *rcu)
-{
-	struct cls_fl_head *head = container_of(rcu, struct cls_fl_head, rcu);
-
-	INIT_WORK(&head->work, fl_destroy_sleepable);
-	schedule_work(&head->work);
 }
 
 static void fl_destroy(struct tcf_proto *tp)
@@ -322,7 +303,7 @@ static void fl_destroy(struct tcf_proto *tp)
 	idr_destroy(&head->handle_idr);
 
 	__module_get(THIS_MODULE);
-	call_rcu(&head->rcu, fl_destroy_rcu);
+	tcf_queue_work(&head->rwork, fl_destroy_sleepable);
 }
 
 static void *fl_get(struct tcf_proto *tp, u32 handle)
@@ -409,6 +390,7 @@ static const struct nla_policy fl_policy[TCA_FLOWER_MAX + 1] = {
 	[TCA_FLOWER_KEY_IP_TOS_MASK]	= { .type = NLA_U8 },
 	[TCA_FLOWER_KEY_IP_TTL]		= { .type = NLA_U8 },
 	[TCA_FLOWER_KEY_IP_TTL_MASK]	= { .type = NLA_U8 },
+	[TCA_FLOWER_FLAGS]		= { .type = NLA_U32 },
 };
 
 static void fl_set_key_val(struct nlattr **tb,
@@ -884,7 +866,7 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
 		goto errout_tb;
 	}
 
-	err = tcf_exts_init(&fnew->exts, TCA_FLOWER_ACT, 0);
+	err = tcf_exts_init(&fnew->exts, net, TCA_FLOWER_ACT, 0);
 	if (err < 0)
 		goto errout;
 
@@ -962,7 +944,7 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
 		list_replace_rcu(&fold->list, &fnew->list);
 		tcf_unbind_filter(tp, &fold->res);
 		tcf_exts_get_net(&fold->exts);
-		call_rcu(&fold->rcu, fl_destroy_filter);
+		tcf_queue_work(&fold->rwork, fl_destroy_filter_work);
 	} else {
 		list_add_tail_rcu(&fnew->list, &head->filters);
 	}
@@ -971,7 +953,7 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
 	return 0;
 
 errout_idr:
-	if (fnew->handle)
+	if (!fold)
 		idr_remove_ext(&head->handle_idr, fnew->handle);
 errout:
 	tcf_exts_destroy(&fnew->exts);
@@ -1343,12 +1325,17 @@ nla_put_failure:
 	return -1;
 }
 
-static void fl_bind_class(void *fh, u32 classid, unsigned long cl)
+static void fl_bind_class(void *fh, u32 classid, unsigned long cl, void *q,
+			  unsigned long base)
 {
 	struct cls_fl_filter *f = fh;
 
-	if (f && f->res.classid == classid)
-		f->res.class = cl;
+	if (f && f->res.classid == classid) {
+		if (cl)
+			__tcf_bind_filter(q, &f->res, base);
+		else
+			__tcf_unbind_filter(q, &f->res);
+	}
 }
 
 static struct tcf_proto_ops cls_fl_ops __read_mostly = {

@@ -77,7 +77,7 @@
 #define ILT_CFG_REG(cli, reg)	PSWRQ2_REG_ ## cli ## _ ## reg ## _RT_OFFSET
 
 /* ILT entry structure */
-#define ILT_ENTRY_PHY_ADDR_MASK		0x000FFFFFFFFFFFULL
+#define ILT_ENTRY_PHY_ADDR_MASK		(~0ULL >> 12)
 #define ILT_ENTRY_PHY_ADDR_SHIFT	0
 #define ILT_ENTRY_VALID_MASK		0x1ULL
 #define ILT_ENTRY_VALID_SHIFT		52
@@ -396,7 +396,7 @@ static void qed_cxt_qm_iids(struct qed_hwfn *p_hwfn,
 		vf_tids += segs[NUM_TASK_PF_SEGMENTS].count;
 	}
 
-	iids->vf_cids += vf_cids * p_mngr->vf_count;
+	iids->vf_cids = vf_cids;
 	iids->tids += vf_tids * p_mngr->vf_count;
 
 	DP_VERBOSE(p_hwfn, QED_MSG_ILT,
@@ -2070,8 +2070,8 @@ static void qed_rdma_set_pf_params(struct qed_hwfn *p_hwfn,
 	num_srqs = min_t(u32, 32 * 1024, p_params->num_srqs);
 
 	if (p_hwfn->mcp_info->func_info.protocol == QED_PCI_ETH_RDMA) {
-		DP_NOTICE(p_hwfn,
-			  "Current day drivers don't support RoCE & iWARP simultaneously on the same PF. Default to RoCE-only\n");
+		DP_VERBOSE(p_hwfn, QED_MSG_SP,
+			   "Current day drivers don't support RoCE & iWARP simultaneously on the same PF. Default to RoCE-only\n");
 		p_hwfn->hw_info.personality = QED_PCI_ETH_ROCE;
 	}
 
@@ -2477,7 +2477,10 @@ int qed_cxt_free_proto_ilt(struct qed_hwfn *p_hwfn, enum protocol_type proto)
 	if (rc)
 		return rc;
 
-	/* Free Task CXT */
+	/* Free Task CXT ( Intentionally RoCE as task-id is shared between
+	 * RoCE and iWARP )
+	 */
+	proto = PROTOCOLID_ROCE;
 	rc = qed_cxt_free_ilt_range(p_hwfn, QED_ELEM_TASK, 0,
 				    qed_cxt_get_proto_tid_count(p_hwfn, proto));
 	if (rc)

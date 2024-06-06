@@ -217,6 +217,9 @@ static int __mlx5e_add_vlan_rule(struct mlx5e_priv *priv,
 		break;
 	}
 
+	if (WARN_ONCE(*rule_p, "VLAN rule already exists type %d", rule_type))
+		return 0;
+
 	*rule_p = mlx5_add_flow_rules(ft, spec, &flow_act, &dest, 1);
 
 	if (IS_ERR(*rule_p)) {
@@ -277,7 +280,6 @@ static void mlx5e_del_vlan_rule(struct mlx5e_priv *priv,
 		}
 		break;
 	case MLX5E_VLAN_RULE_TYPE_MATCH_CTAG_VID:
-		mlx5e_vport_context_update_vlans(priv);
 		if (priv->fs.vlan.active_cvlans_rule[vid]) {
 			mlx5_del_flow_rules(priv->fs.vlan.active_cvlans_rule[vid]);
 			priv->fs.vlan.active_cvlans_rule[vid] = NULL;
@@ -398,8 +400,7 @@ static void mlx5e_add_vlan_rules(struct mlx5e_priv *priv)
 	for_each_set_bit(i, priv->fs.vlan.active_svlans, VLAN_N_VID)
 		mlx5e_add_vlan_rule(priv, MLX5E_VLAN_RULE_TYPE_MATCH_STAG_VID, i);
 
-	if (priv->fs.vlan.cvlan_filter_disabled &&
-	    !(priv->netdev->flags & IFF_PROMISC))
+	if (priv->fs.vlan.cvlan_filter_disabled)
 		mlx5e_add_any_vid_rules(priv);
 }
 
@@ -416,8 +417,12 @@ static void mlx5e_del_vlan_rules(struct mlx5e_priv *priv)
 	for_each_set_bit(i, priv->fs.vlan.active_svlans, VLAN_N_VID)
 		mlx5e_del_vlan_rule(priv, MLX5E_VLAN_RULE_TYPE_MATCH_STAG_VID, i);
 
-	if (priv->fs.vlan.cvlan_filter_disabled &&
-	    !(priv->netdev->flags & IFF_PROMISC))
+	WARN_ON_ONCE(!(test_bit(MLX5E_STATE_DESTROYING, &priv->state)));
+
+	/* must be called after DESTROY bit is set and
+	 * set_rx_mode is called and flushed
+	 */
+	if (priv->fs.vlan.cvlan_filter_disabled)
 		mlx5e_del_any_vid_rules(priv);
 }
 
@@ -888,6 +893,7 @@ static int mlx5e_create_ttc_table_groups(struct mlx5e_ttc_table *ttc,
 	in = kvzalloc(inlen, GFP_KERNEL);
 	if (!in) {
 		kfree(ft->g);
+		ft->g = NULL;
 		return -ENOMEM;
 	}
 
@@ -1248,6 +1254,7 @@ static int mlx5e_create_l2_table_groups(struct mlx5e_l2_table *l2_table)
 	in = kvzalloc(inlen, GFP_KERNEL);
 	if (!in) {
 		kfree(ft->g);
+		ft->g = NULL;
 		return -ENOMEM;
 	}
 
@@ -1293,6 +1300,7 @@ err_destroy_groups:
 	ft->g[ft->num_groups] = NULL;
 	mlx5e_destroy_groups(ft);
 	kvfree(in);
+	kfree(ft->g);
 
 	return err;
 }

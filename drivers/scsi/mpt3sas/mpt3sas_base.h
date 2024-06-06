@@ -314,6 +314,7 @@
  * There are twelve Supplemental Reply Post Host Index Registers
  * and each register is at offset 0x10 bytes from the previous one.
  */
+#define MAX_COMBINED_MSIX_VECTORS(gen35) ((gen35 == 1) ? 16 : 8)
 #define MPT3_SUP_REPLY_POST_HOST_INDEX_REG_COUNT_G3	12
 #define MPT3_SUP_REPLY_POST_HOST_INDEX_REG_COUNT_G35	16
 #define MPT3_SUP_REPLY_POST_HOST_INDEX_REG_OFFSET	(0x10)
@@ -1434,6 +1435,9 @@ void mpt3sas_base_update_missing_delay(struct MPT3SAS_ADAPTER *ioc,
 	u16 device_missing_delay, u8 io_missing_delay);
 
 int mpt3sas_port_enable(struct MPT3SAS_ADAPTER *ioc);
+
+void
+mpt3sas_wait_for_commands_to_complete(struct MPT3SAS_ADAPTER *ioc);
 
 
 /* scsih shared API */

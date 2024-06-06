@@ -280,9 +280,7 @@ int dccp_disconnect(struct sock *sk, int flags)
 
 	dccp_clear_xmit_timers(sk);
 	ccid_hc_rx_delete(dp->dccps_hc_rx_ccid, sk);
-	ccid_hc_tx_delete(dp->dccps_hc_tx_ccid, sk);
 	dp->dccps_hc_rx_ccid = NULL;
-	dp->dccps_hc_tx_ccid = NULL;
 
 	__skb_queue_purge(&sk->sk_receive_queue);
 	__skb_queue_purge(&sk->sk_write_queue);
@@ -766,11 +764,6 @@ int dccp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 
 	lock_sock(sk);
 
-	if (dccp_qpolicy_full(sk)) {
-		rc = -EAGAIN;
-		goto out_release;
-	}
-
 	timeo = sock_sndtimeo(sk, noblock);
 
 	/*
@@ -788,6 +781,16 @@ int dccp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	lock_sock(sk);
 	if (skb == NULL)
 		goto out_release;
+
+	if (dccp_qpolicy_full(sk)) {
+		rc = -EAGAIN;
+		goto out_discard;
+	}
+
+	if (sk->sk_state == DCCP_CLOSED) {
+		rc = -ENOTCONN;
+		goto out_discard;
+	}
 
 	skb_reserve(skb, sk->sk_prot->max_header);
 	rc = memcpy_from_msg(skb_put(skb, len), msg, len);

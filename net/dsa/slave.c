@@ -141,10 +141,14 @@ static void dsa_slave_change_rx_flags(struct net_device *dev, int change)
 {
 	struct net_device *master = dsa_slave_to_master(dev);
 
-	if (change & IFF_ALLMULTI)
-		dev_set_allmulti(master, dev->flags & IFF_ALLMULTI ? 1 : -1);
-	if (change & IFF_PROMISC)
-		dev_set_promiscuity(master, dev->flags & IFF_PROMISC ? 1 : -1);
+	if (dev->flags & IFF_UP) {
+		if (change & IFF_ALLMULTI)
+			dev_set_allmulti(master,
+					 dev->flags & IFF_ALLMULTI ? 1 : -1);
+		if (change & IFF_PROMISC)
+			dev_set_promiscuity(master,
+					    dev->flags & IFF_PROMISC ? 1 : -1);
+	}
 }
 
 static void dsa_slave_set_rx_mode(struct net_device *dev)
@@ -555,13 +559,15 @@ static int dsa_slave_get_sset_count(struct net_device *dev, int sset)
 	struct dsa_switch *ds = dp->ds;
 
 	if (sset == ETH_SS_STATS) {
-		int count;
+		int count = 0;
 
-		count = 4;
-		if (ds->ops->get_sset_count)
-			count += ds->ops->get_sset_count(ds);
+		if (ds->ops->get_sset_count) {
+			count = ds->ops->get_sset_count(ds);
+			if (count < 0)
+				return count;
+		}
 
-		return count;
+		return count + 4;
 	}
 
 	return -EOPNOTSUPP;
@@ -1119,6 +1125,9 @@ int dsa_slave_suspend(struct net_device *slave_dev)
 {
 	struct dsa_slave_priv *p = netdev_priv(slave_dev);
 
+	if (!netif_running(slave_dev))
+		return 0;
+
 	netif_device_detach(slave_dev);
 
 	if (slave_dev->phydev) {
@@ -1134,6 +1143,9 @@ int dsa_slave_suspend(struct net_device *slave_dev)
 
 int dsa_slave_resume(struct net_device *slave_dev)
 {
+	if (!netif_running(slave_dev))
+		return 0;
+
 	netif_device_attach(slave_dev);
 
 	if (slave_dev->phydev) {
@@ -1180,7 +1192,10 @@ int dsa_slave_create(struct dsa_port *port)
 	slave_dev->features = master->vlan_features | NETIF_F_HW_TC;
 	slave_dev->hw_features |= NETIF_F_HW_TC;
 	slave_dev->ethtool_ops = &dsa_slave_ethtool_ops;
-	eth_hw_addr_inherit(slave_dev, master);
+	if (port->mac && is_valid_ether_addr(port->mac))
+		ether_addr_copy(slave_dev->dev_addr, port->mac);
+	else
+		eth_hw_addr_inherit(slave_dev, master);
 	slave_dev->priv_flags |= IFF_NO_QUEUE;
 	slave_dev->netdev_ops = &dsa_slave_netdev_ops;
 	slave_dev->switchdev_ops = &dsa_slave_switchdev_ops;

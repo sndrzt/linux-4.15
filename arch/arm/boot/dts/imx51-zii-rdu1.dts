@@ -489,7 +489,7 @@
 	};
 
 	ds1341: rtc@68 {
-		compatible = "maxim,ds1341";
+		compatible = "dallas,ds1341";
 		reg = <0x68>;
 	};
 
@@ -516,7 +516,7 @@
 	};
 
 	touchscreen@20 {
-		compatible = "syna,rmi4_i2c";
+		compatible = "syna,rmi4-i2c";
 		reg = <0x20>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&pinctrl_ts>;
@@ -534,8 +534,8 @@
 
 		rmi4-f11@11 {
 			reg = <0x11>;
-			touch-inverted-y;
-			touch-swapped-x-y;
+			touchscreen-inverted-y;
+			touchscreen-swapped-x-y;
 			syna,sensor-type = <1>;
 		};
 	};
@@ -752,7 +752,7 @@
 
 	pinctrl_ts: tsgrp {
 		fsl,pins = <
-			MX51_PAD_CSI1_D8__GPIO3_12		0x85
+			MX51_PAD_CSI1_D8__GPIO3_12		0x04
 			MX51_PAD_CSI1_D9__GPIO3_13		0x85
 		>;
 	};

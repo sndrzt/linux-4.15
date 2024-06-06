@@ -173,7 +173,7 @@ static ssize_t codec_reg_show(struct device *dev,
 	return soc_codec_reg_show(rtd->codec, buf, PAGE_SIZE, 0);
 }
 
-static DEVICE_ATTR(codec_reg, 0444, codec_reg_show, NULL);
+static DEVICE_ATTR_RO(codec_reg);
 
 static ssize_t pmdown_time_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
@@ -1697,7 +1697,7 @@ static int soc_link_dai_widgets(struct snd_soc_card *card,
 	sink = codec_dai->playback_widget;
 	source = cpu_dai->capture_widget;
 	if (sink && source) {
-		ret = snd_soc_dapm_new_pcm(card, dai_link->params,
+		ret = snd_soc_dapm_new_pcm(card, rtd, dai_link->params,
 					   dai_link->num_params,
 					   source, sink);
 		if (ret != 0) {
@@ -1710,7 +1710,7 @@ static int soc_link_dai_widgets(struct snd_soc_card *card,
 	sink = cpu_dai->playback_widget;
 	source = codec_dai->capture_widget;
 	if (sink && source) {
-		ret = snd_soc_dapm_new_pcm(card, dai_link->params,
+		ret = snd_soc_dapm_new_pcm(card, rtd, dai_link->params,
 					   dai_link->num_params,
 					   source, sink);
 		if (ret != 0) {
@@ -2311,6 +2311,7 @@ static int snd_soc_instantiate_card(struct snd_soc_card *card)
 	}
 
 	card->instantiated = 1;
+	dapm_mark_endpoints_dirty(card);
 	snd_soc_dapm_sync(&card->dapm);
 	mutex_unlock(&card->mutex);
 	mutex_unlock(&client_mutex);
@@ -4149,7 +4150,7 @@ int snd_soc_of_parse_audio_routing(struct snd_soc_card *card,
 	if (!routes) {
 		dev_err(card->dev,
 			"ASoC: Could not allocate DAPM route table\n");
-		return -EINVAL;
+		return -ENOMEM;
 	}
 
 	for (i = 0; i < num_routes; i++) {
@@ -4346,7 +4347,7 @@ int snd_soc_get_dai_name(struct of_phandle_args *args,
 		if (!component_of_node && pos->dev->parent)
 			component_of_node = pos->dev->parent->of_node;
 
-		if (component_of_node != args->np)
+		if (component_of_node != args->np || !pos->num_dai)
 			continue;
 
 		if (pos->driver->of_xlate_dai_name) {
@@ -4479,10 +4480,23 @@ EXPORT_SYMBOL_GPL(snd_soc_of_get_dai_link_codecs);
 
 static int __init snd_soc_init(void)
 {
-	snd_soc_debugfs_init();
-	snd_soc_util_init();
+	int ret;
 
-	return platform_driver_register(&soc_driver);
+	snd_soc_debugfs_init();
+	ret = snd_soc_util_init();
+	if (ret)
+		goto err_util_init;
+
+	ret = platform_driver_register(&soc_driver);
+	if (ret)
+		goto err_register;
+	return 0;
+
+err_register:
+	snd_soc_util_exit();
+err_util_init:
+	snd_soc_debugfs_exit();
+	return ret;
 }
 module_init(snd_soc_init);
 

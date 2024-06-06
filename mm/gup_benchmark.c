@@ -19,11 +19,15 @@ static int __gup_benchmark_ioctl(unsigned int cmd,
 		struct gup_benchmark *gup)
 {
 	ktime_t start_time, end_time;
-	unsigned long i, nr, nr_pages, addr, next;
+	unsigned long i, nr_pages, addr, next;
+	int nr;
 	struct page **pages;
 
+	if (gup->size > ULONG_MAX)
+		return -EINVAL;
+
 	nr_pages = gup->size / PAGE_SIZE;
-	pages = kvmalloc(sizeof(void *) * nr_pages, GFP_KERNEL);
+	pages = kvzalloc(sizeof(void *) * nr_pages, GFP_KERNEL);
 	if (!pages)
 		return -ENOMEM;
 
@@ -41,6 +45,8 @@ static int __gup_benchmark_ioctl(unsigned int cmd,
 		}
 
 		nr = get_user_pages_fast(addr, nr, gup->flags & 1, pages + i);
+		if (nr <= 0)
+			break;
 		i += nr;
 	}
 	end_time = ktime_get();

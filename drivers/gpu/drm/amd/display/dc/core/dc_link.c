@@ -311,7 +311,7 @@ static bool is_dp_sink_present(struct dc_link *link)
 {
 	enum gpio_result gpio_result;
 	uint32_t clock_pin = 0;
-
+	uint8_t retry = 0;
 	struct ddc *ddc;
 
 	enum connector_id connector_id =
@@ -335,16 +335,27 @@ static bool is_dp_sink_present(struct dc_link *link)
 
 	if (GPIO_RESULT_OK != dal_ddc_open(
 		ddc, GPIO_MODE_INPUT, GPIO_DDC_CONFIG_TYPE_MODE_I2C)) {
-		dal_gpio_destroy_ddc(&ddc);
+		dal_ddc_close(ddc);
 
 		return present;
 	}
 
-	/* Read GPIO: DP sink is present if both clock and data pins are zero */
-	/* [anaumov] in DAL2, there was no check for GPIO failure */
-
-	gpio_result = dal_gpio_get_value(ddc->pin_clock, &clock_pin);
-	ASSERT(gpio_result == GPIO_RESULT_OK);
+	/*
+	 * Read GPIO: DP sink is present if both clock and data pins are zero
+	 *
+	 * [W/A] plug-unplug DP cable, sometimes customer board has
+	 * one short pulse on clk_pin(1V, < 1ms). DP will be config to HDMI/DVI
+	 * then monitor can't br light up. Add retry 3 times
+	 * But in real passive dongle, it need additional 3ms to detect
+	 */
+	do {
+		gpio_result = dal_gpio_get_value(ddc->pin_clock, &clock_pin);
+		ASSERT(gpio_result == GPIO_RESULT_OK);
+		if (clock_pin)
+			udelay(1000);
+		else
+			break;
+	} while (retry++ < 3);
 
 	present = (gpio_result == GPIO_RESULT_OK) && !clock_pin;
 
@@ -483,6 +494,10 @@ static void detect_dp(
 		if (is_mst_supported(link)) {
 			sink_caps->signal = SIGNAL_TYPE_DISPLAY_PORT_MST;
 			link->type = dc_connection_mst_branch;
+
+			dal_ddc_service_set_transaction_type(
+							link->ddc,
+							sink_caps->transaction_type);
 
 			/*
 			 * This call will initiate MST topology discovery. Which
@@ -1005,6 +1020,11 @@ static bool construct(
 		goto ddc_create_fail;
 	}
 
+	if (!link->ddc->ddc_pin) {
+		DC_ERROR("Failed to get I2C info for connector!\n");
+		goto ddc_create_fail;
+	}
+
 	link->ddc_hw_inst =
 		dal_ddc_get_line(
 			dal_ddc_service_get_ddc_pin(link->ddc));
@@ -1267,6 +1287,23 @@ static enum dc_status enable_link_dp(
 		status = DC_FAIL_DP_LINK_TRAINING;
 
 	enable_stream_features(pipe_ctx);
+
+	return status;
+}
+
+static enum dc_status enable_link_edp(
+		struct dc_state *state,
+		struct pipe_ctx *pipe_ctx)
+{
+	enum dc_status status;
+	struct dc_stream_state *stream = pipe_ctx->stream;
+	struct dc_link *link = stream->sink->link;
+
+	/*in case it is not on*/
+	link->dc->hwss.edp_power_control(link, true);
+	link->dc->hwss.edp_wait_for_hpd_ready(link, true);
+
+	status = enable_link_dp(state, pipe_ctx);
 
 	return status;
 }
@@ -1746,8 +1783,10 @@ static enum dc_status enable_link(
 	enum dc_status status = DC_ERROR_UNEXPECTED;
 	switch (pipe_ctx->stream->signal) {
 	case SIGNAL_TYPE_DISPLAY_PORT:
-	case SIGNAL_TYPE_EDP:
 		status = enable_link_dp(state, pipe_ctx);
+		break;
+	case SIGNAL_TYPE_EDP:
+		status = enable_link_edp(state, pipe_ctx);
 		break;
 	case SIGNAL_TYPE_DISPLAY_PORT_MST:
 		status = enable_link_dp_mst(state, pipe_ctx);
@@ -1798,7 +1837,7 @@ static void disable_link(struct dc_link *link, enum signal_type signal)
 		else
 			dp_disable_link_phy_mst(link, signal);
 	} else
-		link->link_enc->funcs->disable_output(link->link_enc, signal, link);
+		link->link_enc->funcs->disable_output(link->link_enc, signal);
 }
 
 static bool dp_active_dongle_validate_timing(
@@ -1876,7 +1915,7 @@ enum dc_status dc_link_validate_mode_timing(
 	/* A hack to avoid failing any modes for EDID override feature on
 	 * topology change such as lower quality cable for DP or different dongle
 	 */
-	if (link->remote_sinks[0])
+	if (link->remote_sinks[0] && link->remote_sinks[0]->sink_signal == SIGNAL_TYPE_VIRTUAL)
 		return DC_OK;
 
 	/* Passive Dongle */
@@ -2408,14 +2447,15 @@ void core_link_enable_stream(
 	if (pipe_ctx->stream->signal == SIGNAL_TYPE_DISPLAY_PORT_MST)
 		allocate_mst_payload(pipe_ctx);
 
-	if (dc_is_dp_signal(pipe_ctx->stream->signal))
-		core_dc->hwss.unblank_stream(pipe_ctx,
-			&pipe_ctx->stream->sink->link->cur_link_settings);
+	core_dc->hwss.unblank_stream(pipe_ctx,
+		&pipe_ctx->stream->sink->link->cur_link_settings);
 }
 
 void core_link_disable_stream(struct pipe_ctx *pipe_ctx, int option)
 {
 	struct dc  *core_dc = pipe_ctx->stream->ctx->dc;
+
+	core_dc->hwss.blank_stream(pipe_ctx);
 
 	if (pipe_ctx->stream->signal == SIGNAL_TYPE_DISPLAY_PORT_MST)
 		deallocate_mst_payload(pipe_ctx);

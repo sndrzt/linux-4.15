@@ -48,6 +48,7 @@
 #include <linux/stat.h>
 #include <linux/module.h>
 #include <linux/uio.h>
+#include <linux/user_namespace.h>
 
 #include "fuse_i.h"
 
@@ -498,7 +499,7 @@ static int cuse_channel_open(struct inode *inode, struct file *file)
 	if (!cc)
 		return -ENOMEM;
 
-	fuse_conn_init(&cc->fc);
+	fuse_conn_init(&cc->fc, current_user_ns());
 
 	fud = fuse_dev_alloc(&cc->fc);
 	if (!fud) {
@@ -513,6 +514,7 @@ static int cuse_channel_open(struct inode *inode, struct file *file)
 	rc = cuse_send_init(cc);
 	if (rc) {
 		fuse_dev_free(fud);
+		fuse_conn_put(&cc->fc);
 		return rc;
 	}
 	file->private_data = fud;
@@ -615,6 +617,8 @@ static int __init cuse_init(void)
 	cuse_channel_fops.owner		= THIS_MODULE;
 	cuse_channel_fops.open		= cuse_channel_open;
 	cuse_channel_fops.release	= cuse_channel_release;
+	/* CUSE is not prepared for FUSE_DEV_IOC_CLONE */
+	cuse_channel_fops.unlocked_ioctl	= NULL;
 
 	cuse_class = class_create(THIS_MODULE, "cuse");
 	if (IS_ERR(cuse_class))

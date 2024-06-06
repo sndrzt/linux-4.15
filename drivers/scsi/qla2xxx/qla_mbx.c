@@ -624,6 +624,7 @@ qla2x00_execute_fw(scsi_qla_host_t *vha, uint32_t risc_addr)
 		mcp->mb[2] = LSW(risc_addr);
 		mcp->mb[3] = 0;
 		mcp->mb[4] = 0;
+		mcp->mb[11] = 0;
 		ha->flags.using_lr_setting = 0;
 		if (IS_QLA25XX(ha) || IS_QLA81XX(ha) || IS_QLA83XX(ha) ||
 		    IS_QLA27XX(ha)) {
@@ -667,7 +668,7 @@ qla2x00_execute_fw(scsi_qla_host_t *vha, uint32_t risc_addr)
 		if (ha->flags.exchoffld_enabled)
 			mcp->mb[4] |= ENABLE_EXCHANGE_OFFLD;
 
-		mcp->out_mb |= MBX_4|MBX_3|MBX_2|MBX_1;
+		mcp->out_mb |= MBX_4 | MBX_3 | MBX_2 | MBX_1 | MBX_11;
 		mcp->in_mb |= MBX_3 | MBX_2 | MBX_1;
 	} else {
 		mcp->mb[1] = LSW(risc_addr);
@@ -3010,7 +3011,7 @@ qla24xx_abort_command(srb_t *sp)
 	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x108c,
 	    "Entered %s.\n", __func__);
 
-	if (vha->flags.qpairs_available && sp->qpair)
+	if (sp->qpair)
 		req = sp->qpair->req;
 
 	if (ql2xasynctmfenable)
@@ -3693,10 +3694,7 @@ qla2x00_set_idma_speed(scsi_qla_host_t *vha, uint16_t loop_id,
 	mcp->mb[0] = MBC_PORT_PARAMS;
 	mcp->mb[1] = loop_id;
 	mcp->mb[2] = BIT_0;
-	if (IS_CNA_CAPABLE(vha->hw))
-		mcp->mb[3] = port_speed & (BIT_5|BIT_4|BIT_3|BIT_2|BIT_1|BIT_0);
-	else
-		mcp->mb[3] = port_speed & (BIT_2|BIT_1|BIT_0);
+	mcp->mb[3] = port_speed & (BIT_5|BIT_4|BIT_3|BIT_2|BIT_1|BIT_0);
 	mcp->mb[9] = vha->vp_idx;
 	mcp->out_mb = MBX_9|MBX_3|MBX_2|MBX_1|MBX_0;
 	mcp->in_mb = MBX_3|MBX_1|MBX_0;
@@ -3731,6 +3729,7 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
 	unsigned long   flags;
 	int found;
 	port_id_t id;
+	struct fc_port *fcport;
 
 	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x10b6,
 	    "Entered %s.\n", __func__);
@@ -3753,7 +3752,7 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
 		    "Primary port id %02x%02x%02x.\n",
 		    rptid_entry->port_id[2], rptid_entry->port_id[1],
 		    rptid_entry->port_id[0]);
-
+		ha->current_topology = ISP_CFG_NL;
 		qlt_update_host_map(vha, id);
 
 	} else if (rptid_entry->format == 1) {
@@ -3797,6 +3796,8 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
 			return;
 		}
 
+		ha->flags.gpsc_supported = 1;
+		ha->current_topology = ISP_CFG_F;
 		/* buffer to buffer credit flag */
 		vha->flags.bbcr_enable = (rptid_entry->u.f1.bbcr & 0xf) != 0;
 
@@ -3862,6 +3863,8 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
 		    rptid_entry->u.f2.port_name);
 
 		/* N2N.  direct connect */
+		ha->current_topology = ISP_CFG_N;
+		ha->flags.rida_fmt2 = 1;
 		vha->d_id.b.domain = rptid_entry->port_id[2];
 		vha->d_id.b.area = rptid_entry->port_id[1];
 		vha->d_id.b.al_pa = rptid_entry->port_id[0];
@@ -3869,6 +3872,37 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
 		spin_lock_irqsave(&ha->vport_slock, flags);
 		qlt_update_vp_map(vha, SET_AL_PA);
 		spin_unlock_irqrestore(&ha->vport_slock, flags);
+
+		list_for_each_entry(fcport, &vha->vp_fcports, list) {
+			fcport->scan_state = QLA_FCPORT_SCAN;
+		}
+
+		fcport = qla2x00_find_fcport_by_wwpn(vha,
+		    rptid_entry->u.f2.port_name, 1);
+
+		if (fcport) {
+			fcport->plogi_nack_done_deadline = jiffies + HZ;
+			fcport->scan_state = QLA_FCPORT_FOUND;
+			switch (fcport->disc_state) {
+			case DSC_DELETED:
+				ql_dbg(ql_dbg_disc, vha, 0x210d,
+				    "%s %d %8phC login\n",
+				    __func__, __LINE__, fcport->port_name);
+				qla24xx_fcport_handle_login(vha, fcport);
+				break;
+			case DSC_DELETE_PEND:
+				break;
+			default:
+				qlt_schedule_sess_for_deletion(fcport);
+				break;
+			}
+		} else {
+			id.b.al_pa  = rptid_entry->u.f2.remote_nport_id[0];
+			id.b.area   = rptid_entry->u.f2.remote_nport_id[1];
+			id.b.domain = rptid_entry->u.f2.remote_nport_id[2];
+			qla24xx_post_newsess_work(vha, &id,
+			    rptid_entry->u.f2.port_name, NULL);
+		}
 	}
 }
 
@@ -5938,9 +5972,8 @@ qla2x00_dump_mctp_data(scsi_qla_host_t *vha, dma_addr_t req_dma, uint32_t addr,
 	mcp->mb[7] = LSW(MSD(req_dma));
 	mcp->mb[8] = MSW(addr);
 	/* Setting RAM ID to valid */
-	mcp->mb[10] |= BIT_7;
 	/* For MCTP RAM ID is 0x40 */
-	mcp->mb[10] |= 0x40;
+	mcp->mb[10] = BIT_7 | 0x40;
 
 	mcp->out_mb |= MBX_10|MBX_8|MBX_7|MBX_6|MBX_5|MBX_4|MBX_3|MBX_2|MBX_1|
 	    MBX_0;
@@ -6160,8 +6193,7 @@ int __qla24xx_parse_gpdb(struct scsi_qla_host *vha, fc_port_t *fcport,
 	}
 
 	/* Check for logged in state. */
-	if (current_login_state != PDS_PRLI_COMPLETE &&
-	    last_login_state != PDS_PRLI_COMPLETE) {
+	if (current_login_state != PDS_PRLI_COMPLETE) {
 		ql_dbg(ql_dbg_mbx, vha, 0x119a,
 		    "Unable to verify login-state (%x/%x) for loop_id %x.\n",
 		    current_login_state, last_login_state, fcport->loop_id);

@@ -146,7 +146,7 @@ static void __dvb_frontend_free(struct dvb_frontend *fe)
 	struct dvb_frontend_private *fepriv = fe->frontend_priv;
 
 	if (fepriv)
-		dvb_free_device(fepriv->dvbdev);
+		dvb_device_put(fepriv->dvbdev);
 
 	dvb_frontend_invoke_release(fe, fe->ops.release);
 
@@ -275,8 +275,20 @@ static void dvb_frontend_add_event(struct dvb_frontend *fe,
 	wake_up_interruptible (&events->wait_queue);
 }
 
+static int dvb_frontend_test_event(struct dvb_frontend_private *fepriv,
+				   struct dvb_fe_events *events)
+{
+	int ret;
+
+	up(&fepriv->sem);
+	ret = events->eventw != events->eventr;
+	down(&fepriv->sem);
+
+	return ret;
+}
+
 static int dvb_frontend_get_event(struct dvb_frontend *fe,
-			    struct dvb_frontend_event *event, int flags)
+			          struct dvb_frontend_event *event, int flags)
 {
 	struct dvb_frontend_private *fepriv = fe->frontend_priv;
 	struct dvb_fe_events *events = &fepriv->events;
@@ -294,13 +306,8 @@ static int dvb_frontend_get_event(struct dvb_frontend *fe,
 		if (flags & O_NONBLOCK)
 			return -EWOULDBLOCK;
 
-		up(&fepriv->sem);
-
-		ret = wait_event_interruptible (events->wait_queue,
-						events->eventw != events->eventr);
-
-		if (down_interruptible (&fepriv->sem))
-			return -ERESTARTSYS;
+		ret = wait_event_interruptible(events->wait_queue,
+					       dvb_frontend_test_event(fepriv, events));
 
 		if (ret < 0)
 			return ret;
@@ -2110,7 +2117,7 @@ static int dvb_frontend_handle_ioctl(struct file *file,
 	struct dvb_frontend *fe = dvbdev->priv;
 	struct dvb_frontend_private *fepriv = fe->frontend_priv;
 	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
-	int i, err;
+	int i, err = -EOPNOTSUPP;
 
 	dev_dbg(fe->dvb->device, "%s:\n", __func__);
 
@@ -2145,6 +2152,7 @@ static int dvb_frontend_handle_ioctl(struct file *file,
 			}
 		}
 		kfree(tvp);
+		err = 0;
 		break;
 	}
 	case FE_GET_PROPERTY: {
@@ -2196,6 +2204,7 @@ static int dvb_frontend_handle_ioctl(struct file *file,
 			return -EFAULT;
 		}
 		kfree(tvp);
+		err = 0;
 		break;
 	}
 
@@ -2717,6 +2726,7 @@ int dvb_register_frontend(struct dvb_adapter* dvb,
 #endif
 		.kernel_ioctl = dvb_frontend_ioctl
 	};
+	int ret;
 
 	dev_dbg(dvb->device, "%s:\n", __func__);
 
@@ -2750,8 +2760,13 @@ int dvb_register_frontend(struct dvb_adapter* dvb,
 			"DVB: registering adapter %i frontend %i (%s)...\n",
 			fe->dvb->num, fe->id, fe->ops.info.name);
 
-	dvb_register_device (fe->dvb, &fepriv->dvbdev, &dvbdev_template,
+	ret = dvb_register_device(fe->dvb, &fepriv->dvbdev, &dvbdev_template,
 			     fe, DVB_DEVICE_FRONTEND, 0);
+	if (ret) {
+		dvb_frontend_put(fe);
+		mutex_unlock(&frontend_mutex);
+		return ret;
+	}
 
 	/*
 	 * Initialize the cache to the proper values according with the

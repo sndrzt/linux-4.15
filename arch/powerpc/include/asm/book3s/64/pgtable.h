@@ -42,6 +42,16 @@
 
 #define _PAGE_PTE		0x4000000000000000UL	/* distinguishes PTEs from pointers */
 #define _PAGE_PRESENT		0x8000000000000000UL	/* pte contains a translation */
+/*
+ * We need to mark a pmd pte invalid while splitting. We can do that by clearing
+ * the _PAGE_PRESENT bit. But then that will be taken as a swap pte. In order to
+ * differentiate between two use a SW field when invalidating.
+ *
+ * We do that temporary invalidate for regular pte entry in ptep_set_access_flags
+ *
+ * This is used only when _PAGE_PRESENT is cleared.
+ */
+#define _PAGE_INVALID		_RPAGE_SW0
 
 /*
  * Top and bottom bits of RPN which can be used by hash
@@ -102,7 +112,7 @@
  */
 #define _HPAGE_CHG_MASK (PTE_RPN_MASK | _PAGE_HPTEFLAGS | _PAGE_DIRTY | \
 			 _PAGE_ACCESSED | H_PAGE_THP_HUGE | _PAGE_PTE | \
-			 _PAGE_SOFT_DIRTY)
+			 _PAGE_SOFT_DIRTY | _PAGE_DEVMAP)
 /*
  * user access blocked by key
  */
@@ -120,7 +130,7 @@
  */
 #define _PAGE_CHG_MASK	(PTE_RPN_MASK | _PAGE_HPTEFLAGS | _PAGE_DIRTY | \
 			 _PAGE_ACCESSED | _PAGE_SPECIAL | _PAGE_PTE |	\
-			 _PAGE_SOFT_DIRTY)
+			 _PAGE_SOFT_DIRTY | _PAGE_DEVMAP)
 /*
  * Mask of bits returned by pte_pgprot()
  */
@@ -544,7 +554,13 @@ static inline pte_t pte_clear_savedwrite(pte_t pte)
 
 static inline int pte_present(pte_t pte)
 {
-	return !!(pte_raw(pte) & cpu_to_be64(_PAGE_PRESENT));
+	/*
+	 * A pte is considerent present if _PAGE_PRESENT is set.
+	 * We also need to consider the pte present which is marked
+	 * invalid during ptep_set_access_flags. Hence we look for _PAGE_INVALID
+	 * if we find _PAGE_PRESENT cleared.
+	 */
+	return !!(pte_raw(pte) & cpu_to_be64(_PAGE_PRESENT | _PAGE_INVALID));
 }
 /*
  * Conversion functions: convert a page and protection to a page entry,
@@ -710,12 +726,14 @@ static inline bool check_pte_access(unsigned long access, unsigned long ptev)
  * Generic functions with hash/radix callbacks
  */
 
-static inline void __ptep_set_access_flags(struct mm_struct *mm,
+static inline void __ptep_set_access_flags(struct vm_area_struct *vma,
 					   pte_t *ptep, pte_t entry,
-					   unsigned long address)
+					   unsigned long address,
+					   int psize)
 {
 	if (radix_enabled())
-		return radix__ptep_set_access_flags(mm, ptep, entry, address);
+		return radix__ptep_set_access_flags(vma, ptep, entry,
+						    address, psize);
 	return hash__ptep_set_access_flags(ptep, entry);
 }
 
@@ -898,10 +916,25 @@ extern struct page *pgd_page(pgd_t pgd);
 #define pud_page_vaddr(pud)	__va(pud_val(pud) & ~PUD_MASKED_BITS)
 #define pgd_page_vaddr(pgd)	__va(pgd_val(pgd) & ~PGD_MASKED_BITS)
 
-#define pgd_index(address) (((address) >> (PGDIR_SHIFT)) & (PTRS_PER_PGD - 1))
-#define pud_index(address) (((address) >> (PUD_SHIFT)) & (PTRS_PER_PUD - 1))
-#define pmd_index(address) (((address) >> (PMD_SHIFT)) & (PTRS_PER_PMD - 1))
-#define pte_index(address) (((address) >> (PAGE_SHIFT)) & (PTRS_PER_PTE - 1))
+static inline unsigned long pgd_index(unsigned long address)
+{
+	return (address >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1);
+}
+
+static inline unsigned long pud_index(unsigned long address)
+{
+	return (address >> PUD_SHIFT) & (PTRS_PER_PUD - 1);
+}
+
+static inline unsigned long pmd_index(unsigned long address)
+{
+	return (address >> PMD_SHIFT) & (PTRS_PER_PMD - 1);
+}
+
+static inline unsigned long pte_index(unsigned long address)
+{
+	return (address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
+}
 
 /*
  * Find an entry in a page-table-directory.  We combine the address region
@@ -1178,7 +1211,9 @@ extern void serialize_against_pte_lookup(struct mm_struct *mm);
 
 static inline pmd_t pmd_mkdevmap(pmd_t pmd)
 {
-	return __pmd(pmd_val(pmd) | (_PAGE_PTE | _PAGE_DEVMAP));
+	if (radix_enabled())
+		return radix__pmd_mkdevmap(pmd);
+	return hash__pmd_mkdevmap(pmd);
 }
 
 static inline int pmd_devmap(pmd_t pmd)

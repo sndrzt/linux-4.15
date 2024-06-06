@@ -266,6 +266,7 @@ struct pp_smumgr_func {
 	int (*populate_requested_graphic_levels)(struct pp_hwmgr *hwmgr,
 			struct amd_pp_profile *request);
 	bool (*is_hw_avfs_present)(struct pp_hwmgr  *hwmgr);
+	int (*stop_smc)(struct pp_hwmgr *hwmgr);
 };
 
 struct pp_hwmgr_func {
@@ -698,6 +699,7 @@ struct pp_thermal_controller_info {
 	uint8_t ucType;
 	uint8_t ucI2cLine;
 	uint8_t ucI2cAddress;
+	uint8_t use_hw_fan_control;
 	struct pp_fan_info fanInfo;
 	struct pp_advance_fan_control_parameters advanceFanControlParameters;
 };

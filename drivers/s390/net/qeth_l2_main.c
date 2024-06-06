@@ -156,52 +156,35 @@ static int qeth_l2_send_delmac(struct qeth_card *card, __u8 *mac)
 	return rc;
 }
 
-static int qeth_l2_send_setgroupmac(struct qeth_card *card, __u8 *mac)
+static int qeth_l2_write_mac(struct qeth_card *card, u8 *mac)
 {
+	enum qeth_ipa_cmds cmd = is_multicast_ether_addr(mac) ?
+					IPA_CMD_SETGMAC : IPA_CMD_SETVMAC;
 	int rc;
 
-	QETH_CARD_TEXT(card, 2, "L2Sgmac");
-	rc = qeth_l2_send_setdelmac(card, mac, IPA_CMD_SETGMAC);
+	QETH_CARD_TEXT(card, 2, "L2Wmac");
+	rc = qeth_l2_send_setdelmac(card, mac, cmd);
 	if (rc == -EEXIST)
-		QETH_DBF_MESSAGE(2, "Group MAC %pM already existing on %s\n",
-			mac, QETH_CARD_IFNAME(card));
+		QETH_DBF_MESSAGE(2, "MAC already registered on device %x\n",
+				 CARD_DEVID(card));
 	else if (rc)
-		QETH_DBF_MESSAGE(2, "Could not set group MAC %pM on %s: %d\n",
-			mac, QETH_CARD_IFNAME(card), rc);
+		QETH_DBF_MESSAGE(2, "Failed to register MAC on device %x: %d\n",
+				 CARD_DEVID(card), rc);
 	return rc;
 }
 
-static int qeth_l2_send_delgroupmac(struct qeth_card *card, __u8 *mac)
+static int qeth_l2_remove_mac(struct qeth_card *card, u8 *mac)
 {
+	enum qeth_ipa_cmds cmd = is_multicast_ether_addr(mac) ?
+					IPA_CMD_DELGMAC : IPA_CMD_DELVMAC;
 	int rc;
 
-	QETH_CARD_TEXT(card, 2, "L2Dgmac");
-	rc = qeth_l2_send_setdelmac(card, mac, IPA_CMD_DELGMAC);
+	QETH_CARD_TEXT(card, 2, "L2Rmac");
+	rc = qeth_l2_send_setdelmac(card, mac, cmd);
 	if (rc)
-		QETH_DBF_MESSAGE(2,
-			"Could not delete group MAC %pM on %s: %d\n",
-			mac, QETH_CARD_IFNAME(card), rc);
+		QETH_DBF_MESSAGE(2, "Failed to delete MAC on device %u: %d\n",
+				 CARD_DEVID(card), rc);
 	return rc;
-}
-
-static int qeth_l2_write_mac(struct qeth_card *card, struct qeth_mac *mac)
-{
-	if (mac->is_uc) {
-		return qeth_l2_send_setdelmac(card, mac->mac_addr,
-						IPA_CMD_SETVMAC);
-	} else {
-		return qeth_l2_send_setgroupmac(card, mac->mac_addr);
-	}
-}
-
-static int qeth_l2_remove_mac(struct qeth_card *card, struct qeth_mac *mac)
-{
-	if (mac->is_uc) {
-		return qeth_l2_send_setdelmac(card, mac->mac_addr,
-						IPA_CMD_DELVMAC);
-	} else {
-		return qeth_l2_send_delgroupmac(card, mac->mac_addr);
-	}
 }
 
 static void qeth_l2_del_all_macs(struct qeth_card *card)
@@ -303,9 +286,9 @@ static int qeth_l2_send_setdelvlan_cb(struct qeth_card *card,
 
 	QETH_CARD_TEXT(card, 2, "L2sdvcb");
 	if (cmd->hdr.return_code) {
-		QETH_DBF_MESSAGE(2, "Error in processing VLAN %i on %s: 0x%x.\n",
+		QETH_DBF_MESSAGE(2, "Error in processing VLAN %u on device %x: %#x.\n",
 				 cmd->data.setdelvlan.vlan_id,
-				 QETH_CARD_IFNAME(card), cmd->hdr.return_code);
+				 CARD_DEVID(card), cmd->hdr.return_code);
 		QETH_CARD_TEXT_(card, 2, "L2VL%4x", cmd->hdr.command);
 		QETH_CARD_TEXT_(card, 2, "err%d", cmd->hdr.return_code);
 	}
@@ -486,7 +469,7 @@ static int qeth_l2_process_inbound_buffer(struct qeth_card *card,
 		default:
 			dev_kfree_skb_any(skb);
 			QETH_CARD_TEXT(card, 3, "inbunkno");
-			QETH_DBF_HEX(CTRL, 3, hdr, QETH_DBF_CTRL_LEN);
+			QETH_DBF_HEX(CTRL, 3, hdr, sizeof(*hdr));
 			continue;
 		}
 		work_done++;
@@ -509,27 +492,29 @@ static int qeth_l2_request_initial_mac(struct qeth_card *card)
 		rc = qeth_vm_request_mac(card);
 		if (!rc)
 			goto out;
-		QETH_DBF_MESSAGE(2, "z/VM MAC Service failed on device %s: x%x\n",
-				 CARD_BUS_ID(card), rc);
+		QETH_DBF_MESSAGE(2, "z/VM MAC Service failed on device %x: %#x\n",
+				 CARD_DEVID(card), rc);
 		QETH_DBF_TEXT_(SETUP, 2, "err%04x", rc);
 		/* fall back to alternative mechanism: */
 	}
 
-	if (card->info.type == QETH_CARD_TYPE_IQD ||
-	    card->info.type == QETH_CARD_TYPE_OSM ||
-	    card->info.type == QETH_CARD_TYPE_OSX ||
-	    card->info.guestlan) {
+	if (!IS_OSN(card)) {
 		rc = qeth_setadpparms_change_macaddr(card);
-		if (rc) {
-			QETH_DBF_MESSAGE(2, "couldn't get MAC address on "
-				"device %s: x%x\n", CARD_BUS_ID(card), rc);
-			QETH_DBF_TEXT_(SETUP, 2, "1err%04x", rc);
-			return rc;
-		}
-	} else {
-		eth_random_addr(card->dev->dev_addr);
-		memcpy(card->dev->dev_addr, vendor_pre, 3);
+		if (!rc && is_valid_ether_addr(card->dev->dev_addr))
+			goto out;
+		QETH_DBF_MESSAGE(2, "READ_MAC Assist failed on device %x: %#x\n",
+				 CARD_DEVID(card), rc);
+		QETH_DBF_TEXT_(SETUP, 2, "1err%04x", rc);
+		/* fall back once more: */
 	}
+
+	/* some devices don't support a custom MAC address: */
+	if (card->info.type == QETH_CARD_TYPE_OSM ||
+	    card->info.type == QETH_CARD_TYPE_OSX)
+		return (rc) ? rc : -EADDRNOTAVAIL;
+	eth_random_addr(card->dev->dev_addr);
+	memcpy(card->dev->dev_addr, vendor_pre, 3);
+
 out:
 	QETH_DBF_HEX(SETUP, 2, card->dev->dev_addr, card->dev->addr_len);
 	return 0;
@@ -597,27 +582,23 @@ static void qeth_promisc_to_bridge(struct qeth_card *card)
  * only if there is not in the hash table storage already
  *
 */
-static void qeth_l2_add_mac(struct qeth_card *card, struct netdev_hw_addr *ha,
-			    u8 is_uc)
+static void qeth_l2_add_mac(struct qeth_card *card, struct netdev_hw_addr *ha)
 {
 	u32 mac_hash = get_unaligned((u32 *)(&ha->addr[2]));
 	struct qeth_mac *mac;
 
 	hash_for_each_possible(card->mac_htable, mac, hnode, mac_hash) {
-		if (is_uc == mac->is_uc &&
-		    !memcmp(ha->addr, mac->mac_addr, OSA_ADDR_LEN)) {
+		if (!memcmp(ha->addr, mac->mac_addr, OSA_ADDR_LEN)) {
 			mac->disp_flag = QETH_DISP_ADDR_DO_NOTHING;
 			return;
 		}
 	}
 
 	mac = kzalloc(sizeof(struct qeth_mac), GFP_ATOMIC);
-
 	if (!mac)
 		return;
 
 	memcpy(mac->mac_addr, ha->addr, OSA_ADDR_LEN);
-	mac->is_uc = is_uc;
 	mac->disp_flag = QETH_DISP_ADDR_ADD;
 
 	hash_add(card->mac_htable, &mac->hnode, mac_hash);
@@ -643,19 +624,18 @@ static void qeth_l2_set_rx_mode(struct net_device *dev)
 	spin_lock_bh(&card->mclock);
 
 	netdev_for_each_mc_addr(ha, dev)
-		qeth_l2_add_mac(card, ha, 0);
-
+		qeth_l2_add_mac(card, ha);
 	netdev_for_each_uc_addr(ha, dev)
-		qeth_l2_add_mac(card, ha, 1);
+		qeth_l2_add_mac(card, ha);
 
 	hash_for_each_safe(card->mac_htable, i, tmp, mac, hnode) {
 		if (mac->disp_flag == QETH_DISP_ADDR_DELETE) {
-			qeth_l2_remove_mac(card, mac);
+			qeth_l2_remove_mac(card, mac->mac_addr);
 			hash_del(&mac->hnode);
 			kfree(mac);
 
 		} else if (mac->disp_flag == QETH_DISP_ADDR_ADD) {
-			rc = qeth_l2_write_mac(card, mac);
+			rc = qeth_l2_write_mac(card, mac->mac_addr);
 			if (rc) {
 				hash_del(&mac->hnode);
 				kfree(mac);
@@ -866,7 +846,10 @@ static int __qeth_l2_open(struct net_device *dev)
 
 	if (qdio_stop_irq(card->data.ccwdev, 0) >= 0) {
 		napi_enable(&card->napi);
+		local_bh_disable();
 		napi_schedule(&card->napi);
+		/* kick-start the NAPI softirq: */
+		local_bh_enable();
 	} else
 		rc = -EIO;
 	return rc;
@@ -933,8 +916,8 @@ static void qeth_l2_remove_device(struct ccwgroup_device *cgdev)
 		qeth_l2_set_offline(cgdev);
 
 	if (card->dev) {
-		netif_napi_del(&card->napi);
 		unregister_netdev(card->dev);
+		free_netdev(card->dev);
 		card->dev = NULL;
 	}
 	return;
@@ -1030,7 +1013,8 @@ static int qeth_l2_setup_netdev(struct qeth_card *card)
 	}
 
 	card->info.broadcast_capable = 1;
-	qeth_l2_request_initial_mac(card);
+	if (!is_valid_ether_addr(card->dev->dev_addr))
+		qeth_l2_request_initial_mac(card);
 	SET_NETDEV_DEV(card->dev, &card->gdev->dev);
 	netif_napi_add(card->dev, &card->napi, qeth_poll, QETH_NAPI_WEIGHT);
 	netif_carrier_off(card->dev);
@@ -1135,6 +1119,8 @@ static int __qeth_l2_set_online(struct ccwgroup_device *gdev, int recovery_mode)
 		netif_carrier_off(card->dev);
 
 	qeth_set_allowed_threads(card, 0xffffffff, 0);
+
+	qeth_enable_hw_features(card->dev);
 	if (recover_flag == CARD_STATE_RECOVER) {
 		if (recovery_mode &&
 		    card->info.type != QETH_CARD_TYPE_OSN) {
@@ -1146,9 +1132,6 @@ static int __qeth_l2_set_online(struct ccwgroup_device *gdev, int recovery_mode)
 		}
 		/* this also sets saved unicast addresses */
 		qeth_l2_set_rx_mode(card->dev);
-		rtnl_lock();
-		qeth_recover_features(card->dev);
-		rtnl_unlock();
 	}
 	/* let user_space know that device is online */
 	kobject_uevent(&gdev->dev.kobj, KOBJ_CHANGE);
@@ -1347,25 +1330,26 @@ EXPORT_SYMBOL_GPL(qeth_l2_discipline);
 static int qeth_osn_send_control_data(struct qeth_card *card, int len,
 			   struct qeth_cmd_buffer *iob)
 {
+	struct qeth_channel *channel = iob->channel;
 	unsigned long flags;
 	int rc = 0;
 
 	QETH_CARD_TEXT(card, 5, "osndctrd");
 
 	wait_event(card->wait_q,
-		   atomic_cmpxchg(&card->write.irq_pending, 0, 1) == 0);
+		   atomic_cmpxchg(&channel->irq_pending, 0, 1) == 0);
 	qeth_prepare_control_data(card, len, iob);
 	QETH_CARD_TEXT(card, 6, "osnoirqp");
-	spin_lock_irqsave(get_ccwdev_lock(card->write.ccwdev), flags);
-	rc = ccw_device_start(card->write.ccwdev, &card->write.ccw,
-			      (addr_t) iob, 0, 0);
-	spin_unlock_irqrestore(get_ccwdev_lock(card->write.ccwdev), flags);
+	spin_lock_irqsave(get_ccwdev_lock(channel->ccwdev), flags);
+	rc = ccw_device_start_timeout(channel->ccwdev, &channel->ccw,
+				      (addr_t) iob, 0, 0, QETH_IPA_TIMEOUT);
+	spin_unlock_irqrestore(get_ccwdev_lock(channel->ccwdev), flags);
 	if (rc) {
 		QETH_DBF_MESSAGE(2, "qeth_osn_send_control_data: "
 			   "ccw_device_start rc = %i\n", rc);
 		QETH_CARD_TEXT_(card, 2, " err%d", rc);
-		qeth_release_buffer(iob->channel, iob);
-		atomic_set(&card->write.irq_pending, 0);
+		qeth_release_buffer(channel, iob);
+		atomic_set(&channel->irq_pending, 0);
 		wake_up(&card->wait_q);
 	}
 	return rc;
@@ -1566,6 +1550,10 @@ static void qeth_bridge_state_change(struct qeth_card *card,
 	int extrasize;
 
 	QETH_CARD_TEXT(card, 2, "brstchng");
+	if (qports->num_entries == 0) {
+		QETH_CARD_TEXT(card, 2, "BPempty");
+		return;
+	}
 	if (qports->entry_length != sizeof(struct qeth_sbp_port_entry)) {
 		QETH_CARD_TEXT_(card, 2, "BPsz%04x", qports->entry_length);
 		return;
@@ -2008,7 +1996,7 @@ static void qeth_bridgeport_an_set_cb(void *priv,
 
 	l2entry = (struct qdio_brinfo_entry_l2 *)entry;
 	code = IPA_ADDR_CHANGE_CODE_MACADDR;
-	if (l2entry->addr_lnid.lnid)
+	if (l2entry->addr_lnid.lnid < VLAN_N_VID)
 		code |= IPA_ADDR_CHANGE_CODE_VLANID;
 	qeth_bridge_emit_host_event(card, anev_reg_unreg, code,
 		(struct net_if_token *)&l2entry->nit,
@@ -2253,14 +2241,13 @@ int qeth_l2_vnicc_set_state(struct qeth_card *card, u32 vnicc, bool state)
 
 	QETH_CARD_TEXT(card, 2, "vniccsch");
 
-	/* do not change anything if BridgePort is enabled */
-	if (qeth_bridgeport_is_in_use(card))
-		return -EBUSY;
-
 	/* check if characteristic and enable/disable are supported */
 	if (!(card->options.vnicc.sup_chars & vnicc) ||
 	    !(card->options.vnicc.set_char_sup & vnicc))
 		return -EOPNOTSUPP;
+
+	if (qeth_bridgeport_is_in_use(card))
+		return -EBUSY;
 
 	/* set enable/disable command and store wanted characteristic */
 	if (state) {
@@ -2307,13 +2294,12 @@ int qeth_l2_vnicc_get_state(struct qeth_card *card, u32 vnicc, bool *state)
 
 	QETH_CARD_TEXT(card, 2, "vniccgch");
 
-	/* do not get anything if BridgePort is enabled */
-	if (qeth_bridgeport_is_in_use(card))
-		return -EBUSY;
-
 	/* check if characteristic is supported */
 	if (!(card->options.vnicc.sup_chars & vnicc))
 		return -EOPNOTSUPP;
+
+	if (qeth_bridgeport_is_in_use(card))
+		return -EBUSY;
 
 	/* if card is ready, query current VNICC state */
 	if (qeth_card_hw_is_reachable(card))
@@ -2332,14 +2318,13 @@ int qeth_l2_vnicc_set_timeout(struct qeth_card *card, u32 timeout)
 
 	QETH_CARD_TEXT(card, 2, "vniccsto");
 
-	/* do not change anything if BridgePort is enabled */
-	if (qeth_bridgeport_is_in_use(card))
-		return -EBUSY;
-
 	/* check if characteristic and set_timeout are supported */
 	if (!(card->options.vnicc.sup_chars & QETH_VNICC_LEARNING) ||
 	    !(card->options.vnicc.getset_timeout_sup & QETH_VNICC_LEARNING))
 		return -EOPNOTSUPP;
+
+	if (qeth_bridgeport_is_in_use(card))
+		return -EBUSY;
 
 	/* do we need to do anything? */
 	if (card->options.vnicc.learning_timeout == timeout)
@@ -2369,14 +2354,14 @@ int qeth_l2_vnicc_get_timeout(struct qeth_card *card, u32 *timeout)
 
 	QETH_CARD_TEXT(card, 2, "vniccgto");
 
-	/* do not get anything if BridgePort is enabled */
-	if (qeth_bridgeport_is_in_use(card))
-		return -EBUSY;
-
 	/* check if characteristic and get_timeout are supported */
 	if (!(card->options.vnicc.sup_chars & QETH_VNICC_LEARNING) ||
 	    !(card->options.vnicc.getset_timeout_sup & QETH_VNICC_LEARNING))
 		return -EOPNOTSUPP;
+
+	if (qeth_bridgeport_is_in_use(card))
+		return -EBUSY;
+
 	/* if card is ready, get timeout. Otherwise, just return stored value */
 	*timeout = card->options.vnicc.learning_timeout;
 	if (qeth_card_hw_is_reachable(card))
@@ -2390,8 +2375,7 @@ int qeth_l2_vnicc_get_timeout(struct qeth_card *card, u32 *timeout)
 /* check if VNICC is currently enabled */
 bool qeth_l2_vnicc_is_in_use(struct qeth_card *card)
 {
-	/* if everything is turned off, VNICC is not active */
-	if (!card->options.vnicc.cur_chars)
+	if (!card->options.vnicc.sup_chars)
 		return false;
 	/* default values are only OK if rx_bcast was not enabled by user
 	 * or the card is offline.
@@ -2436,10 +2420,10 @@ static bool qeth_l2_vnicc_recover_char(struct qeth_card *card, u32 vnicc,
 static void qeth_l2_vnicc_init(struct qeth_card *card)
 {
 	u32 *timeout = &card->options.vnicc.learning_timeout;
+	bool enable, error = false;
 	unsigned int chars_len, i;
 	unsigned long chars_tmp;
 	u32 sup_cmds, vnicc;
-	bool enable, error;
 
 	QETH_CARD_TEXT(card, 2, "vniccini");
 	/* reset rx_bcast */
@@ -2460,19 +2444,25 @@ static void qeth_l2_vnicc_init(struct qeth_card *card)
 	chars_len = sizeof(card->options.vnicc.sup_chars) * BITS_PER_BYTE;
 	for_each_set_bit(i, &chars_tmp, chars_len) {
 		vnicc = BIT(i);
-		qeth_l2_vnicc_query_cmds(card, vnicc, &sup_cmds);
-		if (!(sup_cmds & IPA_VNICC_SET_TIMEOUT) ||
-		    !(sup_cmds & IPA_VNICC_GET_TIMEOUT))
+		if (qeth_l2_vnicc_query_cmds(card, vnicc, &sup_cmds)) {
+			sup_cmds = 0;
+			error = true;
+		}
+		if ((sup_cmds & IPA_VNICC_SET_TIMEOUT) &&
+		    (sup_cmds & IPA_VNICC_GET_TIMEOUT))
+			card->options.vnicc.getset_timeout_sup |= vnicc;
+		else
 			card->options.vnicc.getset_timeout_sup &= ~vnicc;
-		if (!(sup_cmds & IPA_VNICC_ENABLE) ||
-		    !(sup_cmds & IPA_VNICC_DISABLE))
+		if ((sup_cmds & IPA_VNICC_ENABLE) &&
+		    (sup_cmds & IPA_VNICC_DISABLE))
+			card->options.vnicc.set_char_sup |= vnicc;
+		else
 			card->options.vnicc.set_char_sup &= ~vnicc;
 	}
 	/* enforce assumed default values and recover settings, if changed  */
-	error = qeth_l2_vnicc_recover_timeout(card, QETH_VNICC_LEARNING,
-					      timeout);
+	error |= qeth_l2_vnicc_recover_timeout(card, QETH_VNICC_LEARNING,
+					       timeout);
 	chars_tmp = card->options.vnicc.wanted_chars ^ QETH_VNICC_DEFAULT;
-	chars_tmp |= QETH_VNICC_BRIDGE_INVISIBLE;
 	chars_len = sizeof(card->options.vnicc.wanted_chars) * BITS_PER_BYTE;
 	for_each_set_bit(i, &chars_tmp, chars_len) {
 		vnicc = BIT(i);

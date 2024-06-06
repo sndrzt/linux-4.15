@@ -70,10 +70,8 @@ extern int sb_prepare_remount_readonly(struct super_block *);
 
 extern void __init mnt_init(void);
 
-extern int __mnt_want_write(struct vfsmount *);
 extern int __mnt_want_write_file(struct file *);
 extern int mnt_want_write_file_path(struct file *);
-extern void __mnt_drop_write(struct vfsmount *);
 extern void __mnt_drop_write_file(struct file *);
 extern void mnt_drop_write_file_path(struct file *);
 
@@ -113,7 +111,6 @@ extern struct file *do_file_open_root(struct dentry *, struct vfsmount *,
 
 extern int open_check_o_direct(struct file *f);
 extern int vfs_open(const struct path *, struct file *, const struct cred *);
-extern struct file *filp_clone_open(struct file *);
 
 /*
  * inode.c

@@ -62,6 +62,7 @@
 
 #include <linux/acpi.h>
 #include <linux/device.h>
+#include <linux/irq.h>
 #include <linux/pci.h>
 #include <linux/pm_runtime.h>
 
@@ -127,9 +128,7 @@ lpe_audio_platdev_create(struct drm_i915_private *dev_priv)
 
 	kfree(rsc);
 
-	pm_runtime_forbid(&platdev->dev);
-	pm_runtime_set_active(&platdev->dev);
-	pm_runtime_enable(&platdev->dev);
+	pm_runtime_no_callbacks(&platdev->dev);
 
 	return platdev;
 
@@ -176,6 +175,14 @@ static int lpe_audio_irq_init(struct drm_i915_private *dev_priv)
 				handle_simple_irq,
 				"hdmi_lpe_audio_irq_handler");
 
+	static const struct pci_device_id irq_quirk_ids[] = {
+		/* Dell Wyse 3040 */
+		{PCI_DEVICE_SUB(PCI_VENDOR_ID_INTEL, 0x22b0, 0x1028, 0x07c1)},
+		{}
+	};
+
+	if (pci_dev_present(irq_quirk_ids))
+		return 0;
 	return irq_set_chip_data(irq, dev_priv);
 }
 
@@ -304,8 +311,10 @@ void intel_lpe_audio_teardown(struct drm_i915_private *dev_priv)
 	lpe_audio_platdev_destroy(dev_priv);
 
 	irq_free_desc(dev_priv->lpe_audio.irq);
-}
 
+	dev_priv->lpe_audio.irq = -1;
+	dev_priv->lpe_audio.platdev = NULL;
+}
 
 /**
  * intel_lpe_audio_notify() - notify lpe audio event

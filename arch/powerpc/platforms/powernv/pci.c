@@ -18,6 +18,7 @@
 #include <linux/io.h>
 #include <linux/msi.h>
 #include <linux/iommu.h>
+#include <linux/sched/mm.h>
 
 #include <asm/sections.h>
 #include <asm/io.h>
@@ -38,6 +39,7 @@
 #include "pci.h"
 
 static DEFINE_MUTEX(p2p_mutex);
+static DEFINE_MUTEX(tunnel_mutex);
 
 int pnv_pci_get_slot_id(struct device_node *np, uint64_t *id)
 {
@@ -600,8 +602,8 @@ static void pnv_pci_handle_eeh_config(struct pnv_phb *phb, u32 pe_no)
 static void pnv_pci_config_check_eeh(struct pci_dn *pdn)
 {
 	struct pnv_phb *phb = pdn->phb->private_data;
-	u8	fstate;
-	__be16	pcierr;
+	u8	fstate = 0;
+	__be16	pcierr = 0;
 	unsigned int pe_no;
 	s64	rc;
 
@@ -978,16 +980,12 @@ void pnv_pci_dma_dev_setup(struct pci_dev *pdev)
 	struct pnv_phb *phb = hose->private_data;
 #ifdef CONFIG_PCI_IOV
 	struct pnv_ioda_pe *pe;
-	struct pci_dn *pdn;
 
 	/* Fix the VF pdn PE number */
 	if (pdev->is_virtfn) {
-		pdn = pci_get_pdn(pdev);
-		WARN_ON(pdn->pe_number != IODA_INVALID_PE);
 		list_for_each_entry(pe, &phb->ioda.pe_list, list) {
 			if (pe->rid == ((pdev->bus->number << 8) |
 			    (pdev->devfn & 0xff))) {
-				pdn->pe_number = pe->pe_number;
 				pe->pdev = pdev;
 				break;
 			}
@@ -1092,6 +1090,139 @@ out:
 }
 EXPORT_SYMBOL_GPL(pnv_pci_set_p2p);
 
+struct device_node *pnv_pci_get_phb_node(struct pci_dev *dev)
+{
+	struct pci_controller *hose = pci_bus_to_host(dev->bus);
+
+	return of_node_get(hose->dn);
+}
+EXPORT_SYMBOL(pnv_pci_get_phb_node);
+
+int pnv_pci_enable_tunnel(struct pci_dev *dev, u64 *asnind)
+{
+	struct device_node *np;
+	const __be32 *prop;
+	struct pnv_ioda_pe *pe;
+	uint16_t window_id;
+	int rc;
+
+	if (!radix_enabled())
+		return -ENXIO;
+
+	if (!(np = pnv_pci_get_phb_node(dev)))
+		return -ENXIO;
+
+	prop = of_get_property(np, "ibm,phb-indications", NULL);
+	of_node_put(np);
+
+	if (!prop || !prop[1])
+		return -ENXIO;
+
+	*asnind = (u64)be32_to_cpu(prop[1]);
+	pe = pnv_ioda_get_pe(dev);
+	if (!pe)
+		return -ENODEV;
+
+	/* Increase real window size to accept as_notify messages. */
+	window_id = (pe->pe_number << 1 ) + 1;
+	rc = opal_pci_map_pe_dma_window_real(pe->phb->opal_id, pe->pe_number,
+					     window_id, pe->tce_bypass_base,
+					     (uint64_t)1 << 48);
+	return opal_error_code(rc);
+}
+EXPORT_SYMBOL_GPL(pnv_pci_enable_tunnel);
+
+int pnv_pci_disable_tunnel(struct pci_dev *dev)
+{
+	struct pnv_ioda_pe *pe;
+
+	pe = pnv_ioda_get_pe(dev);
+	if (!pe)
+		return -ENODEV;
+
+	/* Restore default real window size. */
+	pnv_pci_ioda2_set_bypass(pe, true);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(pnv_pci_disable_tunnel);
+
+int pnv_pci_set_tunnel_bar(struct pci_dev *dev, u64 addr, int enable)
+{
+	__be64 val;
+	struct pci_controller *hose;
+	struct pnv_phb *phb;
+	u64 tunnel_bar;
+	int rc;
+
+	if (!opal_check_token(OPAL_PCI_GET_PBCQ_TUNNEL_BAR))
+		return -ENXIO;
+	if (!opal_check_token(OPAL_PCI_SET_PBCQ_TUNNEL_BAR))
+		return -ENXIO;
+
+	hose = pci_bus_to_host(dev->bus);
+	phb = hose->private_data;
+
+	mutex_lock(&tunnel_mutex);
+	rc = opal_pci_get_pbcq_tunnel_bar(phb->opal_id, &val);
+	if (rc != OPAL_SUCCESS) {
+		rc = -EIO;
+		goto out;
+	}
+	tunnel_bar = be64_to_cpu(val);
+	if (enable) {
+		/*
+		* Only one device per PHB can use atomics.
+		* Our policy is first-come, first-served.
+		*/
+		if (tunnel_bar) {
+			if (tunnel_bar != addr)
+				rc = -EBUSY;
+			else
+				rc = 0;	/* Setting same address twice is ok */
+			goto out;
+		}
+	} else {
+		/*
+		* The device that owns atomics and wants to release
+		* them must pass the same address with enable == 0.
+		*/
+		if (tunnel_bar != addr) {
+			rc = -EPERM;
+			goto out;
+		}
+		addr = 0x0ULL;
+	}
+	rc = opal_pci_set_pbcq_tunnel_bar(phb->opal_id, addr);
+	rc = opal_error_code(rc);
+out:
+	mutex_unlock(&tunnel_mutex);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(pnv_pci_set_tunnel_bar);
+
+#ifdef CONFIG_PPC64	/* for thread.tidr */
+int pnv_pci_get_as_notify_info(struct task_struct *task, u32 *lpid, u32 *pid,
+			       u32 *tid)
+{
+	struct mm_struct *mm = NULL;
+
+	if (task == NULL)
+		return -EINVAL;
+
+	mm = get_task_mm(task);
+	if (mm == NULL)
+		return -EINVAL;
+
+	*pid = mm->context.id;
+	mmput(mm);
+
+	*tid = task->thread.tidr;
+	*lpid = mfspr(SPRN_LPID);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(pnv_pci_get_as_notify_info);
+#endif
+
 void pnv_pci_shutdown(void)
 {
 	struct pci_controller *hose;
@@ -1118,6 +1249,23 @@ void __init pnv_pci_init(void)
 	if (!firmware_has_feature(FW_FEATURE_OPAL))
 		return;
 
+#ifdef CONFIG_PCIEPORTBUS
+	/*
+	 * On PowerNV PCIe devices are (currently) managed in cooperation
+	 * with firmware. This isn't *strictly* required, but there's enough
+	 * assumptions baked into both firmware and the platform code that
+	 * it's unwise to allow the portbus services to be used.
+	 *
+	 * We need to fix this eventually, but for now set this flag to disable
+	 * the portbus driver. The AER service isn't required since that AER
+	 * events are handled via EEH. The pciehp hotplug driver can't work
+	 * without kernel changes (and portbus binding breaks pnv_php). The
+	 * other services also require some thinking about how we're going
+	 * to integrate them.
+	 */
+	pcie_ports_disabled = true;
+#endif
+
 	/* Look for IODA IO-Hubs. */
 	for_each_compatible_node(np, NULL, "ibm,ioda-hub") {
 		pnv_pci_init_ioda_hub(np);
@@ -1141,6 +1289,10 @@ void __init pnv_pci_init(void)
 	 */
 	for_each_compatible_node(np, NULL, "ibm,ioda2-npu2-phb")
 		pnv_pci_init_npu_phb(np);
+
+	/* Look for NPU2 OpenCAPI PHBs */
+	for_each_compatible_node(np, NULL, "ibm,ioda2-npu2-opencapi-phb")
+		pnv_pci_init_npu2_opencapi_phb(np);
 
 	/* Configure IOMMU DMA hooks */
 	set_pci_dma_ops(&dma_iommu_ops);

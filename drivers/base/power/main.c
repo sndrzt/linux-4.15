@@ -269,10 +269,38 @@ static void dpm_wait_for_suppliers(struct device *dev, bool async)
 	device_links_read_unlock(idx);
 }
 
-static void dpm_wait_for_superior(struct device *dev, bool async)
+static bool dpm_wait_for_superior(struct device *dev, bool async)
 {
-	dpm_wait(dev->parent, async);
+	struct device *parent;
+
+	/*
+	 * If the device is resumed asynchronously and the parent's callback
+	 * deletes both the device and the parent itself, the parent object may
+	 * be freed while this function is running, so avoid that by reference
+	 * counting the parent once more unless the device has been deleted
+	 * already (in which case return right away).
+	 */
+	mutex_lock(&dpm_list_mtx);
+
+	if (!device_pm_initialized(dev)) {
+		mutex_unlock(&dpm_list_mtx);
+		return false;
+	}
+
+	parent = get_device(dev->parent);
+
+	mutex_unlock(&dpm_list_mtx);
+
+	dpm_wait(parent, async);
+	put_device(parent);
+
 	dpm_wait_for_suppliers(dev, async);
+
+	/*
+	 * If the parent's callback has deleted the device, attempting to resume
+	 * it would be invalid, so avoid doing that then.
+	 */
+	return device_pm_initialized(dev);
 }
 
 static void dpm_wait_for_consumers(struct device *dev, bool async)
@@ -540,6 +568,18 @@ void dev_pm_skip_next_resume_phases(struct device *dev)
 	dev->power.is_suspended = false;
 }
 
+/*
+ * dev_pm_may_skip_resume - System-wide device resume optimization check.
+ * @dev: Target device.
+ *
+ * Checks whether or not the device may be left in suspend after a system-wide
+ * transition to the working state.
+ */
+bool dev_pm_may_skip_resume(struct device *dev)
+{
+	return !dev->power.must_resume && pm_transition.event != PM_EVENT_RESTORE;
+}
+
 /**
  * device_resume_noirq - Execute a "noirq resume" callback for given device.
  * @dev: Device to handle.
@@ -564,7 +604,8 @@ static int device_resume_noirq(struct device *dev, pm_message_t state, bool asyn
 	if (!dev->power.is_noirq_suspended)
 		goto Out;
 
-	dpm_wait_for_superior(dev, async);
+	if (!dpm_wait_for_superior(dev, async))
+		goto Out;
 
 	if (dev->pm_domain) {
 		info = "noirq power domain ";
@@ -587,6 +628,19 @@ static int device_resume_noirq(struct device *dev, pm_message_t state, bool asyn
 
 	error = dpm_run_callback(callback, dev, state, info);
 	dev->power.is_noirq_suspended = false;
+
+	if (dev_pm_may_skip_resume(dev)) {
+		/*
+		 * The device is going to be left in suspend, but it might not
+		 * have been in runtime suspend before the system suspended, so
+		 * its runtime PM status needs to be updated to avoid confusing
+		 * the runtime PM framework when runtime PM is enabled for the
+		 * device again.
+		 */
+		pm_runtime_set_suspended(dev);
+		dev->power.is_late_suspended = false;
+		dev->power.is_suspended = false;
+	}
 
  Out:
 	complete_all(&dev->power.completion);
@@ -704,7 +758,8 @@ static int device_resume_early(struct device *dev, pm_message_t state, bool asyn
 	if (!dev->power.is_late_suspended)
 		goto Out;
 
-	dpm_wait_for_superior(dev, async);
+	if (!dpm_wait_for_superior(dev, async))
+		goto Out;
 
 	if (dev->pm_domain) {
 		info = "early power domain ";
@@ -836,7 +891,9 @@ static int device_resume(struct device *dev, pm_message_t state, bool async)
 		goto Complete;
 	}
 
-	dpm_wait_for_superior(dev, async);
+	if (!dpm_wait_for_superior(dev, async))
+		goto Complete;
+
 	dpm_watchdog_set(&wd, dev);
 	device_lock(dev);
 
@@ -1089,6 +1146,22 @@ static pm_message_t resume_event(pm_message_t sleep_state)
 	return PMSG_ON;
 }
 
+static void dpm_superior_set_must_resume(struct device *dev)
+{
+	struct device_link *link;
+	int idx;
+
+	if (dev->parent)
+		dev->parent->power.must_resume = true;
+
+	idx = device_links_read_lock();
+
+	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node)
+		link->supplier->power.must_resume = true;
+
+	device_links_read_unlock(idx);
+}
+
 /**
  * __device_suspend_noirq - Execute a "noirq suspend" callback for given device.
  * @dev: Device to handle.
@@ -1140,10 +1213,28 @@ static int __device_suspend_noirq(struct device *dev, pm_message_t state, bool a
 	}
 
 	error = dpm_run_callback(callback, dev, state, info);
-	if (!error)
-		dev->power.is_noirq_suspended = true;
-	else
+	if (error) {
 		async_error = error;
+		goto Complete;
+	}
+
+	dev->power.is_noirq_suspended = true;
+
+	if (dev_pm_test_driver_flags(dev, DPM_FLAG_LEAVE_SUSPENDED)) {
+		/*
+		 * The only safe strategy here is to require that if the device
+		 * may not be left in suspend, resume callbacks must be invoked
+		 * for it.
+		 */
+		dev->power.must_resume = dev->power.must_resume ||
+					!dev->power.may_skip_resume ||
+					atomic_read(&dev->power.usage_count) > 1;
+	} else {
+		dev->power.must_resume = true;
+	}
+
+	if (dev->power.must_resume)
+		dpm_superior_set_must_resume(dev);
 
 Complete:
 	complete_all(&dev->power.completion);
@@ -1469,25 +1560,36 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 
 	dpm_wait_for_subordinate(dev, async);
 
-	if (async_error)
+	if (async_error) {
+		dev->power.direct_complete = false;
 		goto Complete;
+	}
 
 	/*
-	 * If a device configured to wake up the system from sleep states
-	 * has been suspended at run time and there's a resume request pending
-	 * for it, this is equivalent to the device signaling wakeup, so the
-	 * system suspend operation should be aborted.
+	 * Wait for possible runtime PM transitions of the device in progress
+	 * to complete and if there's a runtime resume request pending for it,
+	 * resume it before proceeding with invoking the system-wide suspend
+	 * callbacks for it.
+	 *
+	 * If the system-wide suspend callbacks below change the configuration
+	 * of the device, they must disable runtime PM for it or otherwise
+	 * ensure that its runtime-resume callbacks will not be confused by that
+	 * change in case they are invoked going forward.
 	 */
-	if (pm_runtime_barrier(dev) && device_may_wakeup(dev))
-		pm_wakeup_event(dev, 0);
+	pm_runtime_barrier(dev);
 
 	if (pm_wakeup_pending()) {
+		dev->power.direct_complete = false;
 		async_error = -EBUSY;
 		goto Complete;
 	}
 
 	if (dev->power.syscore)
 		goto Complete;
+
+	/* Avoid direct_complete to let wakeup_path propagate. */
+	if (device_may_wakeup(dev) || dev->power.wakeup_path)
+		dev->power.direct_complete = false;
 
 	if (dev->power.direct_complete) {
 		if (pm_runtime_status_suspended(dev)) {
@@ -1499,6 +1601,9 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 		}
 		dev->power.direct_complete = false;
 	}
+
+	dev->power.may_skip_resume = false;
+	dev->power.must_resume = false;
 
 	dpm_watchdog_set(&wd, dev);
 	device_lock(dev);
@@ -1665,8 +1770,9 @@ static int device_prepare(struct device *dev, pm_message_t state)
 	if (dev->power.syscore)
 		return 0;
 
-	WARN_ON(dev_pm_test_driver_flags(dev, DPM_FLAG_SMART_SUSPEND) &&
-		!pm_runtime_enabled(dev));
+	WARN_ON(!pm_runtime_enabled(dev) &&
+		dev_pm_test_driver_flags(dev, DPM_FLAG_SMART_SUSPEND |
+					      DPM_FLAG_LEAVE_SUSPENDED));
 
 	/*
 	 * If a device's parent goes into runtime suspend at the wrong time,
@@ -1680,10 +1786,8 @@ static int device_prepare(struct device *dev, pm_message_t state)
 
 	dev->power.wakeup_path = device_may_wakeup(dev);
 
-	if (dev->power.no_pm_callbacks) {
-		ret = 1;	/* Let device go direct_complete */
+	if (dev->power.no_pm_callbacks)
 		goto unlock;
-	}
 
 	if (dev->pm_domain)
 		callback = dev->pm_domain->ops.prepare;
@@ -1717,7 +1821,8 @@ unlock:
 	 */
 	spin_lock_irq(&dev->power.lock);
 	dev->power.direct_complete = state.event == PM_EVENT_SUSPEND &&
-		pm_runtime_suspended(dev) && ret > 0 &&
+		((pm_runtime_suspended(dev) && ret > 0) ||
+		 dev->power.no_pm_callbacks) &&
 		!dev_pm_test_driver_flags(dev, DPM_FLAG_NEVER_SKIP);
 	spin_unlock_irq(&dev->power.lock);
 	return 0;
@@ -1863,7 +1968,9 @@ static bool pm_ops_is_empty(const struct dev_pm_ops *ops)
 
 void device_pm_check_callbacks(struct device *dev)
 {
-	spin_lock_irq(&dev->power.lock);
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->power.lock, flags);
 	dev->power.no_pm_callbacks =
 		(!dev->bus || (pm_ops_is_empty(dev->bus->pm) &&
 		 !dev->bus->suspend && !dev->bus->resume)) &&
@@ -1872,7 +1979,7 @@ void device_pm_check_callbacks(struct device *dev)
 		(!dev->pm_domain || pm_ops_is_empty(&dev->pm_domain->ops)) &&
 		(!dev->driver || (pm_ops_is_empty(dev->driver->pm) &&
 		 !dev->driver->suspend && !dev->driver->resume));
-	spin_unlock_irq(&dev->power.lock);
+	spin_unlock_irqrestore(&dev->power.lock, flags);
 }
 
 bool dev_pm_smart_suspend_and_suspended(struct device *dev)

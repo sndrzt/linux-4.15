@@ -103,6 +103,8 @@ void sctp_addr_wq_mgmt(struct net *, struct sctp_sockaddr_entry *, int);
 /*
  * sctp/socket.c
  */
+int sctp_inet_connect(struct socket *sock, struct sockaddr *uaddr,
+		      int addr_len, int flags);
 int sctp_backlog_rcv(struct sock *sk, struct sk_buff *skb);
 int sctp_inet_listen(struct socket *sock, int backlog);
 void sctp_write_space(struct sock *sk);
@@ -116,6 +118,7 @@ extern struct percpu_counter sctp_sockets_allocated;
 int sctp_asconf_mgmt(struct sctp_sock *, struct sctp_sockaddr_entry *);
 struct sk_buff *sctp_skb_recv_datagram(struct sock *, int, int, int *);
 
+typedef int (*sctp_callback_t)(struct sctp_endpoint *, struct sctp_transport *, void *);
 int sctp_transport_walk_start(struct rhashtable_iter *iter);
 void sctp_transport_walk_stop(struct rhashtable_iter *iter);
 struct sctp_transport *sctp_transport_get_next(struct net *net,
@@ -126,9 +129,8 @@ int sctp_transport_lookup_process(int (*cb)(struct sctp_transport *, void *),
 				  struct net *net,
 				  const union sctp_addr *laddr,
 				  const union sctp_addr *paddr, void *p);
-int sctp_for_each_transport(int (*cb)(struct sctp_transport *, void *),
-			    int (*cb_done)(struct sctp_transport *, void *),
-			    struct net *net, int *pos, void *p);
+int sctp_transport_traverse_process(sctp_callback_t cb, sctp_callback_t cb_done,
+				    struct net *net, int *pos, void *p);
 int sctp_for_each_endpoint(int (*cb)(struct sctp_endpoint *, void *), void *p);
 int sctp_get_sctp_info(struct sock *sk, struct sctp_association *asoc,
 		       struct sctp_info *info);
@@ -428,7 +430,7 @@ static inline void sctp_skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
 	/*
 	 * This mimics the behavior of skb_set_owner_r
 	 */
-	sk->sk_forward_alloc -= event->rmem_len;
+	sk_mem_charge(sk, event->rmem_len);
 }
 
 /* Tests if the list has one and only one entry. */
@@ -614,10 +616,15 @@ static inline struct dst_entry *sctp_transport_dst_check(struct sctp_transport *
 	return t->dst;
 }
 
+static inline __u32 sctp_dst_mtu(const struct dst_entry *dst)
+{
+	return SCTP_TRUNC4(max_t(__u32, dst_mtu(dst),
+				 SCTP_DEFAULT_MINSEGMENT));
+}
+
 static inline bool sctp_transport_pmtu_check(struct sctp_transport *t)
 {
-	__u32 pmtu = max_t(size_t, SCTP_TRUNC4(dst_mtu(t->dst)),
-			   SCTP_DEFAULT_MINSEGMENT);
+	__u32 pmtu = sctp_dst_mtu(t->dst);
 
 	if (t->pathmtu == pmtu)
 		return true;

@@ -183,11 +183,11 @@ static const char emac_version_string[] = "TI DaVinci EMAC Linux v6.1";
 /* EMAC mac_status register */
 #define EMAC_MACSTATUS_TXERRCODE_MASK	(0xF00000)
 #define EMAC_MACSTATUS_TXERRCODE_SHIFT	(20)
-#define EMAC_MACSTATUS_TXERRCH_MASK	(0x7)
+#define EMAC_MACSTATUS_TXERRCH_MASK	(0x70000)
 #define EMAC_MACSTATUS_TXERRCH_SHIFT	(16)
 #define EMAC_MACSTATUS_RXERRCODE_MASK	(0xF000)
 #define EMAC_MACSTATUS_RXERRCODE_SHIFT	(12)
-#define EMAC_MACSTATUS_RXERRCH_MASK	(0x7)
+#define EMAC_MACSTATUS_RXERRCH_MASK	(0x700)
 #define EMAC_MACSTATUS_RXERRCH_SHIFT	(8)
 
 /* EMAC RX register masks */
@@ -426,8 +426,20 @@ static int emac_set_coalesce(struct net_device *ndev,
 	u32 int_ctrl, num_interrupts = 0;
 	u32 prescale = 0, addnl_dvdr = 1, coal_intvl = 0;
 
-	if (!coal->rx_coalesce_usecs)
-		return -EINVAL;
+	if (!coal->rx_coalesce_usecs) {
+		priv->coal_intvl = 0;
+
+		switch (priv->version) {
+		case EMAC_VERSION_2:
+			emac_ctrl_write(EMAC_DM646X_CMINTCTRL, 0);
+			break;
+		default:
+			emac_ctrl_write(EMAC_CTRL_EWINTTCNT, 0);
+			break;
+		}
+
+		return 0;
+	}
 
 	coal_intvl = coal->rx_coalesce_usecs;
 
@@ -1240,7 +1252,7 @@ static int emac_poll(struct napi_struct *napi, int budget)
 	struct net_device *ndev = priv->ndev;
 	struct device *emac_dev = &ndev->dev;
 	u32 status = 0;
-	u32 num_tx_pkts = 0, num_rx_pkts = 0;
+	u32 num_rx_pkts = 0;
 
 	/* Check interrupt vectors and call packet processing */
 	status = emac_read(EMAC_MACINVECTOR);
@@ -1251,8 +1263,7 @@ static int emac_poll(struct napi_struct *napi, int budget)
 		mask = EMAC_DM646X_MAC_IN_VECTOR_TX_INT_VEC;
 
 	if (status & mask) {
-		num_tx_pkts = cpdma_chan_process(priv->txchan,
-					      EMAC_DEF_TX_MAX_SERVICE);
+		cpdma_chan_process(priv->txchan, EMAC_DEF_TX_MAX_SERVICE);
 	} /* TX processing */
 
 	mask = EMAC_DM644X_MAC_IN_VECTOR_RX_INT_VEC;
@@ -1387,6 +1398,10 @@ static int emac_devioctl(struct net_device *ndev, struct ifreq *ifrq, int cmd)
 
 static int match_first_device(struct device *dev, void *data)
 {
+	if (dev->parent && dev->parent->of_node)
+		return of_device_is_compatible(dev->parent->of_node,
+					       "ti,davinci_mdio");
+
 	return !strncmp(dev_name(dev), "davinci_mdio", 12);
 }
 
@@ -1875,18 +1890,25 @@ static int davinci_emac_probe(struct platform_device *pdev)
 
 	priv->txchan = cpdma_chan_create(priv->dma, EMAC_DEF_TX_CH,
 					 emac_tx_handler, 0);
+	if (IS_ERR(priv->txchan)) {
+		dev_err(&pdev->dev, "error initializing tx dma channel\n");
+		rc = PTR_ERR(priv->txchan);
+		goto err_free_dma;
+	}
+
 	priv->rxchan = cpdma_chan_create(priv->dma, EMAC_DEF_RX_CH,
 					 emac_rx_handler, 1);
-	if (WARN_ON(!priv->txchan || !priv->rxchan)) {
-		rc = -ENOMEM;
-		goto no_cpdma_chan;
+	if (IS_ERR(priv->rxchan)) {
+		dev_err(&pdev->dev, "error initializing rx dma channel\n");
+		rc = PTR_ERR(priv->rxchan);
+		goto err_free_txchan;
 	}
 
 	res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
 	if (!res) {
 		dev_err(&pdev->dev, "error getting irq res\n");
 		rc = -ENOENT;
-		goto no_cpdma_chan;
+		goto err_free_rxchan;
 	}
 	ndev->irq = res->start;
 
@@ -1912,7 +1934,7 @@ static int davinci_emac_probe(struct platform_device *pdev)
 		pm_runtime_put_noidle(&pdev->dev);
 		dev_err(&pdev->dev, "%s: failed to get_sync(%d)\n",
 			__func__, rc);
-		goto no_cpdma_chan;
+		goto err_napi_del;
 	}
 
 	/* register the network device */
@@ -1922,7 +1944,7 @@ static int davinci_emac_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "error in register_netdev\n");
 		rc = -ENODEV;
 		pm_runtime_put(&pdev->dev);
-		goto no_cpdma_chan;
+		goto err_napi_del;
 	}
 
 
@@ -1935,11 +1957,13 @@ static int davinci_emac_probe(struct platform_device *pdev)
 
 	return 0;
 
-no_cpdma_chan:
-	if (priv->txchan)
-		cpdma_chan_destroy(priv->txchan);
-	if (priv->rxchan)
-		cpdma_chan_destroy(priv->rxchan);
+err_napi_del:
+	netif_napi_del(&priv->napi);
+err_free_rxchan:
+	cpdma_chan_destroy(priv->rxchan);
+err_free_txchan:
+	cpdma_chan_destroy(priv->txchan);
+err_free_dma:
 	cpdma_ctlr_destroy(priv->dma);
 no_pdata:
 	if (of_phy_is_fixed_link(np))

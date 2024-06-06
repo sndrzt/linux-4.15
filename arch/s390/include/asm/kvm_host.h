@@ -2,7 +2,7 @@
 /*
  * definition for kernel virtual machines on s390
  *
- * Copyright IBM Corp. 2008, 2009
+ * Copyright IBM Corp. 2008, 2018
  *
  *    Author(s): Carsten Otte <cotte@de.ibm.com>
  */
@@ -30,12 +30,12 @@
 #define KVM_USER_MEM_SLOTS 32
 
 /*
- * These seem to be used for allocating ->chip in the routing table,
- * which we don't use. 4096 is an out-of-thin-air value. If we need
- * to look at ->chip later on, we'll need to revisit this.
+ * These seem to be used for allocating ->chip in the routing table, which we
+ * don't use. 1 is as small as we can get to reduce the needed memory. If we
+ * need to look at ->chip later on, we'll need to revisit this.
  */
 #define KVM_NR_IRQCHIPS 1
-#define KVM_IRQCHIP_NUM_PINS 4096
+#define KVM_IRQCHIP_NUM_PINS 1
 #define KVM_HALT_POLL_NS_DEFAULT 80000
 
 /* s390-specific vcpu->requests bit members */
@@ -44,6 +44,7 @@
 #define KVM_REQ_ICPT_OPEREXC	KVM_ARCH_REQ(2)
 #define KVM_REQ_START_MIGRATION KVM_ARCH_REQ(3)
 #define KVM_REQ_STOP_MIGRATION  KVM_ARCH_REQ(4)
+#define KVM_REQ_VSIE_RESTART	KVM_ARCH_REQ(5)
 
 #define SIGP_CTRL_C		0x80
 #define SIGP_CTRL_SCN_MASK	0x3f
@@ -185,6 +186,7 @@ struct kvm_s390_sie_block {
 #define ECA_MVPGI	0x01000000
 #define ECA_VX		0x00020000
 #define ECA_PROTEXCI	0x00002000
+#define ECA_APIE	0x00000008
 #define ECA_SII		0x00000001
 	__u32	eca;			/* 0x004c */
 #define ICPT_INST	0x04
@@ -252,6 +254,8 @@ struct kvm_s390_sie_block {
 	__u8	reservede4[4];		/* 0x00e4 */
 	__u64	tecmc;			/* 0x00e8 */
 	__u8	reservedf0[12];		/* 0x00f0 */
+#define CRYCB_FORMAT_MASK 0x00000003
+#define CRYCB_FORMAT0 0x00000000
 #define CRYCB_FORMAT1 0x00000001
 #define CRYCB_FORMAT2 0x00000003
 	__u32	crycbd;			/* 0x00fc */
@@ -266,6 +270,8 @@ struct kvm_s390_sie_block {
 	__u8	reserved1c0[8];		/* 0x01c0 */
 #define ECD_HOSTREGMGMT	0x20000000
 #define ECD_MEF		0x08000000
+#define ECD_ETOKENF	0x02000000
+#define ECD_ECC		0x00200000
 	__u32	ecd;			/* 0x01c8 */
 	__u8	reserved1cc[18];	/* 0x01cc */
 	__u64	pp;			/* 0x01de */
@@ -317,18 +323,30 @@ struct kvm_vcpu_stat {
 	u64 deliver_program_int;
 	u64 deliver_io_int;
 	u64 exit_wait_state;
+	u64 instruction_epsw;
+	u64 instruction_gs;
+	u64 instruction_io_other;
+	u64 instruction_lpsw;
+	u64 instruction_lpswe;
 	u64 instruction_pfmf;
+	u64 instruction_ptff;
+	u64 instruction_sck;
+	u64 instruction_sckpf;
 	u64 instruction_stidp;
 	u64 instruction_spx;
 	u64 instruction_stpx;
 	u64 instruction_stap;
-	u64 instruction_storage_key;
+	u64 instruction_iske;
+	u64 instruction_ri;
+	u64 instruction_rrbe;
+	u64 instruction_sske;
 	u64 instruction_ipte_interlock;
-	u64 instruction_stsch;
-	u64 instruction_chsc;
 	u64 instruction_stsi;
 	u64 instruction_stfl;
+	u64 instruction_tb;
+	u64 instruction_tpi;
 	u64 instruction_tprot;
+	u64 instruction_tsch;
 	u64 instruction_sie;
 	u64 instruction_essa;
 	u64 instruction_sthyi;
@@ -354,6 +372,7 @@ struct kvm_vcpu_stat {
 	u64 diagnose_258;
 	u64 diagnose_308;
 	u64 diagnose_500;
+	u64 diagnose_other;
 };
 
 #define PGM_OPERATION			0x01
@@ -670,6 +689,7 @@ struct s390_io_adapter {
 struct kvm_s390_cpu_model {
 	/* facility mask supported by kvm & hosting machine */
 	__u64 fac_mask[S390_ARCH_FAC_LIST_SIZE_U64];
+	struct kvm_s390_vm_cpu_subfunc subfuncs;
 	/* facility list requested by guest (in dma page) */
 	__u64 *fac_list;
 	u64 cpuid;
@@ -681,6 +701,7 @@ struct kvm_s390_crypto {
 	__u32 crycbd;
 	__u8 aes_kw;
 	__u8 dea_kw;
+	__u8 apie;
 };
 
 #define APCB0_MASK_SIZE 1
@@ -787,6 +808,10 @@ void kvm_arch_async_page_not_present(struct kvm_vcpu *vcpu,
 void kvm_arch_async_page_present(struct kvm_vcpu *vcpu,
 				 struct kvm_async_pf *work);
 
+void kvm_arch_crypto_clear_masks(struct kvm *kvm);
+void kvm_arch_crypto_set_masks(struct kvm *kvm, unsigned long *apm,
+			       unsigned long *aqm, unsigned long *adm);
+
 extern int sie64a(struct kvm_s390_sie_block *, u64 *);
 extern char sie_exit;
 
@@ -797,7 +822,7 @@ static inline void kvm_arch_vcpu_uninit(struct kvm_vcpu *vcpu) {}
 static inline void kvm_arch_sched_in(struct kvm_vcpu *vcpu, int cpu) {}
 static inline void kvm_arch_free_memslot(struct kvm *kvm,
 		struct kvm_memory_slot *free, struct kvm_memory_slot *dont) {}
-static inline void kvm_arch_memslots_updated(struct kvm *kvm, struct kvm_memslots *slots) {}
+static inline void kvm_arch_memslots_updated(struct kvm *kvm, u64 gen) {}
 static inline void kvm_arch_flush_shadow_all(struct kvm *kvm) {}
 static inline void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
 		struct kvm_memory_slot *slot) {}

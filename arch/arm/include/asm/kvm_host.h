@@ -21,10 +21,12 @@
 
 #include <linux/types.h>
 #include <linux/kvm_types.h>
+#include <asm/cputype.h>
 #include <asm/kvm.h>
 #include <asm/kvm_asm.h>
 #include <asm/kvm_mmio.h>
 #include <asm/fpstate.h>
+#include <asm/spectre.h>
 #include <kvm/arm_arch_timer.h>
 
 #define __KVM_HAVE_ARCH_INTC_INITIALIZED
@@ -47,6 +49,7 @@
 #define KVM_REQ_SLEEP \
 	KVM_ARCH_REQ_FLAGS(0, KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
 #define KVM_REQ_IRQ_PENDING	KVM_ARCH_REQ(1)
+#define KVM_REQ_VCPU_RESET	KVM_ARCH_REQ(2)
 
 u32 *kvm_vcpu_reg(struct kvm_vcpu *vcpu, u8 reg_num, u32 mode);
 int __attribute_const__ kvm_target_cpu(void);
@@ -75,6 +78,9 @@ struct kvm_arch {
 	/* Interrupt controller */
 	struct vgic_dist	vgic;
 	int max_vcpus;
+
+	/* Mandated version of PSCI */
+	u32 psci_version;
 };
 
 #define KVM_NR_MEM_OBJS     40
@@ -141,6 +147,13 @@ struct kvm_cpu_context {
 
 typedef struct kvm_cpu_context kvm_cpu_context_t;
 
+struct vcpu_reset_state {
+	unsigned long	pc;
+	unsigned long	r0;
+	bool		be;
+	bool		reset;
+};
+
 struct kvm_vcpu_arch {
 	struct kvm_cpu_context ctxt;
 
@@ -182,6 +195,8 @@ struct kvm_vcpu_arch {
 
 	/* Cache some mmu pages needed inside spinlock regions */
 	struct kvm_mmu_memory_cache mmu_page_cache;
+
+	struct vcpu_reset_state reset_state;
 
 	/* Detect first run of a vcpu */
 	bool has_run_once;
@@ -237,6 +252,9 @@ int kvm_arm_coproc_set_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *);
 
 int handle_exit(struct kvm_vcpu *vcpu, struct kvm_run *run,
 		int exception_index);
+
+static inline void handle_exit_early(struct kvm_vcpu *vcpu, struct kvm_run *run,
+				     int exception_index) {}
 
 static inline void __cpu_init_hyp_mode(phys_addr_t pgd_ptr,
 				       unsigned long hyp_stack_ptr,
@@ -301,4 +319,39 @@ int kvm_arm_vcpu_arch_has_attr(struct kvm_vcpu *vcpu,
 /* All host FP/SIMD state is restored on guest exit, so nothing to save: */
 static inline void kvm_fpsimd_flush_cpu_state(void) {}
 
+static inline void kvm_arm_vhe_guest_enter(void) {}
+static inline void kvm_arm_vhe_guest_exit(void) {}
+
+static inline bool kvm_arm_harden_branch_predictor(void)
+{
+	switch(read_cpuid_part()) {
+#ifdef CONFIG_HARDEN_BRANCH_PREDICTOR
+	case ARM_CPU_PART_BRAHMA_B15:
+	case ARM_CPU_PART_CORTEX_A12:
+	case ARM_CPU_PART_CORTEX_A15:
+	case ARM_CPU_PART_CORTEX_A17:
+		return true;
+#endif
+	default:
+		return false;
+	}
+}
+
+#define KVM_SSBD_UNKNOWN		-1
+#define KVM_SSBD_FORCE_DISABLE		0
+#define KVM_SSBD_KERNEL		1
+#define KVM_SSBD_FORCE_ENABLE		2
+#define KVM_SSBD_MITIGATED		3
+
+static inline int kvm_arm_have_ssbd(void)
+{
+	/* No way to detect it yet, pretend it is not there. */
+	return KVM_SSBD_UNKNOWN;
+}
+
+static inline int kvm_arm_get_spectre_bhb_state(void)
+{
+	/* 32bit guests don't need firmware for this */
+	return SPECTRE_VULNERABLE; /* aka SMCCC_RET_NOT_SUPPORTED */
+}
 #endif /* __ARM_KVM_HOST_H__ */

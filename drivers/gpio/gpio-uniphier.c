@@ -181,7 +181,11 @@ static int uniphier_gpio_to_irq(struct gpio_chip *chip, unsigned int offset)
 	fwspec.fwnode = of_node_to_fwnode(chip->parent->of_node);
 	fwspec.param_count = 2;
 	fwspec.param[0] = offset - UNIPHIER_GPIO_IRQ_OFFSET;
-	fwspec.param[1] = IRQ_TYPE_NONE;
+	/*
+	 * IRQ_TYPE_NONE is rejected by the parent irq domain. Set LEVEL_HIGH
+	 * temporarily. Anyway, ->irq_set_type() will override it later.
+	 */
+	fwspec.param[1] = IRQ_TYPE_LEVEL_HIGH;
 
 	return irq_create_fwspec_mapping(&fwspec);
 }
@@ -193,7 +197,7 @@ static void uniphier_gpio_irq_mask(struct irq_data *data)
 
 	uniphier_gpio_reg_update(priv, UNIPHIER_GPIO_IRQ_EN, mask, 0);
 
-	return irq_chip_mask_parent(data);
+	irq_chip_mask_parent(data);
 }
 
 static void uniphier_gpio_irq_unmask(struct irq_data *data)
@@ -203,7 +207,7 @@ static void uniphier_gpio_irq_unmask(struct irq_data *data)
 
 	uniphier_gpio_reg_update(priv, UNIPHIER_GPIO_IRQ_EN, mask, mask);
 
-	return irq_chip_unmask_parent(data);
+	irq_chip_unmask_parent(data);
 }
 
 static int uniphier_gpio_irq_set_type(struct irq_data *data, unsigned int type)
@@ -505,4 +509,4 @@ module_platform_driver(uniphier_gpio_driver);
 
 MODULE_AUTHOR("Masahiro Yamada <yamada.masahiro@socionext.com>");
 MODULE_DESCRIPTION("UniPhier GPIO driver");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");

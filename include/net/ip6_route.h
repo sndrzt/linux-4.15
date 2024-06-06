@@ -170,6 +170,9 @@ void rt6_mtu_change(struct net_device *dev, unsigned int mtu);
 void rt6_remove_prefsrc(struct inet6_ifaddr *ifp);
 void rt6_clean_tohost(struct net *net, struct in6_addr *gateway);
 
+void rt6_uncached_list_add(struct rt6_info *rt);
+void rt6_uncached_list_del(struct rt6_info *rt);
+
 static inline const struct rt6_info *skb_rt6_info(const struct sk_buff *skb)
 {
 	const struct dst_entry *dst = skb_dst(skb);
@@ -212,13 +215,14 @@ static inline bool ipv6_anycast_destination(const struct dst_entry *dst,
 
 	return rt->rt6i_flags & RTF_ANYCAST ||
 		(rt->rt6i_dst.plen < 127 &&
+		 !(rt->rt6i_flags & (RTF_GATEWAY | RTF_NONEXTHOP)) &&
 		 ipv6_addr_equal(&rt->rt6i_dst.addr, daddr));
 }
 
 int ip6_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
 		 int (*output)(struct net *, struct sock *, struct sk_buff *));
 
-static inline int ip6_skb_dst_mtu(struct sk_buff *skb)
+static inline unsigned int ip6_skb_dst_mtu(struct sk_buff *skb)
 {
 	struct ipv6_pinfo *np = skb->sk && !dev_recursion_level() ?
 				inet6_sk(skb->sk) : NULL;
@@ -239,8 +243,8 @@ static inline bool ip6_sk_ignore_df(const struct sock *sk)
 	       inet6_sk(sk)->pmtudisc == IPV6_PMTUDISC_OMIT;
 }
 
-static inline struct in6_addr *rt6_nexthop(struct rt6_info *rt,
-					   struct in6_addr *daddr)
+static inline const struct in6_addr *rt6_nexthop(const struct rt6_info *rt,
+						 const struct in6_addr *daddr)
 {
 	if (rt->rt6i_flags & RTF_GATEWAY)
 		return &rt->rt6i_gateway;

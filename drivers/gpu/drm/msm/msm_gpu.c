@@ -270,8 +270,7 @@ static void recover_worker(struct work_struct *work)
 	if (submit) {
 		struct task_struct *task;
 
-		rcu_read_lock();
-		task = pid_task(submit->pid, PIDTYPE_PID);
+		task = get_pid_task(submit->pid, PIDTYPE_PID);
 		if (task) {
 			char *cmd;
 
@@ -287,6 +286,7 @@ static void recover_worker(struct work_struct *work)
 			 */
 			mutex_unlock(&dev->struct_mutex);
 			cmd = kstrdup_quotable_cmdline(task, GFP_KERNEL);
+			put_task_struct(task);
 			mutex_lock(&dev->struct_mutex);
 
 			dev_err(dev->dev, "%s: offending task: %s (%s)\n",
@@ -297,7 +297,6 @@ static void recover_worker(struct work_struct *work)
 		} else {
 			msm_rd_dump_submit(priv->hangrd, submit, NULL);
 		}
-		rcu_read_unlock();
 	}
 
 
@@ -306,7 +305,7 @@ static void recover_worker(struct work_struct *work)
 	 * needs to happen after msm_rd_dump_submit() to ensure that the
 	 * bo's referenced by the offending submit are still around.
 	 */
-	for (i = 0; i < ARRAY_SIZE(gpu->rb); i++) {
+	for (i = 0; i < gpu->nr_rings; i++) {
 		struct msm_ringbuffer *ring = gpu->rb[i];
 
 		uint32_t fence = ring->memptrs->fence;

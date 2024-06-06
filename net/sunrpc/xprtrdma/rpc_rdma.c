@@ -76,7 +76,7 @@ static unsigned int rpcrdma_max_call_header_size(unsigned int maxsegs)
 
 	/* Maximum Read list size */
 	maxsegs += 2;	/* segment for head and tail buffers */
-	size = maxsegs * rpcrdma_readchunk_maxsz * sizeof(__be32);
+	size += maxsegs * rpcrdma_readchunk_maxsz * sizeof(__be32);
 
 	/* Minimal Read chunk size */
 	size += sizeof(__be32);	/* segment count */
@@ -102,7 +102,7 @@ static unsigned int rpcrdma_max_reply_header_size(unsigned int maxsegs)
 
 	/* Maximum Write list size */
 	maxsegs += 2;	/* segment for head and tail buffers */
-	size = sizeof(__be32);		/* segment count */
+	size += sizeof(__be32);		/* segment count */
 	size += maxsegs * rpcrdma_segment_maxsz * sizeof(__be32);
 	size += sizeof(__be32);	/* list discriminator */
 
@@ -143,7 +143,7 @@ static bool rpcrdma_args_inline(struct rpcrdma_xprt *r_xprt,
 	if (xdr->page_len) {
 		remaining = xdr->page_len;
 		offset = offset_in_page(xdr->page_base);
-		count = 0;
+		count = RPCRDMA_MIN_SEND_SGES;
 		while (remaining) {
 			remaining -= min_t(unsigned int,
 					   PAGE_SIZE - offset, remaining);
@@ -230,7 +230,7 @@ rpcrdma_convert_iovs(struct rpcrdma_xprt *r_xprt, struct xdr_buf *xdrbuf,
 			 */
 			*ppages = alloc_page(GFP_ATOMIC);
 			if (!*ppages)
-				return -EAGAIN;
+				return -ENOBUFS;
 		}
 		seg->mr_page = *ppages;
 		seg->mr_offset = (char *)page_base;
@@ -1011,6 +1011,7 @@ static bool
 rpcrdma_is_bcall(struct rpcrdma_xprt *r_xprt, struct rpcrdma_rep *rep)
 #if defined(CONFIG_SUNRPC_BACKCHANNEL)
 {
+	struct rpc_xprt *xprt = &r_xprt->rx_xprt;
 	struct xdr_stream *xdr = &rep->rr_stream;
 	__be32 *p;
 
@@ -1032,6 +1033,10 @@ rpcrdma_is_bcall(struct rpcrdma_xprt *r_xprt, struct rpcrdma_rep *rep)
 	if (*p++ != rep->rr_xid)
 		return false;
 	if (*p != cpu_to_be32(RPC_CALL))
+		return false;
+
+	/* No bc service. */
+	if (xprt->bc_serv == NULL)
 		return false;
 
 	/* Now that we are sure this is a backchannel call,
@@ -1408,7 +1413,7 @@ void rpcrdma_reply_handler(struct rpcrdma_rep *rep)
 	dprintk("RPC:       %s: reply %p completes request %p (xid 0x%08x)\n",
 		__func__, rep, req, be32_to_cpu(rep->rr_xid));
 
-	queue_work_on(req->rl_cpu, rpcrdma_receive_wq, &rep->rr_work);
+	queue_work(rpcrdma_receive_wq, &rep->rr_work);
 	return;
 
 out_badstatus:

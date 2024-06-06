@@ -24,8 +24,7 @@
 
 #define PCM3168A_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | \
 			 SNDRV_PCM_FMTBIT_S24_3LE | \
-			 SNDRV_PCM_FMTBIT_S24_LE | \
-			 SNDRV_PCM_FMTBIT_S32_LE)
+			 SNDRV_PCM_FMTBIT_S24_LE)
 
 #define PCM3168A_FMT_I2S		0x0
 #define PCM3168A_FMT_LEFT_J		0x1
@@ -688,15 +687,22 @@ err_clk:
 }
 EXPORT_SYMBOL_GPL(pcm3168a_probe);
 
-void pcm3168a_remove(struct device *dev)
+static void pcm3168a_disable(struct device *dev)
 {
 	struct pcm3168a_priv *pcm3168a = dev_get_drvdata(dev);
 
 	snd_soc_unregister_codec(dev);
-	pm_runtime_disable(dev);
 	regulator_bulk_disable(ARRAY_SIZE(pcm3168a->supplies),
-				pcm3168a->supplies);
+			       pcm3168a->supplies);
 	clk_disable_unprepare(pcm3168a->scki);
+}
+
+void pcm3168a_remove(struct device *dev)
+{
+	pm_runtime_disable(dev);
+#ifndef CONFIG_PM
+	pcm3168a_disable(dev);
+#endif
 }
 EXPORT_SYMBOL_GPL(pcm3168a_remove);
 
@@ -752,10 +758,7 @@ static int pcm3168a_rt_suspend(struct device *dev)
 
 	regcache_cache_only(pcm3168a->regmap, true);
 
-	regulator_bulk_disable(ARRAY_SIZE(pcm3168a->supplies),
-			       pcm3168a->supplies);
-
-	clk_disable_unprepare(pcm3168a->scki);
+	pcm3168a_disable(dev);
 
 	return 0;
 }

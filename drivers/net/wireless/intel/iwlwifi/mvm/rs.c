@@ -3,6 +3,7 @@
  * Copyright(c) 2005 - 2014 Intel Corporation. All rights reserved.
  * Copyright(c) 2013 - 2015 Intel Mobile Communications GmbH
  * Copyright(c) 2016 - 2017 Intel Deutschland GmbH
+ * Copyright(c) 2018 Intel Corporation
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of version 2 of the GNU General Public License as
@@ -12,10 +13,6 @@
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
  * more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * this program; if not, write to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA 02110, USA
  *
  * The full GNU General Public License is included in this distribution in the
  * file called LICENSE.
@@ -653,9 +650,10 @@ static void rs_tl_turn_on_agg(struct iwl_mvm *mvm, struct iwl_mvm_sta *mvmsta,
 	}
 
 	tid_data = &mvmsta->tid_data[tid];
-	if ((tid_data->state == IWL_AGG_OFF) &&
+	if (mvmsta->sta_state >= IEEE80211_STA_AUTHORIZED &&
+	    tid_data->state == IWL_AGG_OFF &&
 	    (lq_sta->tx_agg_tid_en & BIT(tid)) &&
-	    (tid_data->tx_count_last >= IWL_MVM_RS_AGG_START_THRESHOLD)) {
+	    tid_data->tx_count_last >= IWL_MVM_RS_AGG_START_THRESHOLD) {
 		IWL_DEBUG_RATE(mvm, "try to aggregate tid %d\n", tid);
 		if (rs_tl_turn_on_agg_for_tid(mvm, lq_sta, tid, sta) == 0)
 			tid_data->state = IWL_AGG_QUEUED;
@@ -1222,7 +1220,11 @@ void iwl_mvm_rs_tx_status(struct iwl_mvm *mvm, struct ieee80211_sta *sta,
 	    !(info->flags & IEEE80211_TX_STAT_AMPDU))
 		return;
 
-	rs_rate_from_ucode_rate(tx_resp_hwrate, info->band, &tx_resp_rate);
+	if (rs_rate_from_ucode_rate(tx_resp_hwrate, info->band,
+				    &tx_resp_rate)) {
+		WARN_ON_ONCE(1);
+		return;
+	}
 
 #ifdef CONFIG_MAC80211_DEBUGFS
 	/* Disable last tx check if we are debugging with fixed rate but
@@ -1259,7 +1261,7 @@ void iwl_mvm_rs_tx_status(struct iwl_mvm *mvm, struct ieee80211_sta *sta,
 		       (unsigned long)(lq_sta->last_tx +
 				       (IWL_MVM_RS_IDLE_TIMEOUT * HZ)))) {
 		IWL_DEBUG_RATE(mvm, "Tx idle for too long. reinit rs\n");
-		iwl_mvm_rs_rate_init(mvm, sta, info->band, false);
+		iwl_mvm_rs_rate_init(mvm, sta, info->band);
 		return;
 	}
 	lq_sta->last_tx = jiffies;
@@ -1273,7 +1275,10 @@ void iwl_mvm_rs_tx_status(struct iwl_mvm *mvm, struct ieee80211_sta *sta,
 	 */
 	table = &lq_sta->lq;
 	lq_hwrate = le32_to_cpu(table->rs_table[0]);
-	rs_rate_from_ucode_rate(lq_hwrate, info->band, &lq_rate);
+	if (rs_rate_from_ucode_rate(lq_hwrate, info->band, &lq_rate)) {
+		WARN_ON_ONCE(1);
+		return;
+	}
 
 	/* Here we actually compare this rate to the latest LQ command */
 	if (lq_color != LQ_FLAG_COLOR_GET(table->flags)) {
@@ -1375,8 +1380,12 @@ void iwl_mvm_rs_tx_status(struct iwl_mvm *mvm, struct ieee80211_sta *sta,
 		/* Collect data for each rate used during failed TX attempts */
 		for (i = 0; i <= retries; ++i) {
 			lq_hwrate = le32_to_cpu(table->rs_table[i]);
-			rs_rate_from_ucode_rate(lq_hwrate, info->band,
-						&lq_rate);
+			if (rs_rate_from_ucode_rate(lq_hwrate, info->band,
+						    &lq_rate)) {
+				WARN_ON_ONCE(1);
+				return;
+			}
+
 			/*
 			 * Only collect stats if retried rate is in the same RS
 			 * table as active/search.
@@ -1877,12 +1886,10 @@ static int rs_switch_to_column(struct iwl_mvm *mvm,
 	struct rs_rate *rate = &search_tbl->rate;
 	const struct rs_tx_column *column = &rs_tx_columns[col_id];
 	const struct rs_tx_column *curr_column = &rs_tx_columns[tbl->column];
-	u32 sz = (sizeof(struct iwl_scale_tbl_info) -
-		  (sizeof(struct iwl_rate_scale_data) * IWL_RATE_COUNT));
 	unsigned long rate_mask = 0;
 	u32 rate_idx = 0;
 
-	memcpy(search_tbl, tbl, sz);
+	memcpy(search_tbl, tbl, offsetof(struct iwl_scale_tbl_info, win));
 
 	rate->sgi = column->sgi;
 	rate->ant = column->ant;
@@ -2690,6 +2697,7 @@ static void rs_get_initial_rate(struct iwl_mvm *mvm,
 				enum nl80211_band band,
 				struct rs_rate *rate)
 {
+	struct iwl_mvm_sta *mvmsta = iwl_mvm_sta_from_mac80211(sta);
 	int i, nentries;
 	unsigned long active_rate;
 	s8 best_rssi = S8_MIN;
@@ -2742,14 +2750,26 @@ static void rs_get_initial_rate(struct iwl_mvm *mvm,
 	 */
 	if (sta->vht_cap.vht_supported &&
 	    best_rssi > IWL_RS_LOW_RSSI_THRESHOLD) {
-		switch (sta->bandwidth) {
-		case IEEE80211_STA_RX_BW_160:
-		case IEEE80211_STA_RX_BW_80:
-		case IEEE80211_STA_RX_BW_40:
+		/*
+		 * In AP mode, when a new station associates, rs is initialized
+		 * immediately upon association completion, before the phy
+		 * context is updated with the association parameters, so the
+		 * sta bandwidth might be wider than the phy context allows.
+		 * To avoid this issue, always initialize rs with 20mhz
+		 * bandwidth rate, and after authorization, when the phy context
+		 * is already up-to-date, re-init rs with the correct bw.
+		 */
+		u32 bw = mvmsta->sta_state < IEEE80211_STA_AUTHORIZED ?
+				RATE_MCS_CHAN_WIDTH_20 : rs_bw_from_sta_bw(sta);
+
+		switch (bw) {
+		case RATE_MCS_CHAN_WIDTH_40:
+		case RATE_MCS_CHAN_WIDTH_80:
+		case RATE_MCS_CHAN_WIDTH_160:
 			initial_rates = rs_optimal_rates_vht;
 			nentries = ARRAY_SIZE(rs_optimal_rates_vht);
 			break;
-		case IEEE80211_STA_RX_BW_20:
+		case RATE_MCS_CHAN_WIDTH_20:
 			initial_rates = rs_optimal_rates_vht_20mhz;
 			nentries = ARRAY_SIZE(rs_optimal_rates_vht_20mhz);
 			break;
@@ -2760,7 +2780,7 @@ static void rs_get_initial_rate(struct iwl_mvm *mvm,
 
 		active_rate = lq_sta->active_siso_rate;
 		rate->type = LQ_VHT_SISO;
-		rate->bw = rs_bw_from_sta_bw(sta);
+		rate->bw = bw;
 	} else if (sta->ht_cap.ht_supported &&
 		   best_rssi > IWL_RS_LOW_RSSI_THRESHOLD) {
 		initial_rates = rs_optimal_rates_ht;
@@ -2824,9 +2844,9 @@ void rs_update_last_rssi(struct iwl_mvm *mvm,
 static void rs_initialize_lq(struct iwl_mvm *mvm,
 			     struct ieee80211_sta *sta,
 			     struct iwl_lq_sta *lq_sta,
-			     enum nl80211_band band,
-			     bool init)
+			     enum nl80211_band band)
 {
+	struct iwl_mvm_sta *mvmsta = iwl_mvm_sta_from_mac80211(sta);
 	struct iwl_scale_tbl_info *tbl;
 	struct rs_rate *rate;
 	u8 active_tbl = 0;
@@ -2855,7 +2875,8 @@ static void rs_initialize_lq(struct iwl_mvm *mvm,
 	rs_set_expected_tpt_table(lq_sta, tbl);
 	rs_fill_lq_cmd(mvm, sta, lq_sta, rate);
 	/* TODO restore station should remember the lq cmd */
-	iwl_mvm_send_lq_cmd(mvm, &lq_sta->lq, init);
+	iwl_mvm_send_lq_cmd(mvm, &lq_sta->lq,
+			    mvmsta->sta_state < IEEE80211_STA_AUTHORIZED);
 }
 
 static void rs_get_rate(void *mvm_r, struct ieee80211_sta *sta, void *mvm_sta,
@@ -3112,7 +3133,7 @@ void iwl_mvm_update_frame_stats(struct iwl_mvm *mvm, u32 rate, bool agg)
  * Called after adding a new station to initialize rate scaling
  */
 void iwl_mvm_rs_rate_init(struct iwl_mvm *mvm, struct ieee80211_sta *sta,
-			  enum nl80211_band band, bool init)
+			  enum nl80211_band band)
 {
 	int i, j;
 	struct ieee80211_hw *hw = mvm->hw;
@@ -3191,7 +3212,7 @@ void iwl_mvm_rs_rate_init(struct iwl_mvm *mvm, struct ieee80211_sta *sta,
 #ifdef CONFIG_IWLWIFI_DEBUGFS
 	iwl_mvm_reset_frame_stats(mvm);
 #endif
-	rs_initialize_lq(mvm, sta, lq_sta, band, init);
+	rs_initialize_lq(mvm, sta, lq_sta, band);
 }
 
 static void rs_rate_update(void *mvm_r,
@@ -3212,7 +3233,7 @@ static void rs_rate_update(void *mvm_r,
 	for (tid = 0; tid < IWL_MAX_TID_COUNT; tid++)
 		ieee80211_stop_tx_ba_session(sta, tid);
 
-	iwl_mvm_rs_rate_init(mvm, sta, sband->band, false);
+	iwl_mvm_rs_rate_init(mvm, sta, sband->band);
 }
 
 #ifdef CONFIG_MAC80211_DEBUGFS
@@ -3230,7 +3251,10 @@ static void rs_build_rates_table_from_fixed(struct iwl_mvm *mvm,
 	for (i = 0; i < num_rates; i++)
 		lq_cmd->rs_table[i] = ucode_rate_le32;
 
-	rs_rate_from_ucode_rate(ucode_rate, band, &rate);
+	if (rs_rate_from_ucode_rate(ucode_rate, band, &rate)) {
+		WARN_ON_ONCE(1);
+		return;
+	}
 
 	if (is_mimo(&rate))
 		lq_cmd->mimo_delim = num_rates - 1;

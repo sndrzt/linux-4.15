@@ -1035,7 +1035,7 @@ void flush_cache_mm(struct mm_struct *mm)
 void flush_cache_page(struct vm_area_struct *vma, unsigned long u_vaddr,
 		      unsigned long pfn)
 {
-	unsigned int paddr = pfn << PAGE_SHIFT;
+	phys_addr_t paddr = pfn << PAGE_SHIFT;
 
 	u_vaddr &= PAGE_MASK;
 
@@ -1055,8 +1055,9 @@ void flush_anon_page(struct vm_area_struct *vma, struct page *page,
 		     unsigned long u_vaddr)
 {
 	/* TBD: do we really need to clear the kernel mapping */
-	__flush_dcache_page(page_address(page), u_vaddr);
-	__flush_dcache_page(page_address(page), page_address(page));
+	__flush_dcache_page((phys_addr_t)page_address(page), u_vaddr);
+	__flush_dcache_page((phys_addr_t)page_address(page),
+			    (phys_addr_t)page_address(page));
 
 }
 
@@ -1117,7 +1118,7 @@ void clear_user_page(void *to, unsigned long u_vaddr, struct page *page)
 	clear_page(to);
 	clear_bit(PG_dc_clean, &page->flags);
 }
-
+EXPORT_SYMBOL(clear_user_page);
 
 /**********************************************************************
  * Explicit Cache flush request from user space via syscall
@@ -1157,6 +1158,20 @@ noinline void __init arc_ioc_setup(void)
 		slc_entire_op(OP_FLUSH_N_INV);
 
 	/*
+	 * If IOC was already enabled (due to bootloader) it technically needs to
+	 * be reconfigured with aperture base,size corresponding to Linux memory map
+	 * which will certainly be different than uboot's. But disabling and
+	 * reenabling IOC when DMA might be potentially active is tricky business.
+	 * To avoid random memory issues later, just panic here and ask user to
+	 * upgrade bootloader to one which doesn't enable IOC
+	 */
+	if (read_aux_reg(ARC_REG_IO_COH_ENABLE) & ARC_IO_COH_ENABLE_BIT)
+		panic("IOC already enabled, please upgrade bootloader!\n");
+
+	if (!ioc_enable)
+		return;
+
+	/*
 	 * currently IOC Aperture covers entire DDR
 	 * TBD: fix for PGU + 1GB of low mem
 	 * TBD: fix for PAE
@@ -1179,8 +1194,8 @@ noinline void __init arc_ioc_setup(void)
 		panic("IOC Aperture start must be aligned to the size of the aperture");
 
 	write_aux_reg(ARC_REG_IO_COH_AP0_BASE, ioc_base >> 12);
-	write_aux_reg(ARC_REG_IO_COH_PARTIAL, 1);
-	write_aux_reg(ARC_REG_IO_COH_ENABLE, 1);
+	write_aux_reg(ARC_REG_IO_COH_PARTIAL, ARC_IO_COH_PARTIAL_BIT);
+	write_aux_reg(ARC_REG_IO_COH_ENABLE, ARC_IO_COH_ENABLE_BIT);
 
 	/* Re-enable L1 dcache */
 	__dc_enable();
@@ -1247,7 +1262,7 @@ void __init arc_cache_init_master(void)
 	if (is_isa_arcv2() && l2_line_sz && !slc_enable)
 		arc_slc_disable();
 
-	if (is_isa_arcv2() && ioc_enable)
+	if (is_isa_arcv2() && ioc_exists)
 		arc_ioc_setup();
 
 	if (is_isa_arcv2() && ioc_enable) {

@@ -813,6 +813,7 @@ static int amdgpu_ttm_tt_pin_userptr(struct ttm_tt *ttm)
 
 release_sg:
 	kfree(ttm->sg);
+	ttm->sg = NULL;
 	return r;
 }
 
@@ -826,7 +827,7 @@ static void amdgpu_ttm_tt_unpin_userptr(struct ttm_tt *ttm)
 		DMA_BIDIRECTIONAL : DMA_TO_DEVICE;
 
 	/* double check that we don't free the table twice */
-	if (!ttm->sg->sgl)
+	if (!ttm->sg || !ttm->sg->sgl)
 		return;
 
 	/* free the sg table and pages again */
@@ -1057,6 +1058,7 @@ static void amdgpu_ttm_tt_unpopulate(struct ttm_tt *ttm)
 	if (gtt && gtt->userptr) {
 		amdgpu_ttm_tt_set_user_pages(ttm, NULL);
 		kfree(ttm->sg);
+		ttm->sg = NULL;
 		ttm->page_flags &= ~TTM_PAGE_FLAG_SG;
 		return;
 	}
@@ -1339,12 +1341,14 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
 		return r;
 	}
 
-	r = amdgpu_bo_create_kernel(adev, adev->mc.stolen_size, PAGE_SIZE,
-				    AMDGPU_GEM_DOMAIN_VRAM,
-				    &adev->stolen_vga_memory,
-				    NULL, NULL);
-	if (r)
-		return r;
+	if (adev->mc.stolen_size) {
+		r = amdgpu_bo_create_kernel(adev, adev->mc.stolen_size, PAGE_SIZE,
+					    AMDGPU_GEM_DOMAIN_VRAM,
+					    &adev->stolen_vga_memory,
+					    NULL, NULL);
+		if (r)
+			return r;
+	}
 	DRM_INFO("amdgpu: %uM of VRAM memory ready\n",
 		 (unsigned) (adev->mc.real_vram_size / (1024 * 1024)));
 
@@ -1408,6 +1412,11 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
 	return 0;
 }
 
+void amdgpu_ttm_late_init(struct amdgpu_device *adev)
+{
+	amdgpu_bo_free_kernel(&adev->stolen_vga_memory, NULL, NULL);
+}
+
 void amdgpu_ttm_fini(struct amdgpu_device *adev)
 {
 	int r;
@@ -1415,14 +1424,6 @@ void amdgpu_ttm_fini(struct amdgpu_device *adev)
 	if (!adev->mman.initialized)
 		return;
 	amdgpu_ttm_debugfs_fini(adev);
-	if (adev->stolen_vga_memory) {
-		r = amdgpu_bo_reserve(adev->stolen_vga_memory, true);
-		if (r == 0) {
-			amdgpu_bo_unpin(adev->stolen_vga_memory);
-			amdgpu_bo_unreserve(adev->stolen_vga_memory);
-		}
-		amdgpu_bo_unref(&adev->stolen_vga_memory);
-	}
 	ttm_bo_clean_mm(&adev->mman.bdev, TTM_PL_VRAM);
 	ttm_bo_clean_mm(&adev->mman.bdev, TTM_PL_TT);
 	if (adev->gds.mem.total_size)

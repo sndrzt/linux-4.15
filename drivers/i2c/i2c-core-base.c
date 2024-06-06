@@ -32,6 +32,7 @@
 #include <linux/i2c-smbus.h>
 #include <linux/idr.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/irqflags.h>
 #include <linux/jump_label.h>
 #include <linux/kernel.h>
@@ -267,13 +268,14 @@ EXPORT_SYMBOL_GPL(i2c_recover_bus);
 static void i2c_init_recovery(struct i2c_adapter *adap)
 {
 	struct i2c_bus_recovery_info *bri = adap->bus_recovery_info;
-	char *err_str;
+	char *err_str, *err_level = KERN_ERR;
 
 	if (!bri)
 		return;
 
 	if (!bri->recover_bus) {
-		err_str = "no recover_bus() found";
+		err_str = "no suitable method provided";
+		err_level = KERN_DEBUG;
 		goto err;
 	}
 
@@ -301,7 +303,7 @@ static void i2c_init_recovery(struct i2c_adapter *adap)
 
 	return;
  err:
-	dev_err(&adap->dev, "Not using recovery: %s\n", err_str);
+	dev_printk(err_level, &adap->dev, "Not using recovery: %s\n", err_str);
 	adap->bus_recovery_info = NULL;
 }
 
@@ -316,10 +318,7 @@ static int i2c_smbus_host_notify_to_irq(const struct i2c_client *client)
 	if (client->flags & I2C_CLIENT_TEN)
 		return -EINVAL;
 
-	irq = irq_find_mapping(adap->host_notify_domain, client->addr);
-	if (!irq)
-		irq = irq_create_mapping(adap->host_notify_domain,
-					 client->addr);
+	irq = irq_create_mapping(adap->host_notify_domain, client->addr);
 
 	return irq > 0 ? irq : -ENXIO;
 }
@@ -340,6 +339,8 @@ static int i2c_device_probe(struct device *dev)
 
 		if (client->flags & I2C_CLIENT_HOST_NOTIFY) {
 			dev_dbg(dev, "Using Host Notify IRQ\n");
+			/* Keep adapter active when Host Notify is required */
+			pm_runtime_get_sync(&client->adapter->dev);
 			irq = i2c_smbus_host_notify_to_irq(client);
 		} else if (dev->of_node) {
 			irq = of_irq_get_byname(dev->of_node, "irq");
@@ -443,6 +444,10 @@ static int i2c_device_remove(struct device *dev)
 	dev_pm_clear_wake_irq(&client->dev);
 	device_init_wakeup(&client->dev, false);
 
+	client->irq = client->init_irq;
+	if (client->flags & I2C_CLIENT_HOST_NOTIFY)
+		pm_runtime_put(&client->adapter->dev);
+
 	return status;
 }
 
@@ -456,6 +461,8 @@ static void i2c_device_shutdown(struct device *dev)
 	driver = to_i2c_driver(dev->driver);
 	if (driver->shutdown)
 		driver->shutdown(client);
+	else if (client->irq > 0)
+		disable_irq(client->irq);
 }
 
 static void i2c_client_dev_release(struct device *dev)
@@ -643,7 +650,7 @@ static int i2c_check_addr_busy(struct i2c_adapter *adapter, int addr)
 static void i2c_adapter_lock_bus(struct i2c_adapter *adapter,
 				 unsigned int flags)
 {
-	rt_mutex_lock(&adapter->bus_lock);
+	rt_mutex_lock_nested(&adapter->bus_lock, i2c_adapter_depth(adapter));
 }
 
 /**
@@ -752,10 +759,11 @@ i2c_new_device(struct i2c_adapter *adap, struct i2c_board_info const *info)
 	client->flags = info->flags;
 	client->addr = info->addr;
 
-	client->irq = info->irq;
-	if (!client->irq)
-		client->irq = i2c_dev_irq_from_resources(info->resources,
+	client->init_irq = info->irq;
+	if (!client->init_irq)
+		client->init_irq = i2c_dev_irq_from_resources(info->resources,
 							 info->num_resources);
+	client->irq = client->init_irq;
 
 	strlcpy(client->name, info->type, sizeof(client->name));
 
@@ -1298,8 +1306,8 @@ static int i2c_register_adapter(struct i2c_adapter *adap)
 
 	/* create pre-declared device nodes */
 	of_i2c_register_devices(adap);
-	i2c_acpi_register_devices(adap);
 	i2c_acpi_install_space_handler(adap);
+	i2c_acpi_register_devices(adap);
 
 	if (adap->nr < __i2c_first_dynamic_bus_num)
 		i2c_scan_static_board_info(adap);
@@ -2260,10 +2268,62 @@ void i2c_put_adapter(struct i2c_adapter *adap)
 	if (!adap)
 		return;
 
-	put_device(&adap->dev);
 	module_put(adap->owner);
+	/* Should be last, otherwise we risk use-after-free with 'adap' */
+	put_device(&adap->dev);
 }
 EXPORT_SYMBOL(i2c_put_adapter);
+
+/**
+ * i2c_get_dma_safe_msg_buf() - get a DMA safe buffer for the given i2c_msg
+ * @msg: the message to be checked
+ * @threshold: the minimum number of bytes for which using DMA makes sense.
+ *	       Should at least be 1.
+ *
+ * Return: NULL if a DMA safe buffer was not obtained. Use msg->buf with PIO.
+ *	   Or a valid pointer to be used with DMA. After use, release it by
+ *	   calling i2c_release_dma_safe_msg_buf().
+ *
+ * This function must only be called from process context!
+ */
+u8 *i2c_get_dma_safe_msg_buf(struct i2c_msg *msg, unsigned int threshold)
+{
+	/* also skip 0-length msgs for bogus thresholds of 0 */
+	if (!threshold)
+		pr_debug("DMA buffer for addr=0x%02x with length 0 is bogus\n",
+			 msg->addr);
+	if (msg->len < threshold || msg->len == 0)
+		return NULL;
+
+	if (msg->flags & I2C_M_DMA_SAFE)
+		return msg->buf;
+
+	pr_debug("using bounce buffer for addr=0x%02x, len=%d\n",
+		 msg->addr, msg->len);
+
+	if (msg->flags & I2C_M_RD)
+		return kzalloc(msg->len, GFP_KERNEL);
+	else
+		return kmemdup(msg->buf, msg->len, GFP_KERNEL);
+}
+EXPORT_SYMBOL_GPL(i2c_get_dma_safe_msg_buf);
+
+/**
+ * i2c_release_dma_safe_msg_buf - release DMA safe buffer and sync with i2c_msg
+ * @msg: the message to be synced with
+ * @buf: the buffer obtained from i2c_get_dma_safe_msg_buf(). May be NULL.
+ */
+void i2c_release_dma_safe_msg_buf(struct i2c_msg *msg, u8 *buf)
+{
+	if (!buf || buf == msg->buf)
+		return;
+
+	if (msg->flags & I2C_M_RD)
+		memcpy(msg->buf, buf, msg->len);
+
+	kfree(buf);
+}
+EXPORT_SYMBOL_GPL(i2c_release_dma_safe_msg_buf);
 
 MODULE_AUTHOR("Simon G. Vogl <simon@tk.uni-linz.ac.at>");
 MODULE_DESCRIPTION("I2C-Bus main module");

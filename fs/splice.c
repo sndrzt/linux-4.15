@@ -332,8 +332,8 @@ const struct pipe_buf_operations default_pipe_buf_ops = {
 	.get = generic_pipe_buf_get,
 };
 
-static int generic_pipe_buf_nosteal(struct pipe_inode_info *pipe,
-				    struct pipe_buffer *buf)
+int generic_pipe_buf_nosteal(struct pipe_inode_info *pipe,
+			     struct pipe_buffer *buf)
 {
 	return 1;
 }
@@ -837,8 +837,8 @@ EXPORT_SYMBOL(generic_splice_sendpage);
 /*
  * Attempt to initiate a splice from pipe to file.
  */
-static long do_splice_from(struct pipe_inode_info *pipe, struct file *out,
-			   loff_t *ppos, size_t len, unsigned int flags)
+long do_splice_from(struct pipe_inode_info *pipe, struct file *out,
+		    loff_t *ppos, size_t len, unsigned int flags)
 {
 	ssize_t (*splice_write)(struct pipe_inode_info *, struct file *,
 				loff_t *, size_t, unsigned int);
@@ -850,13 +850,14 @@ static long do_splice_from(struct pipe_inode_info *pipe, struct file *out,
 
 	return splice_write(pipe, out, ppos, len, flags);
 }
+EXPORT_SYMBOL_GPL(do_splice_from);
 
 /*
  * Attempt to initiate a splice from a file to a pipe.
  */
-static long do_splice_to(struct file *in, loff_t *ppos,
-			 struct pipe_inode_info *pipe, size_t len,
-			 unsigned int flags)
+long do_splice_to(struct file *in, loff_t *ppos,
+		  struct pipe_inode_info *pipe, size_t len,
+		  unsigned int flags)
 {
 	ssize_t (*splice_read)(struct file *, loff_t *,
 			       struct pipe_inode_info *, size_t, unsigned int);
@@ -879,6 +880,7 @@ static long do_splice_to(struct file *in, loff_t *ppos,
 
 	return splice_read(in, ppos, pipe, len, flags);
 }
+EXPORT_SYMBOL_GPL(do_splice_to);
 
 /**
  * splice_direct_to_actor - splices data directly between two non-pipes
@@ -945,11 +947,17 @@ ssize_t splice_direct_to_actor(struct file *in, struct splice_desc *sd,
 	sd->flags &= ~SPLICE_F_NONBLOCK;
 	more = sd->flags & SPLICE_F_MORE;
 
+	WARN_ON_ONCE(pipe->nrbufs != 0);
+
 	while (len) {
+		unsigned int pipe_pages;
 		size_t read_len;
 		loff_t pos = sd->pos, prev_pos = pos;
 
-		ret = do_splice_to(in, &pos, pipe, len, flags);
+		/* Don't try to read more the pipe has space for. */
+		pipe_pages = pipe->buffers - pipe->nrbufs;
+		read_len = min(len, (size_t)pipe_pages << PAGE_SHIFT);
+		ret = do_splice_to(in, &pos, pipe, read_len, flags);
 		if (unlikely(ret <= 0))
 			goto out_release;
 
@@ -1169,8 +1177,15 @@ static long do_splice(struct file *in, loff_t __user *off_in,
 
 		pipe_lock(opipe);
 		ret = wait_for_space(opipe, flags);
-		if (!ret)
+		if (!ret) {
+			unsigned int pipe_pages;
+
+			/* Don't try to read more the pipe has space for. */
+			pipe_pages = opipe->buffers - opipe->nrbufs;
+			len = min(len, (size_t)pipe_pages << PAGE_SHIFT);
+
 			ret = do_splice_to(in, &offset, opipe, len, flags);
+		}
 		pipe_unlock(opipe);
 		if (ret > 0)
 			wakeup_pipe_readers(opipe);
@@ -1571,7 +1586,11 @@ retry:
 			 * Get a reference to this pipe buffer,
 			 * so we can copy the contents over.
 			 */
-			pipe_buf_get(ipipe, ibuf);
+			if (!pipe_buf_get(ipipe, ibuf)) {
+				if (ret == 0)
+					ret = -EFAULT;
+				break;
+			}
 			*obuf = *ibuf;
 
 			/*
@@ -1579,6 +1598,8 @@ retry:
 			 * prevent multiple steals of this page.
 			 */
 			obuf->flags &= ~PIPE_BUF_FLAG_GIFT;
+
+			pipe_buf_mark_unmergeable(obuf);
 
 			obuf->len = len;
 			opipe->nrbufs++;
@@ -1643,7 +1664,11 @@ static int link_pipe(struct pipe_inode_info *ipipe,
 		 * Get a reference to this pipe buffer,
 		 * so we can copy the contents over.
 		 */
-		pipe_buf_get(ipipe, ibuf);
+		if (!pipe_buf_get(ipipe, ibuf)) {
+			if (ret == 0)
+				ret = -EFAULT;
+			break;
+		}
 
 		obuf = opipe->bufs + nbuf;
 		*obuf = *ibuf;
@@ -1653,6 +1678,8 @@ static int link_pipe(struct pipe_inode_info *ipipe,
 		 * prevent multiple steals of this page.
 		 */
 		obuf->flags &= ~PIPE_BUF_FLAG_GIFT;
+
+		pipe_buf_mark_unmergeable(obuf);
 
 		if (obuf->len > len)
 			obuf->len = len;

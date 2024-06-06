@@ -310,7 +310,7 @@ static ssize_t otg_mode_store(struct device *device,
 
 	return r;
 }
-static DEVICE_ATTR(otg_mode, 0644, otg_mode_show, otg_mode_store);
+static DEVICE_ATTR_RW(otg_mode);
 
 static struct attribute *tahvo_attributes[] = {
 	&dev_attr_vbus.attr,
@@ -396,7 +396,9 @@ static int tahvo_usb_probe(struct platform_device *pdev)
 
 	dev_set_drvdata(&pdev->dev, tu);
 
-	tu->irq = platform_get_irq(pdev, 0);
+	tu->irq = ret = platform_get_irq(pdev, 0);
+	if (ret < 0)
+		return ret;
 	ret = request_threaded_irq(tu->irq, NULL, tahvo_usb_vbus_interrupt,
 				   IRQF_ONESHOT,
 				   "tahvo-vbus", tu);

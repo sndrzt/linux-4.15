@@ -99,11 +99,10 @@ int bnxt_set_vf_spoofchk(struct net_device *dev, int vf_id, bool setting)
 	if (old_setting == setting)
 		return 0;
 
-	func_flags = vf->func_flags;
 	if (setting)
-		func_flags |= FUNC_CFG_REQ_FLAGS_SRC_MAC_ADDR_CHECK_ENABLE;
+		func_flags = FUNC_CFG_REQ_FLAGS_SRC_MAC_ADDR_CHECK_ENABLE;
 	else
-		func_flags |= FUNC_CFG_REQ_FLAGS_SRC_MAC_ADDR_CHECK_DISABLE;
+		func_flags = FUNC_CFG_REQ_FLAGS_SRC_MAC_ADDR_CHECK_DISABLE;
 	/*TODO: if the driver supports VLAN filter on guest VLAN,
 	 * the spoof check should also include vlan anti-spoofing
 	 */
@@ -112,7 +111,6 @@ int bnxt_set_vf_spoofchk(struct net_device *dev, int vf_id, bool setting)
 	req.flags = cpu_to_le32(func_flags);
 	rc = hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
 	if (!rc) {
-		vf->func_flags = func_flags;
 		if (setting)
 			vf->flags |= BNXT_VF_SPOOFCHK;
 		else
@@ -176,7 +174,6 @@ int bnxt_set_vf_mac(struct net_device *dev, int vf_id, u8 *mac)
 	memcpy(vf->mac_addr, mac, ETH_ALEN);
 	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_CFG, -1, -1);
 	req.fid = cpu_to_le16(vf->fw_fid);
-	req.flags = cpu_to_le32(vf->func_flags);
 	req.enables = cpu_to_le32(FUNC_CFG_REQ_ENABLES_DFLT_MAC_ADDR);
 	memcpy(req.dflt_mac_addr, mac, ETH_ALEN);
 	return hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
@@ -214,7 +211,6 @@ int bnxt_set_vf_vlan(struct net_device *dev, int vf_id, u16 vlan_id, u8 qos,
 
 	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_CFG, -1, -1);
 	req.fid = cpu_to_le16(vf->fw_fid);
-	req.flags = cpu_to_le32(vf->func_flags);
 	req.dflt_vlan = cpu_to_le16(vlan_tag);
 	req.enables = cpu_to_le32(FUNC_CFG_REQ_ENABLES_DFLT_VLAN);
 	rc = hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
@@ -253,7 +249,6 @@ int bnxt_set_vf_bw(struct net_device *dev, int vf_id, int min_tx_rate,
 		return 0;
 	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_CFG, -1, -1);
 	req.fid = cpu_to_le16(vf->fw_fid);
-	req.flags = cpu_to_le32(vf->func_flags);
 	req.enables = cpu_to_le32(FUNC_CFG_REQ_ENABLES_MAX_BW);
 	req.max_bw = cpu_to_le32(max_tx_rate);
 	req.enables |= cpu_to_le32(FUNC_CFG_REQ_ENABLES_MIN_BW);
@@ -349,6 +344,7 @@ static void bnxt_free_vf_resources(struct bnxt *bp)
 		}
 	}
 
+	bp->pf.active_vfs = 0;
 	kfree(bp->pf.vf);
 	bp->pf.vf = NULL;
 }
@@ -613,7 +609,6 @@ void bnxt_sriov_disable(struct bnxt *bp)
 
 	bnxt_free_vf_resources(bp);
 
-	bp->pf.active_vfs = 0;
 	/* Reclaim all resources for the PF. */
 	rtnl_lock();
 	bnxt_restore_pf_fw_resources(bp);
@@ -902,7 +897,7 @@ update_vf_mac_exit:
 	mutex_unlock(&bp->hwrm_cmd_lock);
 }
 
-int bnxt_approve_mac(struct bnxt *bp, u8 *mac)
+int bnxt_approve_mac(struct bnxt *bp, u8 *mac, bool strict)
 {
 	struct hwrm_func_vf_cfg_input req = {0};
 	int rc = 0;
@@ -920,12 +915,13 @@ int bnxt_approve_mac(struct bnxt *bp, u8 *mac)
 	memcpy(req.dflt_mac_addr, mac, ETH_ALEN);
 	rc = hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
 mac_done:
-	if (rc) {
+	if (rc && strict) {
 		rc = -EADDRNOTAVAIL;
 		netdev_warn(bp->dev, "VF MAC address %pM not approved by the PF\n",
 			    mac);
+		return rc;
 	}
-	return rc;
+	return 0;
 }
 #else
 
@@ -942,7 +938,7 @@ void bnxt_update_vf_mac(struct bnxt *bp)
 {
 }
 
-int bnxt_approve_mac(struct bnxt *bp, u8 *mac)
+int bnxt_approve_mac(struct bnxt *bp, u8 *mac, bool strict)
 {
 	return 0;
 }

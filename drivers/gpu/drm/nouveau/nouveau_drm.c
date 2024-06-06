@@ -79,6 +79,10 @@ MODULE_PARM_DESC(modeset, "enable driver (default: auto, "
 int nouveau_modeset = -1;
 module_param_named(modeset, nouveau_modeset, int, 0400);
 
+MODULE_PARM_DESC(atomic, "Expose atomic ioctl (default: disabled)");
+static int nouveau_atomic = 0;
+module_param_named(atomic, nouveau_atomic, int, 0400);
+
 MODULE_PARM_DESC(runpm, "disable (0), force enable (1), optimus only default (-1)");
 static int nouveau_runtime_pm = -1;
 module_param_named(runpm, nouveau_runtime_pm, int, 0400);
@@ -112,24 +116,22 @@ nouveau_name(struct drm_device *dev)
 }
 
 static inline bool
-nouveau_cli_work_ready(struct dma_fence *fence, bool wait)
+nouveau_cli_work_ready(struct dma_fence *fence)
 {
-	if (!dma_fence_is_signaled(fence)) {
-		if (!wait)
-			return false;
-		WARN_ON(dma_fence_wait_timeout(fence, false, 2 * HZ) <= 0);
-	}
+	if (!dma_fence_is_signaled(fence))
+		return false;
 	dma_fence_put(fence);
 	return true;
 }
 
 static void
-nouveau_cli_work_flush(struct nouveau_cli *cli, bool wait)
+nouveau_cli_work(struct work_struct *w)
 {
+	struct nouveau_cli *cli = container_of(w, typeof(*cli), work);
 	struct nouveau_cli_work *work, *wtmp;
 	mutex_lock(&cli->lock);
 	list_for_each_entry_safe(work, wtmp, &cli->worker, head) {
-		if (!work->fence || nouveau_cli_work_ready(work->fence, wait)) {
+		if (!work->fence || nouveau_cli_work_ready(work->fence)) {
 			list_del(&work->head);
 			work->func(work);
 		}
@@ -158,16 +160,16 @@ nouveau_cli_work_queue(struct nouveau_cli *cli, struct dma_fence *fence,
 }
 
 static void
-nouveau_cli_work(struct work_struct *w)
-{
-	struct nouveau_cli *cli = container_of(w, typeof(*cli), work);
-	nouveau_cli_work_flush(cli, false);
-}
-
-static void
 nouveau_cli_fini(struct nouveau_cli *cli)
 {
-	nouveau_cli_work_flush(cli, true);
+	/* All our channels are dead now, which means all the fences they
+	 * own are signalled, and all callback functions have been called.
+	 *
+	 * So, after flushing the workqueue, there should be nothing left.
+	 */
+	flush_work(&cli->work);
+	WARN_ON(!list_empty(&cli->worker));
+
 	usif_client_fini(cli);
 	nouveau_vmm_fini(&cli->vmm);
 	nvif_mmu_fini(&cli->mmu);
@@ -226,7 +228,7 @@ nouveau_cli_init(struct nouveau_drm *drm, const char *sname,
 		mutex_unlock(&drm->master.lock);
 	}
 	if (ret) {
-		NV_ERROR(drm, "Client allocation failed: %d\n", ret);
+		NV_PRINTK(err, cli, "Client allocation failed: %d\n", ret);
 		goto done;
 	}
 
@@ -236,37 +238,37 @@ nouveau_cli_init(struct nouveau_drm *drm, const char *sname,
 			       }, sizeof(struct nv_device_v0),
 			       &cli->device);
 	if (ret) {
-		NV_ERROR(drm, "Device allocation failed: %d\n", ret);
+		NV_PRINTK(err, cli, "Device allocation failed: %d\n", ret);
 		goto done;
 	}
 
 	ret = nvif_mclass(&cli->device.object, mmus);
 	if (ret < 0) {
-		NV_ERROR(drm, "No supported MMU class\n");
+		NV_PRINTK(err, cli, "No supported MMU class\n");
 		goto done;
 	}
 
 	ret = nvif_mmu_init(&cli->device.object, mmus[ret].oclass, &cli->mmu);
 	if (ret) {
-		NV_ERROR(drm, "MMU allocation failed: %d\n", ret);
+		NV_PRINTK(err, cli, "MMU allocation failed: %d\n", ret);
 		goto done;
 	}
 
 	ret = nvif_mclass(&cli->mmu.object, vmms);
 	if (ret < 0) {
-		NV_ERROR(drm, "No supported VMM class\n");
+		NV_PRINTK(err, cli, "No supported VMM class\n");
 		goto done;
 	}
 
 	ret = nouveau_vmm_init(cli, vmms[ret].oclass, &cli->vmm);
 	if (ret) {
-		NV_ERROR(drm, "VMM allocation failed: %d\n", ret);
+		NV_PRINTK(err, cli, "VMM allocation failed: %d\n", ret);
 		goto done;
 	}
 
 	ret = nvif_mclass(&cli->mmu.object, mems);
 	if (ret < 0) {
-		NV_ERROR(drm, "No supported MEM class\n");
+		NV_PRINTK(err, cli, "No supported MEM class\n");
 		goto done;
 	}
 
@@ -501,6 +503,9 @@ static int nouveau_drm_probe(struct pci_dev *pdev,
 
 	pci_set_master(pdev);
 
+	if (nouveau_atomic)
+		driver_pci.driver_features |= DRIVER_ATOMIC;
+
 	ret = drm_get_pci_dev(pdev, pent, &driver_pci);
 	if (ret) {
 		nvkm_device_del(&device);
@@ -646,7 +651,7 @@ nouveau_drm_unload(struct drm_device *dev)
 	nouveau_debugfs_fini(drm);
 
 	if (dev->mode_config.num_crtc)
-		nouveau_display_fini(dev, false);
+		nouveau_display_fini(dev, false, false);
 	nouveau_display_destroy(dev);
 
 	nouveau_bios_takedown(dev);
@@ -854,8 +859,6 @@ nouveau_pmops_runtime_suspend(struct device *dev)
 		return -EBUSY;
 	}
 
-	drm_kms_helper_poll_disable(drm_dev);
-	vga_switcheroo_set_dynamic_switch(pdev, VGA_SWITCHEROO_OFF);
 	nouveau_switcheroo_optimus_dsm();
 	ret = nouveau_do_suspend(drm_dev, true);
 	pci_save_state(pdev);
@@ -890,7 +893,6 @@ nouveau_pmops_runtime_resume(struct device *dev)
 
 	/* do magic */
 	nvif_mask(&device->object, 0x088488, (1 << 25), (1 << 25));
-	vga_switcheroo_set_dynamic_switch(pdev, VGA_SWITCHEROO_ON);
 	drm_dev->switch_power_state = DRM_SWITCH_POWER_ON;
 
 	/* Monitors may have been connected / disconnected during suspend */
@@ -943,14 +945,18 @@ nouveau_drm_open(struct drm_device *dev, struct drm_file *fpriv)
 
 	/* need to bring up power immediately if opening device */
 	ret = pm_runtime_get_sync(dev->dev);
-	if (ret < 0 && ret != -EACCES)
+	if (ret < 0 && ret != -EACCES) {
+		pm_runtime_put_autosuspend(dev->dev);
 		return ret;
+	}
 
 	get_task_comm(tmpname, current);
 	snprintf(name, sizeof(name), "%s[%d]", tmpname, pid_nr(fpriv->pid));
 
-	if (!(cli = kzalloc(sizeof(*cli), GFP_KERNEL)))
-		return ret;
+	if (!(cli = kzalloc(sizeof(*cli), GFP_KERNEL))) {
+		ret = -ENOMEM;
+		goto done;
+	}
 
 	ret = nouveau_cli_init(drm, name, cli);
 	if (ret)
@@ -1022,8 +1028,10 @@ nouveau_drm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	long ret;
 
 	ret = pm_runtime_get_sync(dev->dev);
-	if (ret < 0 && ret != -EACCES)
+	if (ret < 0 && ret != -EACCES) {
+		pm_runtime_put_autosuspend(dev->dev);
 		return ret;
+	}
 
 	switch (_IOC_NR(cmd) - DRM_COMMAND_BASE) {
 	case DRM_NOUVEAU_NVIF:
@@ -1057,8 +1065,11 @@ nouveau_driver_fops = {
 static struct drm_driver
 driver_stub = {
 	.driver_features =
-		DRIVER_GEM | DRIVER_MODESET | DRIVER_PRIME | DRIVER_RENDER |
-		DRIVER_KMS_LEGACY_CONTEXT,
+		DRIVER_GEM | DRIVER_MODESET | DRIVER_PRIME | DRIVER_RENDER
+#if defined(CONFIG_NOUVEAU_LEGACY_CTX_SUPPORT)
+		| DRIVER_KMS_LEGACY_CONTEXT
+#endif
+		,
 
 	.load = nouveau_drm_load,
 	.unload = nouveau_drm_unload,

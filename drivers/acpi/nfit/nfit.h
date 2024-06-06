@@ -34,11 +34,14 @@
 /* https://msdn.microsoft.com/library/windows/hardware/mt604741 */
 #define UUID_NFIT_DIMM_N_MSFT "1ee68b36-d4bd-4a1a-9a16-4f8e53d46e05"
 
+/* http://www.uefi.org/RFIC_LIST (see "Virtual NVDIMM 0x1901") */
+#define UUID_NFIT_DIMM_N_HYPERV "5746c5f2-a9a2-4264-ad0e-e4ddc9e09e80"
+
 #define ACPI_NFIT_MEM_FAILED_MASK (ACPI_NFIT_MEM_SAVE_FAILED \
 		| ACPI_NFIT_MEM_RESTORE_FAILED | ACPI_NFIT_MEM_FLUSH_FAILED \
 		| ACPI_NFIT_MEM_NOT_ARMED | ACPI_NFIT_MEM_MAP_FAILED)
 
-#define NVDIMM_FAMILY_MAX NVDIMM_FAMILY_MSFT
+#define NVDIMM_FAMILY_MAX NVDIMM_FAMILY_HYPERV
 
 #define NVDIMM_STANDARD_CMDMASK \
 (1 << ND_CMD_SMART | 1 << ND_CMD_SMART_THRESHOLD | 1 << ND_CMD_DIMM_FLAGS \
@@ -75,6 +78,7 @@ enum nfit_uuids {
 	NFIT_DEV_DIMM_N_HPE1 = NVDIMM_FAMILY_HPE1,
 	NFIT_DEV_DIMM_N_HPE2 = NVDIMM_FAMILY_HPE2,
 	NFIT_DEV_DIMM_N_MSFT = NVDIMM_FAMILY_MSFT,
+	NFIT_DEV_DIMM_N_HYPERV = NVDIMM_FAMILY_HYPERV,
 	NFIT_SPA_VOLATILE,
 	NFIT_SPA_PM,
 	NFIT_SPA_DCR,
@@ -171,9 +175,8 @@ struct nfit_mem {
 	struct resource *flush_wpq;
 	unsigned long dsm_mask;
 	int family;
-	u32 has_lsi:1;
-	u32 has_lsr:1;
-	u32 has_lsw:1;
+	bool has_lsr;
+	bool has_lsw;
 };
 
 struct acpi_nfit_desc {
@@ -202,6 +205,7 @@ struct acpi_nfit_desc {
 	unsigned long dimm_cmd_force_en;
 	unsigned long bus_cmd_force_en;
 	unsigned long bus_nfit_cmd_force_en;
+	unsigned int platform_cap;
 	int (*blk_do_io)(struct nd_blk_region *ndbr, resource_size_t dpa,
 			void *iobuf, u64 len, int rw);
 };

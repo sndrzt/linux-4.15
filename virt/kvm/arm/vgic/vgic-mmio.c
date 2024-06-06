@@ -112,14 +112,23 @@ unsigned long vgic_mmio_read_pending(struct kvm_vcpu *vcpu,
 	/* Loop over all IRQs affected by this read */
 	for (i = 0; i < len * 8; i++) {
 		struct vgic_irq *irq = vgic_get_irq(vcpu->kvm, vcpu, intid + i);
+		unsigned long flags;
 
+		spin_lock_irqsave(&irq->irq_lock, flags);
 		if (irq_is_pending(irq))
 			value |= (1U << i);
+		spin_unlock_irqrestore(&irq->irq_lock, flags);
 
 		vgic_put_irq(vcpu->kvm, irq);
 	}
 
 	return value;
+}
+
+static bool is_vgic_v2_sgi(struct kvm_vcpu *vcpu, struct vgic_irq *irq)
+{
+	return (vgic_irq_is_sgi(irq->intid) &&
+		vcpu->kvm->arch.vgic.vgic_model == KVM_DEV_TYPE_ARM_VGIC_V2);
 }
 
 void vgic_mmio_write_spending(struct kvm_vcpu *vcpu,
@@ -132,6 +141,12 @@ void vgic_mmio_write_spending(struct kvm_vcpu *vcpu,
 
 	for_each_set_bit(i, &val, len * 8) {
 		struct vgic_irq *irq = vgic_get_irq(vcpu->kvm, vcpu, intid + i);
+
+		/* GICD_ISPENDR0 SGI bits are WI */
+		if (is_vgic_v2_sgi(vcpu, irq)) {
+			vgic_put_irq(vcpu->kvm, irq);
+			continue;
+		}
 
 		spin_lock_irqsave(&irq->irq_lock, flags);
 		irq->pending_latch = true;
@@ -151,6 +166,12 @@ void vgic_mmio_write_cpending(struct kvm_vcpu *vcpu,
 
 	for_each_set_bit(i, &val, len * 8) {
 		struct vgic_irq *irq = vgic_get_irq(vcpu->kvm, vcpu, intid + i);
+
+		/* GICD_ICPENDR0 SGI bits are WI */
+		if (is_vgic_v2_sgi(vcpu, irq)) {
+			vgic_put_irq(vcpu->kvm, irq);
+			continue;
+		}
 
 		spin_lock_irqsave(&irq->irq_lock, flags);
 
@@ -203,22 +224,6 @@ static void vgic_mmio_change_active(struct kvm_vcpu *vcpu, struct vgic_irq *irq,
 	 */
 	requester_vcpu = kvm_arm_get_running_vcpu();
 
-	/*
-	 * If this virtual IRQ was written into a list register, we
-	 * have to make sure the CPU that runs the VCPU thread has
-	 * synced back the LR state to the struct vgic_irq.
-	 *
-	 * As long as the conditions below are true, we know the VCPU thread
-	 * may be on its way back from the guest (we kicked the VCPU thread in
-	 * vgic_change_active_prepare)  and still has to sync back this IRQ,
-	 * so we release and re-acquire the spin_lock to let the other thread
-	 * sync back the IRQ.
-	 */
-	while (irq->vcpu && /* IRQ may have state in an LR somewhere */
-	       irq->vcpu != requester_vcpu && /* Current thread is not the VCPU thread */
-	       irq->vcpu->cpu != -1) /* VCPU thread is running */
-		cond_resched_lock(&irq->irq_lock);
-
 	irq->active = new_active_state;
 	if (new_active_state)
 		vgic_queue_irq_unlock(vcpu->kvm, irq, flags);
@@ -243,14 +248,16 @@ static void vgic_mmio_change_active(struct kvm_vcpu *vcpu, struct vgic_irq *irq,
  */
 static void vgic_change_active_prepare(struct kvm_vcpu *vcpu, u32 intid)
 {
-	if (intid > VGIC_NR_PRIVATE_IRQS)
+	if (vcpu->kvm->arch.vgic.vgic_model == KVM_DEV_TYPE_ARM_VGIC_V3 ||
+	    intid >= VGIC_NR_PRIVATE_IRQS)
 		kvm_arm_halt_guest(vcpu->kvm);
 }
 
 /* See vgic_change_active_prepare */
 static void vgic_change_active_finish(struct kvm_vcpu *vcpu, u32 intid)
 {
-	if (intid > VGIC_NR_PRIVATE_IRQS)
+	if (vcpu->kvm->arch.vgic.vgic_model == KVM_DEV_TYPE_ARM_VGIC_V3 ||
+	    intid >= VGIC_NR_PRIVATE_IRQS)
 		kvm_arm_resume_guest(vcpu->kvm);
 }
 

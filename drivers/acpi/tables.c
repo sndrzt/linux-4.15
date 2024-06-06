@@ -456,7 +456,8 @@ static const char * const table_sigs[] = {
 	ACPI_SIG_SLIC, ACPI_SIG_SPCR, ACPI_SIG_SPMI, ACPI_SIG_TCPA,
 	ACPI_SIG_UEFI, ACPI_SIG_WAET, ACPI_SIG_WDAT, ACPI_SIG_WDDT,
 	ACPI_SIG_WDRT, ACPI_SIG_DSDT, ACPI_SIG_FADT, ACPI_SIG_PSDT,
-	ACPI_SIG_RSDT, ACPI_SIG_XSDT, ACPI_SIG_SSDT, NULL };
+	ACPI_SIG_RSDT, ACPI_SIG_XSDT, ACPI_SIG_SSDT, ACPI_SIG_PPTT,
+	NULL };
 
 #define ACPI_HEADER_SIZE sizeof(struct acpi_table_header)
 
@@ -525,6 +526,11 @@ void __init acpi_table_upgrade(void)
 	}
 	if (table_nr == 0)
 		return;
+
+	if (kernel_is_locked_down("ACPI table override")) {
+		pr_notice("kernel is locked down, ignoring table override\n");
+		return;
+	}
 
 	acpi_tables_addr =
 		memblock_find_in_range(0, ACPI_TABLE_UPGRADE_MAX_PHYS,
@@ -726,7 +732,7 @@ acpi_os_table_override(struct acpi_table_header *existing_table,
 }
 
 /*
- * acpi_table_init()
+ * acpi_locate_initial_tables()
  *
  * find RSDP, find and checksum SDT/XSDT.
  * checksum all tables, print SDT/XSDT
@@ -734,7 +740,7 @@ acpi_os_table_override(struct acpi_table_header *existing_table,
  * result: sdt_entry[] is initialized
  */
 
-int __init acpi_table_init(void)
+int __init acpi_locate_initial_tables(void)
 {
 	acpi_status status;
 
@@ -749,9 +755,45 @@ int __init acpi_table_init(void)
 	status = acpi_initialize_tables(initial_tables, ACPI_MAX_TABLES, 0);
 	if (ACPI_FAILURE(status))
 		return -EINVAL;
-	acpi_table_initrd_scan();
 
+	return 0;
+}
+
+void __init acpi_reserve_initial_tables(void)
+{
+	int i;
+
+	for (i = 0; i < ACPI_MAX_TABLES; i++) {
+		struct acpi_table_desc *table_desc = &initial_tables[i];
+		u64 start = table_desc->address;
+		u64 size = table_desc->length;
+
+		if (!start || !size)
+			break;
+
+		pr_info("Reserving %4s table memory at [mem 0x%llx-0x%llx]\n",
+			table_desc->signature.ascii, start, start + size - 1);
+
+		memblock_reserve(start, size);
+	}
+}
+
+void __init acpi_table_init_complete(void)
+{
+	acpi_table_initrd_scan();
 	check_multiple_madt();
+}
+
+int __init acpi_table_init(void)
+{
+	int ret;
+
+	ret = acpi_locate_initial_tables();
+	if (ret)
+		return ret;
+
+	acpi_table_init_complete();
+
 	return 0;
 }
 

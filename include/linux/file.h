@@ -13,6 +13,7 @@
 struct file;
 
 extern void fput(struct file *);
+extern void fput_many(struct file *, unsigned int);
 
 struct file_operations;
 struct vfsmount;
@@ -20,6 +21,7 @@ struct dentry;
 struct path;
 extern struct file *alloc_file(const struct path *, fmode_t mode,
 	const struct file_operations *fop);
+extern struct file *get_empty_filp(void);
 
 static inline void fput_light(struct file *file, int fput_needed)
 {
@@ -41,6 +43,7 @@ static inline void fdput(struct fd fd)
 }
 
 extern struct file *fget(unsigned int fd);
+extern struct file *fget_many(unsigned int fd, unsigned int refs);
 extern struct file *fget_raw(unsigned int fd);
 extern unsigned long __fdget(unsigned int fd);
 extern unsigned long __fdget_raw(unsigned int fd);

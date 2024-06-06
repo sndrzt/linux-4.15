@@ -986,11 +986,7 @@ i915_gem_shmem_pread(struct drm_i915_gem_object *obj,
 	offset = offset_in_page(args->offset);
 	for (idx = args->offset >> PAGE_SHIFT; remain; idx++) {
 		struct page *page = i915_gem_object_get_page(obj, idx);
-		int length;
-
-		length = remain;
-		if (offset + length > PAGE_SIZE)
-			length = PAGE_SIZE - offset;
+		unsigned int length = min_t(u64, remain, PAGE_SIZE - offset);
 
 		ret = shmem_pread(page, offset, length, user_data,
 				  page_to_phys(page) & obj_do_bit17_swizzling,
@@ -1099,7 +1095,7 @@ i915_gem_gtt_pread(struct drm_i915_gem_object *obj,
 			page_base += offset & PAGE_MASK;
 		}
 
-		if (gtt_user_read(&ggtt->mappable, page_base, page_offset,
+		if (gtt_user_read(&ggtt->iomap, page_base, page_offset,
 				  user_data, page_length)) {
 			ret = -EFAULT;
 			break;
@@ -1307,7 +1303,7 @@ i915_gem_gtt_pwrite_fast(struct drm_i915_gem_object *obj,
 		 * If the object is non-shmem backed, we retry again with the
 		 * path that handles page fault.
 		 */
-		if (ggtt_write(&ggtt->mappable, page_base, page_offset,
+		if (ggtt_write(&ggtt->iomap, page_base, page_offset,
 			       user_data, page_length)) {
 			ret = -EFAULT;
 			break;
@@ -1436,11 +1432,7 @@ i915_gem_shmem_pwrite(struct drm_i915_gem_object *obj,
 	offset = offset_in_page(args->offset);
 	for (idx = args->offset >> PAGE_SHIFT; remain; idx++) {
 		struct page *page = i915_gem_object_get_page(obj, idx);
-		int length;
-
-		length = remain;
-		if (offset + length > PAGE_SIZE)
-			length = PAGE_SIZE - offset;
+		unsigned int length = min_t(u64, remain, PAGE_SIZE - offset);
 
 		ret = shmem_pwrite(page, offset, length, user_data,
 				   page_to_phys(page) & obj_do_bit17_swizzling,
@@ -1675,6 +1667,17 @@ i915_gem_sw_finish_ioctl(struct drm_device *dev, void *data,
 	return 0;
 }
 
+static inline bool
+__vma_matches(struct vm_area_struct *vma, struct file *filp,
+	      unsigned long addr, unsigned long size)
+{
+	if (vma->vm_file != filp)
+		return false;
+
+	return vma->vm_start == addr &&
+	       (vma->vm_end - vma->vm_start) == PAGE_ALIGN(size);
+}
+
 /**
  * i915_gem_mmap_ioctl - Maps the contents of an object, returning the address
  *			 it is mapped to.
@@ -1717,39 +1720,50 @@ i915_gem_mmap_ioctl(struct drm_device *dev, void *data,
 	 * pages from.
 	 */
 	if (!obj->base.filp) {
-		i915_gem_object_put(obj);
-		return -EINVAL;
+		addr = -ENXIO;
+		goto err;
+	}
+
+	if (range_overflows(args->offset, args->size, (u64)obj->base.size)) {
+		addr = -EINVAL;
+		goto err;
 	}
 
 	addr = vm_mmap(obj->base.filp, 0, args->size,
 		       PROT_READ | PROT_WRITE, MAP_SHARED,
 		       args->offset);
+	if (IS_ERR_VALUE(addr))
+		goto err;
+
 	if (args->flags & I915_MMAP_WC) {
 		struct mm_struct *mm = current->mm;
 		struct vm_area_struct *vma;
 
 		if (down_write_killable(&mm->mmap_sem)) {
-			i915_gem_object_put(obj);
-			return -EINTR;
+			addr = -EINTR;
+			goto err;
 		}
 		vma = find_vma(mm, addr);
-		if (vma)
+		if (vma && __vma_matches(vma, obj->base.filp, addr, args->size))
 			vma->vm_page_prot =
 				pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
 		else
 			addr = -ENOMEM;
 		up_write(&mm->mmap_sem);
+		if (IS_ERR_VALUE(addr))
+			goto err;
 
 		/* This may race, but that's ok, it only gets set */
 		WRITE_ONCE(obj->frontbuffer_ggtt_origin, ORIGIN_CPU);
 	}
 	i915_gem_object_put(obj);
-	if (IS_ERR((void *)addr))
-		return addr;
 
 	args->addr_ptr = (uint64_t) addr;
-
 	return 0;
+
+err:
+	i915_gem_object_put(obj);
+	return addr;
 }
 
 static unsigned int tile_row_pages(struct drm_i915_gem_object *obj)
@@ -1865,6 +1879,10 @@ int i915_gem_fault(struct vm_fault *vmf)
 	unsigned int flags;
 	int ret;
 
+	/* Sanity check that we allow writing into this object */
+	if (i915_gem_object_is_readonly(obj) && write)
+		return VM_FAULT_SIGBUS;
+
 	/* We don't use vmf->pgoff since that has the fake offset */
 	page_offset = (vmf->address - area->vm_start) >> PAGE_SHIFT;
 
@@ -1936,9 +1954,9 @@ int i915_gem_fault(struct vm_fault *vmf)
 	/* Finally, remap it using the new GTT offset */
 	ret = remap_io_mapping(area,
 			       area->vm_start + (vma->ggtt_view.partial.offset << PAGE_SHIFT),
-			       (ggtt->mappable_base + vma->node.start) >> PAGE_SHIFT,
+			       (ggtt->gmadr.start + vma->node.start) >> PAGE_SHIFT,
 			       min_t(u64, vma->size, area->vm_end - area->vm_start),
-			       &ggtt->mappable);
+			       &ggtt->iomap);
 	if (ret)
 		goto err_fence;
 
@@ -2266,6 +2284,76 @@ static void __i915_gem_object_reset_page_iter(struct drm_i915_gem_object *obj)
 	rcu_read_unlock();
 }
 
+struct reg_and_bit {
+	i915_reg_t reg;
+	u32 bit;
+};
+
+static struct reg_and_bit
+get_reg_and_bit(const struct intel_engine_cs *engine,
+		const i915_reg_t *regs, const unsigned int num)
+{
+	const unsigned int class = engine->class;
+	struct reg_and_bit rb = { .bit = 1 };
+
+	if (WARN_ON_ONCE(class >= num || !regs[class].reg))
+		return rb;
+
+	rb.reg = regs[class];
+	if (class == VIDEO_DECODE_CLASS)
+		rb.reg.reg += 4 * engine->instance; /* GEN8_M2TCR */
+
+	return rb;
+}
+
+static void invalidate_tlbs(struct drm_i915_private *dev_priv)
+{
+	static const i915_reg_t gen8_regs[] = {
+		[RENDER_CLASS]                  = GEN8_RTCR,
+		[VIDEO_DECODE_CLASS]            = GEN8_M1TCR, /* , GEN8_M2TCR */
+		[VIDEO_ENHANCEMENT_CLASS]       = GEN8_VTCR,
+		[COPY_ENGINE_CLASS]             = GEN8_BTCR,
+	};
+	const unsigned int num = ARRAY_SIZE(gen8_regs);
+	const i915_reg_t *regs = gen8_regs;
+	struct intel_engine_cs *engine;
+	enum intel_engine_id id;
+
+	if (INTEL_GEN(dev_priv) < 8)
+		return;
+
+	assert_rpm_wakelock_held(dev_priv);
+
+	mutex_lock(&dev_priv->tlb_invalidate_lock);
+	intel_uncore_forcewake_get(dev_priv, FORCEWAKE_ALL);
+
+	for_each_engine(engine, dev_priv, id) {
+		/*
+		 * HW architecture suggest typical invalidation time at 40us,
+		 * with pessimistic cases up to 100us and a recommendation to
+		 * cap at 1ms. We go a bit higher just in case.
+		 */
+		const unsigned int timeout_us = 100;
+		const unsigned int timeout_ms = 4;
+		struct reg_and_bit rb;
+
+		rb = get_reg_and_bit(engine, regs, num);
+		if (!i915_mmio_reg_offset(rb.reg))
+			continue;
+
+		I915_WRITE_FW(rb.reg, rb.bit);
+		if (__intel_wait_for_register_fw(dev_priv,
+						 rb.reg, rb.bit, 0,
+						 timeout_us, timeout_ms,
+						 NULL))
+			DRM_ERROR_RATELIMITED("%s TLB invalidation did not complete in %ums!\n",
+					      engine->name, timeout_ms);
+	}
+
+	intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);
+	mutex_unlock(&dev_priv->tlb_invalidate_lock);
+}
+
 void __i915_gem_object_put_pages(struct drm_i915_gem_object *obj,
 				 enum i915_mm_subclass subclass)
 {
@@ -2308,8 +2396,18 @@ void __i915_gem_object_put_pages(struct drm_i915_gem_object *obj,
 
 	__i915_gem_object_reset_page_iter(obj);
 
-	if (!IS_ERR(pages))
+	if (!IS_ERR(pages)) {
+		if (test_and_clear_bit(I915_BO_WAS_BOUND_BIT, &obj->flags)) {
+			struct drm_i915_private *i915 = to_i915(obj->base.dev);
+
+			if (intel_runtime_pm_get_if_in_use(i915)) {
+				invalidate_tlbs(i915);
+				intel_runtime_pm_put(i915);
+			}
+		}
+
 		obj->ops->put_pages(obj, pages);
+	}
 
 	obj->mm.page_sizes.phys = obj->mm.page_sizes.sg = 0;
 
@@ -3695,7 +3793,8 @@ restart:
 			return -EBUSY;
 		}
 
-		if (i915_gem_valid_gtt_space(vma, cache_level))
+		if (!i915_vma_is_closed(vma) &&
+		    i915_gem_valid_gtt_space(vma, cache_level))
 			continue;
 
 		ret = i915_vma_unbind(vma);
@@ -4079,6 +4178,20 @@ i915_gem_object_ggtt_pin(struct drm_i915_gem_object *obj,
 {
 	struct drm_i915_private *dev_priv = to_i915(obj->base.dev);
 	struct i915_address_space *vm = &dev_priv->ggtt.base;
+
+	return i915_gem_object_pin(obj, vm, view, size, alignment,
+				   flags | PIN_GLOBAL);
+}
+
+struct i915_vma *
+i915_gem_object_pin(struct drm_i915_gem_object *obj,
+		    struct i915_address_space *vm,
+		    const struct i915_ggtt_view *view,
+		    u64 size,
+		    u64 alignment,
+		    u64 flags)
+{
+	struct drm_i915_private *dev_priv = to_i915(obj->base.dev);
 	struct i915_vma *vma;
 	int ret;
 
@@ -4141,7 +4254,7 @@ i915_gem_object_ggtt_pin(struct drm_i915_gem_object *obj,
 			return ERR_PTR(ret);
 	}
 
-	ret = i915_vma_pin(vma, size, alignment, flags | PIN_GLOBAL);
+	ret = i915_vma_pin(vma, size, alignment, flags);
 	if (ret)
 		return ERR_PTR(ret);
 
@@ -4655,14 +4768,16 @@ void __i915_gem_object_release_unless_active(struct drm_i915_gem_object *obj)
 		i915_gem_object_put(obj);
 }
 
-static void assert_kernel_context_is_current(struct drm_i915_private *dev_priv)
+static void assert_kernel_context_is_current(struct drm_i915_private *i915)
 {
+	struct i915_gem_context *kernel_context = i915->kernel_context;
 	struct intel_engine_cs *engine;
 	enum intel_engine_id id;
 
-	for_each_engine(engine, dev_priv, id)
-		GEM_BUG_ON(engine->last_retired_context &&
-			   !i915_gem_context_is_kernel(engine->last_retired_context));
+	for_each_engine(engine, i915, id) {
+		GEM_BUG_ON(__i915_gem_active_peek(&engine->timeline->last_request));
+		GEM_BUG_ON(engine->last_retired_context != kernel_context);
+	}
 }
 
 void i915_gem_sanitize(struct drm_i915_private *i915)
@@ -4937,6 +5052,120 @@ bool intel_sanitize_semaphores(struct drm_i915_private *dev_priv, int value)
 	return true;
 }
 
+static int __intel_engines_record_defaults(struct drm_i915_private *i915)
+{
+	struct i915_gem_context *ctx;
+	struct intel_engine_cs *engine;
+	enum intel_engine_id id;
+	int err;
+
+	/*
+	 * As we reset the gpu during very early sanitisation, the current
+	 * register state on the GPU should reflect its defaults values.
+	 * We load a context onto the hw (with restore-inhibit), then switch
+	 * over to a second context to save that default register state. We
+	 * can then prime every new context with that state so they all start
+	 * from the same default HW values.
+	 */
+
+	ctx = i915_gem_context_create_kernel(i915, 0);
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
+
+	for_each_engine(engine, i915, id) {
+		struct drm_i915_gem_request *rq;
+
+		rq = i915_gem_request_alloc(engine, ctx);
+		if (IS_ERR(rq)) {
+			err = PTR_ERR(rq);
+			goto out_ctx;
+		}
+
+		err = i915_switch_context(rq);
+		if (engine->init_context)
+			err = engine->init_context(rq);
+
+		__i915_add_request(rq, true);
+		if (err)
+			goto err_active;
+	}
+
+	err = i915_gem_switch_to_kernel_context(i915);
+	if (err)
+		goto err_active;
+
+	err = i915_gem_wait_for_idle(i915, I915_WAIT_LOCKED);
+	if (err)
+		goto err_active;
+
+	assert_kernel_context_is_current(i915);
+
+	for_each_engine(engine, i915, id) {
+		struct i915_vma *state;
+
+		state = ctx->engine[id].state;
+		if (!state)
+			continue;
+
+		/*
+		 * As we will hold a reference to the logical state, it will
+		 * not be torn down with the context, and importantly the
+		 * object will hold onto its vma (making it possible for a
+		 * stray GTT write to corrupt our defaults). Unmap the vma
+		 * from the GTT to prevent such accidents and reclaim the
+		 * space.
+		 */
+		err = i915_vma_unbind(state);
+		if (err)
+			goto err_active;
+
+		err = i915_gem_object_set_to_cpu_domain(state->obj, false);
+		if (err)
+			goto err_active;
+
+		engine->default_state = i915_gem_object_get(state->obj);
+	}
+
+	if (IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM)) {
+		unsigned int found = intel_engines_has_context_isolation(i915);
+
+		/*
+		 * Make sure that classes with multiple engine instances all
+		 * share the same basic configuration.
+		 */
+		for_each_engine(engine, i915, id) {
+			unsigned int bit = BIT(engine->uabi_class);
+			unsigned int expected = engine->default_state ? bit : 0;
+
+			if ((found & bit) != expected) {
+				DRM_ERROR("mismatching default context state for class %d on engine %s\n",
+					  engine->uabi_class, engine->name);
+			}
+		}
+	}
+
+out_ctx:
+	i915_gem_context_set_closed(ctx);
+	i915_gem_context_put(ctx);
+	return err;
+
+err_active:
+	/*
+	 * If we have to abandon now, we expect the engines to be idle
+	 * and ready to be torn-down. First try to flush any remaining
+	 * request, ensure we are pointing at the kernel context and
+	 * then remove it.
+	 */
+	if (WARN_ON(i915_gem_switch_to_kernel_context(i915)))
+		goto out_ctx;
+
+	if (WARN_ON(i915_gem_wait_for_idle(i915, I915_WAIT_LOCKED)))
+		goto out_ctx;
+
+	i915_gem_contexts_lost(i915);
+	goto out_ctx;
+}
+
 int i915_gem_init(struct drm_i915_private *dev_priv)
 {
 	int ret;
@@ -4985,8 +5214,28 @@ int i915_gem_init(struct drm_i915_private *dev_priv)
 	if (ret)
 		goto out_unlock;
 
+	intel_init_gt_powersave(dev_priv);
+
 	ret = i915_gem_init_hw(dev_priv);
+	if (ret)
+		goto out_unlock;
+
+	/*
+	 * Despite its name intel_init_clock_gating applies both display
+	 * clock gating workarounds; GT mmio workarounds and the occasional
+	 * GT power context workaround. Worse, sometimes it includes a context
+	 * register workaround which we need to apply before we record the
+	 * default HW state for all contexts.
+	 *
+	 * FIXME: break up the workarounds and apply them at the right time!
+	 */
+	intel_init_clock_gating(dev_priv);
+
+	ret = __intel_engines_record_defaults(dev_priv);
+out_unlock:
 	if (ret == -EIO) {
+		mutex_lock(&dev_priv->drm.struct_mutex);
+
 		/* Allow engine initialisation to fail by marking the GPU as
 		 * wedged. But we only want to do this where the GPU is angry,
 		 * for all other failure, such as an allocation failure, bail.
@@ -4995,10 +5244,15 @@ int i915_gem_init(struct drm_i915_private *dev_priv)
 			DRM_ERROR("Failed to initialize GPU, declaring it wedged\n");
 			i915_gem_set_wedged(dev_priv);
 		}
-		ret = 0;
-	}
 
-out_unlock:
+		/* Minimal basic recovery for KMS */
+		ret = i915_ggtt_enable_hw(dev_priv);
+		i915_gem_restore_gtt_mappings(dev_priv);
+		i915_gem_restore_fences(dev_priv);
+		intel_init_clock_gating(dev_priv);
+
+		mutex_unlock(&dev_priv->drm.struct_mutex);
+	}
 	intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);
 	mutex_unlock(&dev_priv->drm.struct_mutex);
 
@@ -5113,6 +5367,8 @@ i915_gem_load_init(struct drm_i915_private *dev_priv)
 	atomic_set(&dev_priv->mm.bsd_engine_dispatch_index, 0);
 
 	spin_lock_init(&dev_priv->fb_tracking.lock);
+
+	mutex_init(&dev_priv->tlb_invalidate_lock);
 
 	err = i915_gemfs_init(dev_priv);
 	if (err)

@@ -15,6 +15,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/mm.h>
+#include <linux/highmem.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/sched/task.h>
@@ -121,7 +122,7 @@ static inline const char *check_kernel_text_object(const void *ptr,
 static inline const char *check_bogus_address(const void *ptr, unsigned long n)
 {
 	/* Reject if object wraps past end of memory. */
-	if ((unsigned long)ptr + n < (unsigned long)ptr)
+	if ((unsigned long)ptr + (n - 1) < (unsigned long)ptr)
 		return "<wrapped address>";
 
 	/* Reject if NULL or ZERO-allocation. */
@@ -203,7 +204,12 @@ static inline const char *check_heap_object(const void *ptr, unsigned long n,
 	if (!virt_addr_valid(ptr))
 		return NULL;
 
-	page = virt_to_head_page(ptr);
+	/*
+	 * When CONFIG_HIGHMEM=y, kmap_to_page() will give either the
+	 * highmem page or fallback to virt_to_page(). The following
+	 * is effectively a highmem-aware virt_to_head_page().
+	 */
+	page = compound_head(kmap_to_page((void *)ptr));
 
 	/* Check slab allocator for flags and size. */
 	if (PageSlab(page))
@@ -216,7 +222,8 @@ static inline const char *check_heap_object(const void *ptr, unsigned long n,
 /*
  * Validates that the given object is:
  * - not bogus address
- * - known-safe heap or stack object
+ * - fully contained by stack (or stack frame, when available)
+ * - fully within SLAB object (or object whitelist area, when available)
  * - not in kernel text
  */
 void __check_object_size(const void *ptr, unsigned long n, bool to_user)
@@ -229,11 +236,6 @@ void __check_object_size(const void *ptr, unsigned long n, bool to_user)
 
 	/* Check for invalid addresses. */
 	err = check_bogus_address(ptr, n);
-	if (err)
-		goto report;
-
-	/* Check for bad heap object. */
-	err = check_heap_object(ptr, n, to_user);
 	if (err)
 		goto report;
 
@@ -254,6 +256,9 @@ void __check_object_size(const void *ptr, unsigned long n, bool to_user)
 		err = "<process stack>";
 		goto report;
 	}
+
+	/* Check for bad heap object. */
+	check_heap_object(ptr, n, to_user);
 
 	/* Check for object in kernel to avoid text exposure. */
 	err = check_kernel_text_object(ptr, n);

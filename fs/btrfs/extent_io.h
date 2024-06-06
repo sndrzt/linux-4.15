@@ -114,11 +114,6 @@ struct extent_io_ops {
 	/*
 	 * Optional hooks, called if the pointer is not NULL
 	 */
-	int (*fill_delalloc)(void *private_data, struct page *locked_page,
-			     u64 start, u64 end, int *page_started,
-			     unsigned long *nr_written,
-			     struct writeback_control *wbc);
-
 	int (*writepage_start_hook)(struct page *page, u64 start, u64 end);
 	void (*writepage_end_io_hook)(struct page *page, u64 start, u64 end,
 				      struct extent_state *state, int uptodate);
@@ -210,7 +205,7 @@ struct extent_buffer {
  */
 struct extent_changeset {
 	/* How many bytes are set/cleared in this operation */
-	unsigned int bytes_changed;
+	u64 bytes_changed;
 
 	/* Changed ranges */
 	struct ulist range_changed;
@@ -354,11 +349,11 @@ static inline int set_extent_dirty(struct extent_io_tree *tree, u64 start,
 }
 
 static inline int clear_extent_dirty(struct extent_io_tree *tree, u64 start,
-		u64 end)
+				     u64 end, struct extent_state **cached)
 {
 	return clear_extent_bit(tree, start, end,
 				EXTENT_DIRTY | EXTENT_DELALLOC |
-				EXTENT_DO_ACCOUNTING, 0, 0, NULL, GFP_NOFS);
+				EXTENT_DO_ACCOUNTING, 0, 0, cached, GFP_NOFS);
 }
 
 int convert_extent_bit(struct extent_io_tree *tree, u64 start, u64 end,
@@ -456,9 +451,9 @@ int memcmp_extent_buffer(const struct extent_buffer *eb, const void *ptrv,
 void read_extent_buffer(const struct extent_buffer *eb, void *dst,
 			unsigned long start,
 			unsigned long len);
-int read_extent_buffer_to_user(const struct extent_buffer *eb,
-			       void __user *dst, unsigned long start,
-			       unsigned long len);
+int read_extent_buffer_to_user_nofault(const struct extent_buffer *eb,
+				       void __user *dst, unsigned long start,
+				       unsigned long len);
 void write_extent_buffer_fsid(struct extent_buffer *eb, const void *src);
 void write_extent_buffer_chunk_tree_uuid(struct extent_buffer *eb,
 		const void *src);

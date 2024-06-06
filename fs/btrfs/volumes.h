@@ -24,6 +24,8 @@
 #include <linux/btrfs.h>
 #include "async-thread.h"
 
+#define BTRFS_MAX_DATA_CHUNK_SIZE	(10ULL * SZ_1G)
+
 extern struct mutex uuid_mutex;
 
 #define BTRFS_STRIPE_LEN	SZ_64K
@@ -59,6 +61,11 @@ struct btrfs_device {
 
 	spinlock_t io_lock ____cacheline_aligned;
 	int running_pending;
+	/* When true means this device has pending chunk alloc in
+	 * current transaction. Protected by chunk_mutex.
+	 */
+	bool has_pending_chunks;
+
 	/* regular prio bios */
 	struct btrfs_pending_bios pending_bios;
 	/* sync bios */
@@ -263,6 +270,15 @@ struct btrfs_fs_devices {
 
 #define BTRFS_BIO_INLINE_CSUM_SIZE	64
 
+#define BTRFS_MAX_DEVS(info) ((BTRFS_MAX_ITEM_SIZE(info)	\
+			- sizeof(struct btrfs_chunk))		\
+			/ sizeof(struct btrfs_stripe) + 1)
+
+#define BTRFS_MAX_DEVS_SYS_CHUNK ((BTRFS_SYSTEM_CHUNK_ARRAY_SIZE	\
+				- 2 * sizeof(struct btrfs_disk_key)	\
+				- 2 * sizeof(struct btrfs_chunk))	\
+				/ sizeof(struct btrfs_stripe) + 1)
+
 /*
  * we need the mirror number and stripe index to be passed around
  * the call chain while we are processing end_io (especially errors).
@@ -310,7 +326,6 @@ struct btrfs_bio {
 	u64 map_type; /* get from map_lookup->type */
 	bio_end_io_t *end_io;
 	struct bio *orig_bio;
-	unsigned long flags;
 	void *private;
 	atomic_t error;
 	int max_errors;
@@ -440,8 +455,8 @@ void btrfs_cleanup_fs_uuids(void);
 int btrfs_num_copies(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 int btrfs_grow_device(struct btrfs_trans_handle *trans,
 		      struct btrfs_device *device, u64 new_size);
-struct btrfs_device *btrfs_find_device(struct btrfs_fs_info *fs_info, u64 devid,
-				       u8 *uuid, u8 *fsid);
+struct btrfs_device *btrfs_find_device(struct btrfs_fs_devices *fs_devices,
+				       u64 devid, u8 *uuid, u8 *fsid, bool seed);
 int btrfs_shrink_device(struct btrfs_device *device, u64 new_size);
 int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *path);
 int btrfs_init_dev_replace_tgtdev(struct btrfs_fs_info *fs_info,
@@ -498,6 +513,12 @@ static inline void btrfs_dev_stat_inc(struct btrfs_device *dev,
 				      int index)
 {
 	atomic_inc(dev->dev_stat_values + index);
+	/*
+	 * This memory barrier orders stores updating statistics before stores
+	 * updating dev_stats_ccnt.
+	 *
+	 * It pairs with smp_rmb() in btrfs_run_dev_stats().
+	 */
 	smp_mb__before_atomic();
 	atomic_inc(&dev->dev_stats_ccnt);
 }
@@ -523,6 +544,12 @@ static inline void btrfs_dev_stat_set(struct btrfs_device *dev,
 				      int index, unsigned long val)
 {
 	atomic_set(dev->dev_stat_values + index, val);
+	/*
+	 * This memory barrier orders stores updating statistics before stores
+	 * updating dev_stats_ccnt.
+	 *
+	 * It pairs with smp_rmb() in btrfs_run_dev_stats().
+	 */
 	smp_mb__before_atomic();
 	atomic_inc(&dev->dev_stats_ccnt);
 }

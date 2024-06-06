@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 # Makefile for vm selftests
 
-ifndef OUTPUT
-  OUTPUT := $(shell pwd)
-endif
-
 CFLAGS = -Wall -I ../../../../usr/include $(EXTRA_CFLAGS)
 LDLIBS = -lrt
 TEST_GEN_FILES = compaction_test
@@ -22,12 +18,11 @@ TEST_GEN_FILES += gup_benchmark
 
 TEST_PROGS := run_vmtests
 
+TEST_FILES := test_vmalloc.sh
+
+KSFT_KHDR_INSTALL := 1
 include ../lib.mk
 
-$(OUTPUT)/userfaultfd: ../../../../usr/include/linux/kernel.h
 $(OUTPUT)/userfaultfd: LDLIBS += -lpthread
 
 $(OUTPUT)/mlock-random-test: LDLIBS += -lcap
-
-../../../../usr/include/linux/kernel.h:
-	make -C ../../../.. headers_install

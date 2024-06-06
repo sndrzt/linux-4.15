@@ -88,8 +88,9 @@ static int qla_nvme_alloc_queue(struct nvme_fc_local_port *lport,
 	struct qla_hw_data *ha;
 	struct qla_qpair *qpair;
 
-	if (!qidx)
-		qidx++;
+	/* Map admin queue and 1st IO queue to index 0 */
+	if (qidx)
+		qidx--;
 
 	vha = (struct scsi_qla_host *)lport->private;
 	ha = vha->hw;
@@ -507,6 +508,11 @@ static int qla_nvme_post_cmd(struct nvme_fc_local_port *lport,
 	}
 
 	priv = fd->private;
+	if (!priv) {
+		/* nvme association has been torn down */
+		return rval;
+	}
+
 	fcport = rport->private;
 	if (!fcport) {
 		ql_log(ql_log_warn, NULL, 0x210e, "No fcport ptr\n");

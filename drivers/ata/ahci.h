@@ -251,6 +251,9 @@ enum {
 	AHCI_HFLAG_YES_ALPM		= (1 << 23), /* force ALPM cap on */
 	AHCI_HFLAG_NO_WRITE_TO_RO	= (1 << 24), /* don't write to read
 							only registers */
+	AHCI_HFLAG_IS_MOBILE		= (1 << 25), /* mobile chipset, use
+							SATA_MOBILE_LPM_POLICY
+							as default lpm_policy */
 
 	/* ap->flags bits */
 
@@ -258,9 +261,11 @@ enum {
 					  ATA_FLAG_ACPI_SATA | ATA_FLAG_AN,
 
 	ICH_MAP				= 0x90, /* ICH MAP register */
+	PCS_6				= 0x92, /* 6 port PCS */
+	PCS_7				= 0x94, /* 7+ port PCS (Denverton) */
 
 	/* em constants */
-	EM_MAX_SLOTS			= 8,
+	EM_MAX_SLOTS			= SATA_PMP_MAX_PORTS,
 	EM_MAX_RETRY			= 5,
 
 	/* em_ctl bits */
@@ -362,6 +367,13 @@ struct ahci_host_priv {
 	 * be overridden anytime before the host is activated.
 	 */
 	void			(*start_engine)(struct ata_port *ap);
+	/*
+	 * Optional ahci_stop_engine override, if not set this gets set to the
+	 * default ahci_stop_engine during ahci_save_initial_config, this can
+	 * be overridden anytime before the host is activated.
+	 */
+	int			(*stop_engine)(struct ata_port *ap);
+
 	irqreturn_t 		(*irq_handler)(int irq, void *dev_instance);
 
 	/* only required for per-port MSI(-X) support */

@@ -39,6 +39,8 @@
 #include <linux/mlx5/device.h>
 #include "lib/mpfs.h"
 
+#define MLX5_ESWITCH_MANAGER(mdev) MLX5_CAP_GEN(mdev, eswitch_manager)
+
 enum {
 	SRIOV_NONE,
 	SRIOV_LEGACY,
@@ -244,6 +246,13 @@ enum {
 
 #define MLX5_FLOW_CONTEXT_ACTION_VLAN_POP  0x4000
 #define MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH 0x8000
+
+enum mlx5_flow_match_level {
+	MLX5_MATCH_NONE	= MLX5_INLINE_MODE_NONE,
+	MLX5_MATCH_L2	= MLX5_INLINE_MODE_L2,
+	MLX5_MATCH_L3	= MLX5_INLINE_MODE_IP,
+	MLX5_MATCH_L4	= MLX5_INLINE_MODE_TCP_UDP,
+};
 
 struct mlx5_esw_flow_attr {
 	struct mlx5_eswitch_rep *in_rep;

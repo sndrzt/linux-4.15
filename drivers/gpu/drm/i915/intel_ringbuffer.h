@@ -290,10 +290,13 @@ struct intel_engine_execlists {
 struct intel_engine_cs {
 	struct drm_i915_private *i915;
 	char name[INTEL_ENGINE_CS_MAX_NAME];
+
 	enum intel_engine_id id;
-	unsigned int uabi_id;
 	unsigned int hw_id;
 	unsigned int guc_id;
+
+	u8 uabi_id;
+	u8 uabi_class;
 
 	u8 class;
 	u8 instance;
@@ -304,6 +307,7 @@ struct intel_engine_cs {
 	struct intel_ring *buffer;
 	struct intel_timeline *timeline;
 
+	struct drm_i915_gem_object *default_state;
 	struct intel_render_state *render_state;
 
 	atomic_t irq_count;
@@ -507,7 +511,9 @@ struct intel_engine_cs {
 
 	struct intel_engine_hangcheck hangcheck;
 
-	bool needs_cmd_parser;
+#define I915_ENGINE_USING_CMD_PARSER	BIT(0)
+#define I915_ENGINE_REQUIRES_CMD_PARSER	BIT(3)
+	unsigned int flags;
 
 	/*
 	 * Table of commands the command parser needs to know about
@@ -533,6 +539,18 @@ struct intel_engine_cs {
 	 */
 	u32 (*get_cmd_length_mask)(u32 cmd_header);
 };
+
+static inline bool
+intel_engine_using_cmd_parser(const struct intel_engine_cs *engine)
+{
+	return engine->flags & I915_ENGINE_USING_CMD_PARSER;
+}
+
+static inline bool
+intel_engine_requires_cmd_parser(const struct intel_engine_cs *engine)
+{
+	return engine->flags & I915_ENGINE_REQUIRES_CMD_PARSER;
+}
 
 static inline void
 execlists_set_active(struct intel_engine_execlists *execlists,
@@ -867,8 +885,11 @@ static inline u32 *gen8_emit_pipe_control(u32 *batch, u32 flags, u32 offset)
 bool intel_engine_is_idle(struct intel_engine_cs *engine);
 bool intel_engines_are_idle(struct drm_i915_private *dev_priv);
 
+bool intel_engine_has_kernel_context(const struct intel_engine_cs *engine);
+
 void intel_engines_mark_idle(struct drm_i915_private *i915);
 void intel_engines_reset_default_submission(struct drm_i915_private *i915);
+unsigned int intel_engines_has_context_isolation(struct drm_i915_private *i915);
 
 bool intel_engine_can_store_dword(struct intel_engine_cs *engine);
 

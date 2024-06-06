@@ -392,8 +392,10 @@ static int stm32_dma_terminate_all(struct dma_chan *c)
 
 	spin_lock_irqsave(&chan->vchan.lock, flags);
 
-	if (chan->busy) {
-		stm32_dma_stop(chan);
+	if (chan->desc) {
+		vchan_terminate_vdesc(&chan->desc->vdesc);
+		if (chan->busy)
+			stm32_dma_stop(chan);
 		chan->desc = NULL;
 	}
 
@@ -429,6 +431,8 @@ static void stm32_dma_dump_reg(struct stm32_dma_chan *chan)
 	dev_dbg(chan2dev(chan), "SFCR:  0x%08x\n", sfcr);
 }
 
+static void stm32_dma_configure_next_sg(struct stm32_dma_chan *chan);
+
 static void stm32_dma_start_transfer(struct stm32_dma_chan *chan)
 {
 	struct stm32_dma_device *dmadev = stm32_dma_get_dev(chan);
@@ -446,6 +450,8 @@ static void stm32_dma_start_transfer(struct stm32_dma_chan *chan)
 		vdesc = vchan_next_desc(&chan->vchan);
 		if (!vdesc)
 			return;
+
+		list_del(&vdesc->node);
 
 		chan->desc = to_stm32_dma_desc(vdesc);
 		chan->next_sg = 0;
@@ -470,6 +476,9 @@ static void stm32_dma_start_transfer(struct stm32_dma_chan *chan)
 	status = stm32_dma_irq_status(chan);
 	if (status)
 		stm32_dma_irq_clear(chan, status);
+
+	if (chan->desc->cyclic)
+		stm32_dma_configure_next_sg(chan);
 
 	stm32_dma_dump_reg(chan);
 
@@ -521,7 +530,6 @@ static void stm32_dma_handle_chan_done(struct stm32_dma_chan *chan)
 		} else {
 			chan->busy = false;
 			if (chan->next_sg == chan->desc->num_sgs) {
-				list_del(&chan->desc->vdesc.node);
 				vchan_cookie_complete(&chan->desc->vdesc);
 				chan->desc = NULL;
 			}
@@ -564,8 +572,7 @@ static void stm32_dma_issue_pending(struct dma_chan *c)
 	if (vchan_issue_pending(&chan->vchan) && !chan->desc && !chan->busy) {
 		dev_dbg(chan2dev(chan), "vchan %p: issued\n", &chan->vchan);
 		stm32_dma_start_transfer(chan);
-		if (chan->desc->cyclic)
-			stm32_dma_configure_next_sg(chan);
+
 	}
 	spin_unlock_irqrestore(&chan->vchan.lock, flags);
 }

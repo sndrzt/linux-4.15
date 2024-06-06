@@ -10,6 +10,7 @@
 #include <linux/workqueue.h>
 #include <linux/list.h>
 #include <linux/sysctl.h>
+#include <linux/uidgid.h>
 
 #include <net/flow.h>
 #include <net/netns/core.h>
@@ -56,6 +57,7 @@ struct net {
 						 */
 	spinlock_t		rules_mod_lock;
 
+	u32			hash_mix;
 	atomic64_t		cookie_gen;
 
 	struct list_head	list;		/* list of network namespaces */
@@ -120,6 +122,7 @@ struct net {
 #endif
 #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
 	struct netns_nf_frag	nf_frag;
+	struct ctl_table_header *nf_frag_frags_hdr;
 #endif
 	struct sock		*nfnl;
 	struct sock		*nfnl_stash;
@@ -161,7 +164,11 @@ extern struct net init_net;
 struct net *copy_net_ns(unsigned long flags, struct user_namespace *user_ns,
 			struct net *old_net);
 
+void net_ns_get_ownership(const struct net *net, kuid_t *uid, kgid_t *gid);
+
 void net_ns_barrier(void);
+
+struct ns_common *get_net_ns(struct ns_common *ns);
 #else /* CONFIG_NET_NS */
 #include <linux/sched.h>
 #include <linux/nsproxy.h>
@@ -173,7 +180,19 @@ static inline struct net *copy_net_ns(unsigned long flags,
 	return old_net;
 }
 
+static inline void net_ns_get_ownership(const struct net *net,
+					kuid_t *uid, kgid_t *gid)
+{
+	*uid = GLOBAL_ROOT_UID;
+	*gid = GLOBAL_ROOT_GID;
+}
+
 static inline void net_ns_barrier(void) {}
+
+static inline struct ns_common *get_net_ns(struct ns_common *ns)
+{
+	return ERR_PTR(-EINVAL);
+}
 #endif /* CONFIG_NET_NS */
 
 
@@ -301,7 +320,7 @@ static inline struct net *read_pnet(const possible_net_t *pnet)
 #define __net_initconst	__initconst
 #endif
 
-int peernet2id_alloc(struct net *net, struct net *peer);
+int peernet2id_alloc(struct net *net, struct net *peer, gfp_t gfp);
 int peernet2id(struct net *net, struct net *peer);
 bool peernet_has_id(struct net *net, struct net *peer);
 struct net *get_net_ns_by_id(struct net *net, int id);

@@ -95,7 +95,7 @@ static int compute_effective_progs(struct cgroup *cgrp,
 				   enum bpf_attach_type type,
 				   struct bpf_prog_array __rcu **array)
 {
-	struct bpf_prog_array __rcu *progs;
+	struct bpf_prog_array *progs;
 	struct bpf_prog_list *pl;
 	struct cgroup *p = cgrp;
 	int cnt = 0;
@@ -120,13 +120,12 @@ static int compute_effective_progs(struct cgroup *cgrp,
 					    &p->bpf.progs[type], node) {
 				if (!pl->prog)
 					continue;
-				rcu_dereference_protected(progs, 1)->
-					progs[cnt++] = pl->prog;
+				progs->progs[cnt++] = pl->prog;
 			}
 		p = cgroup_parent(p);
 	} while (p);
 
-	*array = progs;
+	rcu_assign_pointer(*array, progs);
 	return 0;
 }
 
@@ -568,6 +567,8 @@ static bool cgroup_dev_is_valid_access(int off, int size,
 				       enum bpf_access_type type,
 				       struct bpf_insn_access_aux *info)
 {
+	const int size_default = sizeof(__u32);
+
 	if (type == BPF_WRITE)
 		return false;
 
@@ -576,8 +577,17 @@ static bool cgroup_dev_is_valid_access(int off, int size,
 	/* The verifier guarantees that size > 0. */
 	if (off % size != 0)
 		return false;
-	if (size != sizeof(__u32))
-		return false;
+
+	switch (off) {
+	case bpf_ctx_range(struct bpf_cgroup_dev_ctx, access_type):
+		bpf_ctx_record_field_size(info, size_default);
+		if (!bpf_ctx_narrow_access_ok(off, size, size_default))
+			return false;
+		break;
+	default:
+		if (size != size_default)
+			return false;
+	}
 
 	return true;
 }

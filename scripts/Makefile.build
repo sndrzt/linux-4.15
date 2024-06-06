@@ -219,6 +219,8 @@ cmd_modversions_c =								\
 endif
 
 ifdef CONFIG_FTRACE_MCOUNT_RECORD
+ifndef CC_USING_RECORD_MCOUNT
+# compiler will not generate __mcount_loc use recordmcount or recordmcount.pl
 ifdef BUILD_C_RECORDMCOUNT
 ifeq ("$(origin RECORDMCOUNT_WARN)", "command line")
   RECORDMCOUNT_FLAGS = -w
@@ -237,7 +239,7 @@ else
 sub_cmd_record_mcount = set -e ; perl $(srctree)/scripts/recordmcount.pl "$(ARCH)" \
 	"$(if $(CONFIG_CPU_BIG_ENDIAN),big,little)" \
 	"$(if $(CONFIG_64BIT),64,32)" \
-	"$(OBJDUMP)" "$(OBJCOPY)" "$(CC) $(KBUILD_CFLAGS)" \
+	"$(OBJDUMP)" "$(OBJCOPY)" "$(CC) $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS)" \
 	"$(LD)" "$(NM)" "$(RM)" "$(MV)" \
 	"$(if $(part-of-module),1,0)" "$(@)";
 recordmcount_source := $(srctree)/scripts/recordmcount.pl
@@ -247,6 +249,7 @@ cmd_record_mcount =						\
 	     "$(CC_FLAGS_FTRACE)" ]; then			\
 		$(sub_cmd_record_mcount)			\
 	fi;
+endif # CC_USING_RECORD_MCOUNT
 endif # CONFIG_FTRACE_MCOUNT_RECORD
 
 ifdef CONFIG_STACK_VALIDATION
@@ -256,6 +259,8 @@ __objtool_obj := $(objtree)/tools/objtool/objtool
 
 objtool_args = $(if $(CONFIG_UNWINDER_ORC),orc generate,check)
 
+objtool_args += $(if $(part-of-module), --module,)
+
 ifndef CONFIG_FRAME_POINTER
 objtool_args += --no-fp
 endif
@@ -264,6 +269,10 @@ objtool_args += --no-unreachable
 else
 objtool_args += $(call cc-ifversion, -lt, 0405, --no-unreachable)
 endif
+ifdef CONFIG_RETPOLINE
+  objtool_args += --retpoline
+endif
+
 
 ifdef CONFIG_MODVERSIONS
 objtool_o = $(@D)/.tmp_$(@F)
@@ -289,19 +298,27 @@ objtool_dep = $(objtool_obj)					\
 	      $(wildcard include/config/orc/unwinder.h		\
 			 include/config/stack/validation.h)
 
+ifdef CONFIG_RETPOLINE
+cmd_ubuntu_retpoline = $(CONFIG_SHELL) $(srctree)/scripts/ubuntu-retpoline-extract-one $(@) $(<) "$(filter -m16 %code16gcc.h,$(a_flags))";
+else
+cmd_ubuntu_retpoline =
+endif
+
 define rule_cc_o_c
 	$(call echo-cmd,checksrc) $(cmd_checksrc)			  \
 	$(call cmd_and_fixdep,cc_o_c)					  \
 	$(cmd_checkdoc)							  \
 	$(call echo-cmd,objtool) $(cmd_objtool)				  \
 	$(cmd_modversions_c)						  \
+	$(call echo-cmd,ubuntu-retpoline) $(cmd_ubuntu_retpoline)	  \
 	$(call echo-cmd,record_mcount) $(cmd_record_mcount)
 endef
 
 define rule_as_o_S
 	$(call cmd_and_fixdep,as_o_S)					  \
 	$(call echo-cmd,objtool) $(cmd_objtool)				  \
-	$(cmd_modversions_S)
+	$(cmd_modversions_S)						  \
+	$(call echo-cmd,ubuntu-retpoline) $(cmd_ubuntu_retpoline)
 endef
 
 # List module undefined symbols (or empty line if not enabled)
@@ -314,12 +331,14 @@ endif
 # Built-in and composite module parts
 $(obj)/%.o: $(src)/%.c $(recordmcount_source) $(objtool_dep) FORCE
 	$(call cmd,force_checksrc)
+	$(call cmd,force_check_kmsg)
 	$(call if_changed_rule,cc_o_c)
 
 # Single-part modules are special since we need to mark them in $(MODVERDIR)
 
 $(single-used-m): $(obj)/%.o: $(src)/%.c $(recordmcount_source) $(objtool_dep) FORCE
 	$(call cmd,force_checksrc)
+	$(call cmd,force_check_kmsg)
 	$(call if_changed_rule,cc_o_c)
 	@{ echo $(@:.o=.ko); echo $@; \
 	   $(cmd_undef_syms); } > $(MODVERDIR)/$(@F:.o=.mod)
@@ -566,6 +585,19 @@ $(call multi_depend, $(multi-used-m), .o, -objs -y -m)
 
 targets += $(multi-used-y) $(multi-used-m)
 targets := $(filter-out $(PHONY), $(targets))
+
+# kmsg check tool
+ifneq ($(KBUILD_KMSG_CHECK),0)
+  ifeq ($(KBUILD_KMSG_CHECK),2)
+    kmsg_cmd := print
+    quiet_cmd_force_check_kmsg = KMSG_PRINT $<
+    $(shell [ -d $(objtree)/man ] || mkdir -p $(objtree)/man)
+  else
+    kmsg_cmd := check
+    quiet_cmd_force_check_kmsg = KMSG_CHECK $<
+  endif
+  cmd_force_check_kmsg = $(KMSG_CHECK) $(kmsg_cmd) $(CC) $(c_flags) $< ;
+endif
 
 # Descending
 # ---------------------------------------------------------------------------

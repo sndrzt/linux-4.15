@@ -25,8 +25,6 @@
 
 #include "bpf_jit_32.h"
 
-int bpf_jit_enable __read_mostly;
-
 /*
  * eBPF prog stack layout:
  *
@@ -40,6 +38,10 @@ int bpf_jit_enable __read_mostly;
  *                        +-----+
  *                        |RSVD | JIT scratchpad
  * current ARM_SP =>      +-----+ <= (BPF_FP - STACK_SIZE + SCRATCH_SIZE)
+ *                        | ... | caller-saved registers
+ *                        +-----+
+ *                        | ... | arguments passed on stack
+ * ARM_SP during call =>  +-----|
  *                        |     |
  *                        | ... | Function call stack
  *                        |     |
@@ -67,12 +69,20 @@ int bpf_jit_enable __read_mostly;
  *
  * When popping registers off the stack at the end of a BPF function, we
  * reference them via the current ARM_FP register.
+ *
+ * Some eBPF operations are implemented via a call to a helper function.
+ * Such calls are "invisible" in the eBPF code, so it is up to the calling
+ * program to preserve any caller-saved ARM registers during the call. The
+ * JIT emits code to push and pop those registers onto the stack, immediately
+ * above the callee stack frame.
  */
 #define CALLEE_MASK	(1 << ARM_R4 | 1 << ARM_R5 | 1 << ARM_R6 | \
 			 1 << ARM_R7 | 1 << ARM_R8 | 1 << ARM_R10 | \
 			 1 << ARM_FP)
 #define CALLEE_PUSH_MASK (CALLEE_MASK | 1 << ARM_LR)
 #define CALLEE_POP_MASK  (CALLEE_MASK | 1 << ARM_PC)
+
+#define CALLER_MASK	(1 << ARM_R0 | 1 << ARM_R1 | 1 << ARM_R2 | 1 << ARM_R3)
 
 #define STACK_OFFSET(k)	(k)
 #define TMP_REG_1	(MAX_BPF_JIT_REG + 0)	/* TEMP Register 1 */
@@ -364,6 +374,7 @@ static inline int epilogue_offset(const struct jit_ctx *ctx)
 
 static inline void emit_udivmod(u8 rd, u8 rm, u8 rn, struct jit_ctx *ctx, u8 op)
 {
+	const int exclude_mask = BIT(ARM_R0) | BIT(ARM_R1);
 	const u8 *tmp = bpf2a32[TMP_REG_1];
 	s32 jmp_offset;
 
@@ -403,10 +414,16 @@ static inline void emit_udivmod(u8 rd, u8 rm, u8 rn, struct jit_ctx *ctx, u8 op)
 		emit(ARM_MOV_R(ARM_R0, rm), ctx);
 	}
 
+	/* Push caller-saved registers on stack */
+	emit(ARM_PUSH(CALLER_MASK & ~exclude_mask), ctx);
+
 	/* Call appropriate function */
 	emit_mov_i(ARM_IP, op == BPF_DIV ?
 		   (u32)jit_udiv32 : (u32)jit_mod32, ctx);
 	emit_blx_r(ARM_IP, ctx);
+
+	/* Restore caller-saved registers from stack */
+	emit(ARM_POP(CALLER_MASK & ~exclude_mask), ctx);
 
 	/* Save return value */
 	if (rd != ARM_R0)
@@ -718,7 +735,7 @@ static inline void emit_a32_arsh_r64(const u8 dst[], const u8 src[], bool dstk,
 }
 
 /* dst = dst >> src */
-static inline void emit_a32_lsr_r64(const u8 dst[], const u8 src[], bool dstk,
+static inline void emit_a32_rsh_r64(const u8 dst[], const u8 src[], bool dstk,
 				     bool sstk, struct jit_ctx *ctx) {
 	const u8 *tmp = bpf2a32[TMP_REG_1];
 	const u8 *tmp2 = bpf2a32[TMP_REG_2];
@@ -734,7 +751,7 @@ static inline void emit_a32_lsr_r64(const u8 dst[], const u8 src[], bool dstk,
 		emit(ARM_LDR_I(rm, ARM_SP, STACK_VAR(dst_hi)), ctx);
 	}
 
-	/* Do LSH operation */
+	/* Do RSH operation */
 	emit(ARM_RSB_I(ARM_IP, rt, 32), ctx);
 	emit(ARM_SUBS_I(tmp2[0], rt, 32), ctx);
 	emit(ARM_MOV_SR(ARM_LR, rd, SRTYPE_LSR, rt), ctx);
@@ -784,7 +801,7 @@ static inline void emit_a32_lsh_i64(const u8 dst[], bool dstk,
 }
 
 /* dst = dst >> val */
-static inline void emit_a32_lsr_i64(const u8 dst[], bool dstk,
+static inline void emit_a32_rsh_i64(const u8 dst[], bool dstk,
 				    const u32 val, struct jit_ctx *ctx) {
 	const u8 *tmp = bpf2a32[TMP_REG_1];
 	const u8 *tmp2 = bpf2a32[TMP_REG_2];
@@ -798,7 +815,11 @@ static inline void emit_a32_lsr_i64(const u8 dst[], bool dstk,
 	}
 
 	/* Do LSR operation */
-	if (val < 32) {
+	if (val == 0) {
+		/* An immediate value of 0 encodes a shift amount of 32
+		 * for LSR. To shift by 0, don't do anything.
+		 */
+	} else if (val < 32) {
 		emit(ARM_MOV_SI(tmp2[1], rd, SRTYPE_LSR, val), ctx);
 		emit(ARM_ORR_SI(rd, tmp2[1], rm, SRTYPE_ASL, 32 - val), ctx);
 		emit(ARM_MOV_SI(rm, rm, SRTYPE_LSR, val), ctx);
@@ -831,7 +852,11 @@ static inline void emit_a32_arsh_i64(const u8 dst[], bool dstk,
 	}
 
 	/* Do ARSH operation */
-	if (val < 32) {
+	if (val == 0) {
+		/* An immediate value of 0 encodes a shift amount of 32
+		 * for ASR. To shift by 0, don't do anything.
+		 */
+	} else if (val < 32) {
 		emit(ARM_MOV_SI(tmp2[1], rd, SRTYPE_LSR, val), ctx);
 		emit(ARM_ORR_SI(rd, tmp2[1], rm, SRTYPE_ASL, 32 - val), ctx);
 		emit(ARM_MOV_SI(rm, rm, SRTYPE_ASR, val), ctx);
@@ -915,7 +940,7 @@ static inline void emit_str_r(const u8 dst, const u8 src, bool dstk,
 /* dst = *(size*)(src + off) */
 static inline void emit_ldx_r(const u8 dst[], const u8 src, bool dstk,
 			      s32 off, struct jit_ctx *ctx, const u8 sz){
-	const u8 *tmp = bpf2a32[TMP_REG_1];
+	const u8 *tmp = bpf2a32[TMP_REG_2];
 	const u8 *rd = dstk ? tmp : dst;
 	u8 rm = src;
 	s32 off_max;
@@ -1340,7 +1365,7 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx)
 	case BPF_ALU64 | BPF_RSH | BPF_K:
 		if (unlikely(imm > 63))
 			return -EINVAL;
-		emit_a32_lsr_i64(dst, dstk, imm, ctx);
+		emit_a32_rsh_i64(dst, dstk, imm, ctx);
 		break;
 	/* dst = dst << src */
 	case BPF_ALU64 | BPF_LSH | BPF_X:
@@ -1348,7 +1373,7 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx)
 		break;
 	/* dst = dst >> src */
 	case BPF_ALU64 | BPF_RSH | BPF_X:
-		emit_a32_lsr_r64(dst, src, dstk, sstk, ctx);
+		emit_a32_rsh_r64(dst, src, dstk, sstk, ctx);
 		break;
 	/* dst = dst >> src (signed) */
 	case BPF_ALU64 | BPF_ARSH | BPF_X:
@@ -1938,7 +1963,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		/* there are 2 passes here */
 		bpf_jit_dump(prog->len, image_size, 2, ctx.target);
 
-	set_memory_ro((unsigned long)header, header->pages);
+	bpf_jit_binary_lock_ro(header);
 	prog->bpf_func = (void *)ctx.target;
 	prog->jited = 1;
 	prog->jited_len = image_size;

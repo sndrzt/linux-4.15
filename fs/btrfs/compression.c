@@ -45,6 +45,37 @@
 #include "extent_io.h"
 #include "extent_map.h"
 
+static const char* const btrfs_compress_types[] = { "", "zlib", "lzo", "zstd" };
+
+const char* btrfs_compress_type2str(enum btrfs_compression_type type)
+{
+	switch (type) {
+	case BTRFS_COMPRESS_ZLIB:
+	case BTRFS_COMPRESS_LZO:
+	case BTRFS_COMPRESS_ZSTD:
+	case BTRFS_COMPRESS_NONE:
+		return btrfs_compress_types[type];
+	}
+
+	return NULL;
+}
+
+bool btrfs_compress_is_valid_type(const char *str, size_t len)
+{
+	int i;
+
+	for (i = 1; i < ARRAY_SIZE(btrfs_compress_types); i++) {
+		size_t comp_len = strlen(btrfs_compress_types[i]);
+
+		if (len < comp_len)
+			continue;
+
+		if (!strncmp(btrfs_compress_types[i], str, comp_len))
+			return true;
+	}
+	return false;
+}
+
 static int btrfs_decompress_bio(struct compressed_bio *cb);
 
 static inline int compressed_bio_size(struct btrfs_fs_info *fs_info,
@@ -257,8 +288,7 @@ static void end_compressed_bio_write(struct bio *bio)
 					 cb->start,
 					 cb->start + cb->len - 1,
 					 NULL,
-					 bio->bi_status ?
-					 BLK_STS_OK : BLK_STS_NOTSUPP);
+					 !cb->errors);
 	cb->compressed_pages[0]->mapping = NULL;
 
 	end_compressed_writeback(inode, cb);
@@ -495,7 +525,7 @@ static noinline int add_ra_bio_pages(struct inode *inode,
 
 		if (page->index == end_index) {
 			char *userpage;
-			size_t zero_offset = isize & (PAGE_SIZE - 1);
+			size_t zero_offset = offset_in_page(isize);
 
 			if (zero_offset) {
 				int zeros;

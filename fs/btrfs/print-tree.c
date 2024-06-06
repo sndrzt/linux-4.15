@@ -116,9 +116,10 @@ static void print_extent_item(struct extent_buffer *eb, int slot, int type)
 			 * offset is supposed to be a tree block which
 			 * must be aligned to nodesize.
 			 */
-			if (!IS_ALIGNED(offset, eb->fs_info->nodesize))
-				pr_info("\t\t\t(parent %llu is NOT ALIGNED to nodesize %llu)\n",
-					offset, (unsigned long long)eb->fs_info->nodesize);
+			if (!IS_ALIGNED(offset, eb->fs_info->sectorsize))
+				pr_info(
+			"\t\t\t(parent %llu not aligned to sectorsize %u)\n",
+					offset, eb->fs_info->sectorsize);
 			break;
 		case BTRFS_EXTENT_DATA_REF_KEY:
 			dref = (struct btrfs_extent_data_ref *)(&iref->offset);
@@ -133,8 +134,9 @@ static void print_extent_item(struct extent_buffer *eb, int slot, int type)
 			 * must be aligned to nodesize.
 			 */
 			if (!IS_ALIGNED(offset, eb->fs_info->nodesize))
-				pr_info("\t\t\t(parent %llu is NOT ALIGNED to nodesize %llu)\n",
-				     offset, (unsigned long long)eb->fs_info->nodesize);
+				pr_info(
+			"\t\t\t(parent %llu not aligned to sectorsize %u)\n",
+				     offset, eb->fs_info->sectorsize);
 			break;
 		default:
 			pr_cont("(extent %llu has INVALID ref type %d)\n",
@@ -259,8 +261,8 @@ void btrfs_print_leaf(struct extent_buffer *l)
 					    struct btrfs_file_extent_item);
 			if (btrfs_file_extent_type(l, fi) ==
 			    BTRFS_FILE_EXTENT_INLINE) {
-				pr_info("\t\tinline extent data size %u\n",
-				       btrfs_file_extent_inline_len(l, i, fi));
+				pr_info("\t\tinline extent data size %llu\n",
+				       btrfs_file_extent_ram_bytes(l, fi));
 				break;
 			}
 			pr_info("\t\textent data disk bytenr %llu nr %llu\n",
@@ -365,9 +367,13 @@ void btrfs_print_tree(struct extent_buffer *c)
 		       btrfs_node_blockptr(c, i));
 	}
 	for (i = 0; i < nr; i++) {
-		struct extent_buffer *next = read_tree_block(fs_info,
-					btrfs_node_blockptr(c, i),
-					btrfs_node_ptr_generation(c, i));
+		struct btrfs_key first_key;
+		struct extent_buffer *next;
+
+		btrfs_node_key_to_cpu(c, &first_key, i);
+		next = read_tree_block(fs_info, btrfs_node_blockptr(c, i),
+				       btrfs_node_ptr_generation(c, i),
+				       level - 1, &first_key);
 		if (IS_ERR(next)) {
 			continue;
 		} else if (!extent_buffer_uptodate(next)) {

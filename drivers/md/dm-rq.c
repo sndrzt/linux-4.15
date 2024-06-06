@@ -95,9 +95,6 @@ static void dm_old_stop_queue(struct request_queue *q)
 
 static void dm_mq_stop_queue(struct request_queue *q)
 {
-	if (blk_mq_queue_stopped(q))
-		return;
-
 	blk_mq_quiesce_queue(q);
 }
 
@@ -219,7 +216,7 @@ static void dm_end_request(struct request *clone, blk_status_t error)
 	struct request *rq = tio->orig;
 
 	blk_rq_unprep_clone(clone);
-	tio->ti->type->release_clone_rq(clone);
+	tio->ti->type->release_clone_rq(clone, NULL);
 
 	rq_end_stats(md, rq);
 	if (!rq->q->mq_ops)
@@ -270,7 +267,7 @@ static void dm_requeue_original_request(struct dm_rq_target_io *tio, bool delay_
 	rq_end_stats(md, rq);
 	if (tio->clone) {
 		blk_rq_unprep_clone(tio->clone);
-		tio->ti->type->release_clone_rq(tio->clone);
+		tio->ti->type->release_clone_rq(tio->clone, NULL);
 	}
 
 	if (!rq->q->mq_ops)
@@ -395,7 +392,7 @@ static void end_clone_request(struct request *clone, blk_status_t error)
 	dm_complete_request(tio->orig, error);
 }
 
-static void dm_dispatch_clone_request(struct request *clone, struct request *rq)
+static blk_status_t dm_dispatch_clone_request(struct request *clone, struct request *rq)
 {
 	blk_status_t r;
 
@@ -404,9 +401,10 @@ static void dm_dispatch_clone_request(struct request *clone, struct request *rq)
 
 	clone->start_time = jiffies;
 	r = blk_insert_cloned_request(clone->q, clone);
-	if (r)
+	if (r != BLK_STS_OK && r != BLK_STS_RESOURCE && r != BLK_STS_DEV_RESOURCE)
 		/* must complete clone in terms of original request */
 		dm_complete_request(rq, r);
+	return r;
 }
 
 static int dm_rq_bio_constructor(struct bio *bio, struct bio *bio_orig,
@@ -476,8 +474,10 @@ static int map_request(struct dm_rq_target_io *tio)
 	struct mapped_device *md = tio->md;
 	struct request *rq = tio->orig;
 	struct request *clone = NULL;
+	blk_status_t ret;
 
 	r = ti->type->clone_and_map_rq(ti, rq, &tio->info, &clone);
+check_again:
 	switch (r) {
 	case DM_MAPIO_SUBMITTED:
 		/* The target has taken the I/O to submit by itself later */
@@ -485,14 +485,24 @@ static int map_request(struct dm_rq_target_io *tio)
 	case DM_MAPIO_REMAPPED:
 		if (setup_clone(clone, rq, tio, GFP_ATOMIC)) {
 			/* -ENOMEM */
-			ti->type->release_clone_rq(clone);
+			ti->type->release_clone_rq(clone, &tio->info);
 			return DM_MAPIO_REQUEUE;
 		}
 
 		/* The target has remapped the I/O so dispatch it */
 		trace_block_rq_remap(clone->q, clone, disk_devt(dm_disk(md)),
 				     blk_rq_pos(rq));
-		dm_dispatch_clone_request(clone, rq);
+		ret = dm_dispatch_clone_request(clone, rq);
+		if (ret == BLK_STS_RESOURCE || ret == BLK_STS_DEV_RESOURCE) {
+			blk_rq_unprep_clone(clone);
+			tio->ti->type->release_clone_rq(clone, &tio->info);
+			tio->clone = NULL;
+			if (!rq->q->mq_ops)
+				r = DM_MAPIO_DELAY_REQUEUE;
+			else
+				r = DM_MAPIO_REQUEUE;
+			goto check_again;
+		}
 		break;
 	case DM_MAPIO_REQUEUE:
 		/* The target wants to requeue the I/O */
@@ -758,7 +768,6 @@ static blk_status_t dm_mq_queue_rq(struct blk_mq_hw_ctx *hctx,
 		/* Undo dm_start_request() before requeuing */
 		rq_end_stats(md, rq);
 		rq_completed(md, rq_data_dir(rq), false);
-		blk_mq_delay_run_hw_queue(hctx, 100/*ms*/);
 		return BLK_STS_RESOURCE;
 	}
 
@@ -825,6 +834,7 @@ out_tag_set:
 	blk_mq_free_tag_set(md->tag_set);
 out_kfree_tag_set:
 	kfree(md->tag_set);
+	md->tag_set = NULL;
 
 	return err;
 }
@@ -834,6 +844,7 @@ void dm_mq_cleanup_mapped_device(struct mapped_device *md)
 	if (md->tag_set) {
 		blk_mq_free_tag_set(md->tag_set);
 		kfree(md->tag_set);
+		md->tag_set = NULL;
 	}
 }
 

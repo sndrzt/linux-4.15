@@ -65,6 +65,18 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 
 	memcpy(dst, src, arch_task_struct_size);
 	dst->thread.fpu.regs = dst->thread.fpu.fprs;
+
+	/*
+	 * Don't transfer over the runtime instrumentation or the guarded
+	 * storage control block pointers. These fields are cleared here instead
+	 * of in copy_thread() to avoid premature freeing of associated memory
+	 * on fork() failure. Wait to clear the RI flag because ->stack still
+	 * refers to the source thread.
+	 */
+	dst->thread.ri_cb = NULL;
+	dst->thread.gs_cb = NULL;
+	dst->thread.gs_bc_cb = NULL;
+
 	return 0;
 }
 
@@ -121,13 +133,11 @@ int copy_thread_tls(unsigned long clone_flags, unsigned long new_stackp,
 	frame->childregs.flags = 0;
 	if (new_stackp)
 		frame->childregs.gprs[15] = new_stackp;
-
-	/* Don't copy runtime instrumentation info */
-	p->thread.ri_cb = NULL;
+	/*
+	 * Clear the runtime instrumentation flag after the above childregs
+	 * copy. The CB pointer was already cleared in arch_dup_task_struct().
+	 */
 	frame->childregs.psw.mask &= ~PSW_MASK_RI;
-	/* Don't copy guarded storage control block */
-	p->thread.gs_cb = NULL;
-	p->thread.gs_bc_cb = NULL;
 
 	/* Set a new TLS ?  */
 	if (clone_flags & CLONE_SETTLS) {
@@ -173,20 +183,30 @@ unsigned long get_wchan(struct task_struct *p)
 
 	if (!p || p == current || p->state == TASK_RUNNING || !task_stack_page(p))
 		return 0;
+
+	if (!try_get_task_stack(p))
+		return 0;
+
 	low = task_stack_page(p);
 	high = (struct stack_frame *) task_pt_regs(p);
 	sf = (struct stack_frame *) p->thread.ksp;
-	if (sf <= low || sf > high)
-		return 0;
+	if (sf <= low || sf > high) {
+		return_address = 0;
+		goto out;
+	}
 	for (count = 0; count < 16; count++) {
 		sf = (struct stack_frame *) sf->back_chain;
-		if (sf <= low || sf > high)
-			return 0;
+		if (sf <= low || sf > high) {
+			return_address = 0;
+			goto out;
+		}
 		return_address = sf->gprs[8];
 		if (!in_sched_functions(return_address))
-			return return_address;
+			goto out;
 	}
-	return 0;
+out:
+	put_task_stack(p);
+	return return_address;
 }
 
 unsigned long arch_align_stack(unsigned long sp)

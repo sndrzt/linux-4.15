@@ -767,7 +767,9 @@ typedef int (*trace_func_graph_ent_t)(struct ftrace_graph_ent *); /* entry */
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER
 
 /* for init task */
-#define INIT_FTRACE_GRAPH		.ret_stack = NULL,
+#define INIT_FTRACE_GRAPH				\
+	.ret_stack		= NULL,			\
+	.tracing_graph_pause	= ATOMIC_INIT(0),
 
 /*
  * Stack of return addresses for functions
@@ -797,8 +799,8 @@ struct ftrace_ret_stack {
 extern void return_to_handler(void);
 
 extern int
-ftrace_push_return_trace(unsigned long ret, unsigned long func, int *depth,
-			 unsigned long frame_pointer, unsigned long *retp);
+function_graph_enter(unsigned long ret, unsigned long func,
+		     unsigned long frame_pointer, unsigned long *retp);
 
 unsigned long ftrace_graph_ret_addr(struct task_struct *task, int *idx,
 				    unsigned long ret, unsigned long *retp);

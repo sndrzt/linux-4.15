@@ -3012,6 +3012,7 @@ megasas_fw_crash_buffer_show(struct device *cdev,
 	u32 size;
 	unsigned long buff_addr;
 	unsigned long dmachunk = CRASH_DMA_BUF_SIZE;
+	unsigned long chunk_left_bytes;
 	unsigned long src_addr;
 	unsigned long flags;
 	u32 buff_offset;
@@ -3037,6 +3038,8 @@ megasas_fw_crash_buffer_show(struct device *cdev,
 	}
 
 	size = (instance->fw_crash_buffer_size * dmachunk) - buff_offset;
+	chunk_left_bytes = dmachunk - (buff_offset % dmachunk);
+	size = (size > chunk_left_bytes) ? chunk_left_bytes : size;
 	size = (size >= PAGE_SIZE) ? (PAGE_SIZE - 1) : size;
 
 	src_addr = (unsigned long)instance->crash_buf[buff_offset / dmachunk] +
@@ -3860,12 +3863,12 @@ megasas_transition_to_ready(struct megasas_instance *instance, int ocr)
 		/*
 		 * The cur_state should not last for more than max_wait secs
 		 */
-		for (i = 0; i < (max_wait * 1000); i++) {
+		for (i = 0; i < max_wait * 50; i++) {
 			curr_abs_state = instance->instancet->
 				read_fw_status_reg(instance->reg_set);
 
 			if (abs_state == curr_abs_state) {
-				msleep(1);
+				msleep(20);
 			} else
 				break;
 		}
@@ -4125,6 +4128,7 @@ int megasas_alloc_cmds(struct megasas_instance *instance)
 	if (megasas_create_frame_pool(instance)) {
 		dev_printk(KERN_DEBUG, &instance->pdev->dev, "Error creating frame DMA pool\n");
 		megasas_free_cmds(instance);
+		return -ENOMEM;
 	}
 
 	return 0;
@@ -4143,7 +4147,8 @@ dcmd_timeout_ocr_possible(struct megasas_instance *instance) {
 	if (instance->adapter_type == MFI_SERIES)
 		return KILL_ADAPTER;
 	else if (instance->unload ||
-			test_bit(MEGASAS_FUSION_IN_RESET, &instance->reset_flags))
+			test_bit(MEGASAS_FUSION_OCR_NOT_POSSIBLE,
+				 &instance->reset_flags))
 		return IGNORE_TIMEOUT;
 	else
 		return INITIATE_OCR;
@@ -5140,6 +5145,26 @@ skip_alloc:
 		instance->use_seqnum_jbod_fp = false;
 }
 
+static void megasas_setup_reply_map(struct megasas_instance *instance)
+{
+	const struct cpumask *mask;
+	unsigned int queue, cpu;
+
+	for (queue = 0; queue < instance->msix_vectors; queue++) {
+		mask = pci_irq_get_affinity(instance->pdev, queue);
+		if (!mask)
+			goto fallback;
+
+		for_each_cpu(cpu, mask)
+			instance->reply_map[cpu] = queue;
+	}
+	return;
+
+fallback:
+	for_each_possible_cpu(cpu)
+		instance->reply_map[cpu] = cpu % instance->msix_vectors;
+}
+
 /**
  * megasas_init_fw -	Initializes the FW
  * @instance:		Adapter soft state
@@ -5151,7 +5176,7 @@ static int megasas_init_fw(struct megasas_instance *instance)
 {
 	u32 max_sectors_1;
 	u32 max_sectors_2, tmp_sectors, msix_enable;
-	u32 scratch_pad_2, scratch_pad_3, scratch_pad_4;
+	u32 scratch_pad_2, scratch_pad_3, scratch_pad_4, status_reg;
 	resource_size_t base_addr;
 	struct megasas_register_set __iomem *reg_set;
 	struct megasas_ctrl_info *ctrl_info = NULL;
@@ -5159,6 +5184,7 @@ static int megasas_init_fw(struct megasas_instance *instance)
 	int i, j, loop, fw_msix_count = 0;
 	struct IOV_111 *iovPtr;
 	struct fusion_context *fusion;
+	bool do_adp_reset = true;
 
 	fusion = instance->ctrl_context;
 
@@ -5207,19 +5233,29 @@ static int megasas_init_fw(struct megasas_instance *instance)
 	}
 
 	if (megasas_transition_to_ready(instance, 0)) {
-		atomic_set(&instance->fw_reset_no_pci_access, 1);
-		instance->instancet->adp_reset
-			(instance, instance->reg_set);
-		atomic_set(&instance->fw_reset_no_pci_access, 0);
-		dev_info(&instance->pdev->dev,
-			"FW restarted successfully from %s!\n",
-			__func__);
+		if (instance->adapter_type >= INVADER_SERIES) {
+			status_reg = instance->instancet->read_fw_status_reg(
+					instance->reg_set);
+			do_adp_reset = status_reg & MFI_RESET_ADAPTER;
+		}
 
-		/*waitting for about 30 second before retry*/
-		ssleep(30);
+		if (do_adp_reset) {
+			atomic_set(&instance->fw_reset_no_pci_access, 1);
+			instance->instancet->adp_reset
+				(instance, instance->reg_set);
+			atomic_set(&instance->fw_reset_no_pci_access, 0);
+			dev_info(&instance->pdev->dev,
+				 "FW restarted successfully from %s!\n",
+				 __func__);
 
-		if (megasas_transition_to_ready(instance, 0))
+			/*waiting for about 30 second before retry*/
+			ssleep(30);
+
+			if (megasas_transition_to_ready(instance, 0))
+				goto fail_ready_state;
+		} else {
 			goto fail_ready_state;
+		}
 	}
 
 	megasas_init_ctrl_params(instance);
@@ -5258,12 +5294,29 @@ static int megasas_init_fw(struct megasas_instance *instance)
 				instance->msix_vectors = (scratch_pad_2
 					& MR_MAX_REPLY_QUEUES_OFFSET) + 1;
 				fw_msix_count = instance->msix_vectors;
-			} else { /* Invader series supports more than 8 MSI-x vectors*/
+			} else {
 				instance->msix_vectors = ((scratch_pad_2
 					& MR_MAX_REPLY_QUEUES_EXT_OFFSET)
 					>> MR_MAX_REPLY_QUEUES_EXT_OFFSET_SHIFT) + 1;
-				if (instance->msix_vectors > 16)
-					instance->msix_combined = true;
+
+				/*
+				 * For Invader series, > 8 MSI-x vectors
+				 * supported by FW/HW implies combined
+				 * reply queue mode is enabled.
+				 * For Ventura series, > 16 MSI-x vectors
+				 * supported by FW/HW implies combined
+				 * reply queue mode is enabled.
+				 */
+				switch (instance->adapter_type) {
+				case INVADER_SERIES:
+					if (instance->msix_vectors > 8)
+						instance->msix_combined = true;
+					break;
+				case VENTURA_SERIES:
+					if (instance->msix_vectors > 16)
+						instance->msix_combined = true;
+					break;
+				}
 
 				if (rdpq_enable)
 					instance->is_rdpq = (scratch_pad_2 & MR_RDPQ_MODE_OFFSET) ?
@@ -5315,8 +5368,10 @@ static int megasas_init_fw(struct megasas_instance *instance)
 	if (!instance->msix_vectors) {
 		i = pci_alloc_irq_vectors(instance->pdev, 1, 1, PCI_IRQ_LEGACY);
 		if (i < 0)
-			goto fail_setup_irqs;
+			goto fail_init_adapter;
 	}
+
+	megasas_setup_reply_map(instance);
 
 	dev_info(&instance->pdev->dev,
 		"firmware supports msix\t: (%d)", fw_msix_count);
@@ -5522,9 +5577,8 @@ static int megasas_init_fw(struct megasas_instance *instance)
 
 fail_get_ld_pd_list:
 	instance->instancet->disable_intr(instance);
-fail_init_adapter:
 	megasas_destroy_irqs(instance);
-fail_setup_irqs:
+fail_init_adapter:
 	if (instance->msix_vectors)
 		pci_free_irq_vectors(instance->pdev);
 	instance->msix_vectors = 0;
@@ -5793,7 +5847,8 @@ megasas_get_target_prop(struct megasas_instance *instance,
 	int ret;
 	struct megasas_cmd *cmd;
 	struct megasas_dcmd_frame *dcmd;
-	u16 targetId = (sdev->channel % 2) + sdev->id;
+	u16 targetId = ((sdev->channel % 2) * MEGASAS_MAX_DEV_PER_CHANNEL) +
+			sdev->id;
 
 	cmd = megasas_get_cmd(instance);
 
@@ -5955,13 +6010,13 @@ static int megasas_io_attach(struct megasas_instance *instance)
  * @instance:		Adapter soft state
  * Description:
  *
- * For Ventura, driver/FW will operate in 64bit DMA addresses.
+ * For Ventura, driver/FW will operate in 63bit DMA addresses.
  *
  * For invader-
  *	By default, driver/FW will operate in 32bit DMA addresses
  *	for consistent DMA mapping but if 32 bit consistent
- *	DMA mask fails, driver will try with 64 bit consistent
- *	mask provided FW is true 64bit DMA capable
+ *	DMA mask fails, driver will try with 63 bit consistent
+ *	mask provided FW is true 63bit DMA capable
  *
  * For older controllers(Thunderbolt and MFI based adapters)-
  *	driver/FW will operate in 32 bit consistent DMA addresses.
@@ -5975,14 +6030,14 @@ megasas_set_dma_mask(struct megasas_instance *instance)
 
 	pdev = instance->pdev;
 	consistent_mask = (instance->adapter_type == VENTURA_SERIES) ?
-				DMA_BIT_MASK(64) : DMA_BIT_MASK(32);
+				DMA_BIT_MASK(63) : DMA_BIT_MASK(32);
 
 	if (IS_DMA64) {
-		if (dma_set_mask(&pdev->dev, DMA_BIT_MASK(64)) &&
+		if (dma_set_mask(&pdev->dev, DMA_BIT_MASK(63)) &&
 		    dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32)))
 			goto fail_set_dma_mask;
 
-		if ((*pdev->dev.dma_mask == DMA_BIT_MASK(64)) &&
+		if ((*pdev->dev.dma_mask == DMA_BIT_MASK(63)) &&
 		    (dma_set_coherent_mask(&pdev->dev, consistent_mask) &&
 		     dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32)))) {
 			/*
@@ -5995,7 +6050,7 @@ megasas_set_dma_mask(struct megasas_instance *instance)
 			if (!(scratch_pad_2 & MR_CAN_HANDLE_64_BIT_DMA_OFFSET))
 				goto fail_set_dma_mask;
 			else if (dma_set_mask_and_coherent(&pdev->dev,
-							   DMA_BIT_MASK(64)))
+							   DMA_BIT_MASK(63)))
 				goto fail_set_dma_mask;
 		}
 	} else if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32)))
@@ -6007,8 +6062,8 @@ megasas_set_dma_mask(struct megasas_instance *instance)
 		instance->consistent_mask_64bit = true;
 
 	dev_info(&pdev->dev, "%s bit DMA mask and %s bit consistent mask\n",
-		 ((*pdev->dev.dma_mask == DMA_BIT_MASK(64)) ? "64" : "32"),
-		 (instance->consistent_mask_64bit ? "64" : "32"));
+		 ((*pdev->dev.dma_mask == DMA_BIT_MASK(64)) ? "63" : "32"),
+		 (instance->consistent_mask_64bit ? "63" : "32"));
 
 	return 0;
 
@@ -6094,20 +6149,29 @@ static inline int megasas_alloc_mfi_ctrl_mem(struct megasas_instance *instance)
  */
 static int megasas_alloc_ctrl_mem(struct megasas_instance *instance)
 {
+	instance->reply_map = kzalloc(sizeof(unsigned int) * nr_cpu_ids,
+				      GFP_KERNEL);
+	if (!instance->reply_map)
+		return -ENOMEM;
+
 	switch (instance->adapter_type) {
 	case MFI_SERIES:
 		if (megasas_alloc_mfi_ctrl_mem(instance))
-			return -ENOMEM;
+			goto fail;
 		break;
 	case VENTURA_SERIES:
 	case THUNDERBOLT_SERIES:
 	case INVADER_SERIES:
 		if (megasas_alloc_fusion_context(instance))
-			return -ENOMEM;
+			goto fail;
 		break;
 	}
 
 	return 0;
+ fail:
+	kfree(instance->reply_map);
+	instance->reply_map = NULL;
+	return -ENOMEM;
 }
 
 /*
@@ -6119,6 +6183,7 @@ static int megasas_alloc_ctrl_mem(struct megasas_instance *instance)
  */
 static inline void megasas_free_ctrl_mem(struct megasas_instance *instance)
 {
+	kfree(instance->reply_map);
 	if (instance->adapter_type == MFI_SERIES) {
 		if (instance->producer)
 			pci_free_consistent(instance->pdev, sizeof(u32),
@@ -6512,7 +6577,6 @@ fail_io_attach:
 		pci_free_irq_vectors(instance->pdev);
 fail_init_mfi:
 	scsi_host_put(host);
-
 fail_alloc_instance:
 	pci_disable_device(pdev);
 
@@ -6717,6 +6781,8 @@ megasas_resume(struct pci_dev *pdev)
 	if (rval < 0)
 		goto fail_reenable_msix;
 
+	megasas_setup_reply_map(instance);
+
 	if (instance->adapter_type != MFI_SERIES) {
 		megasas_reset_reply_desc(instance);
 		if (megasas_ioc_init_fusion(instance)) {
@@ -6732,6 +6798,9 @@ megasas_resume(struct pci_dev *pdev)
 		if (megasas_issue_init_mfi(instance))
 			goto fail_init_mfi;
 	}
+
+	if (megasas_get_ctrl_info(instance) != DCMD_SUCCESS)
+		goto fail_init_mfi;
 
 	tasklet_init(&instance->isr_tasklet, instance->instancet->tasklet,
 		     (unsigned long)instance);
@@ -6822,7 +6891,6 @@ static void megasas_detach_one(struct pci_dev *pdev)
 	u32 pd_seq_map_sz;
 
 	instance = pci_get_drvdata(pdev);
-	instance->unload = 1;
 	host = instance->host;
 	fusion = instance->ctrl_context;
 
@@ -6833,6 +6901,7 @@ static void megasas_detach_one(struct pci_dev *pdev)
 	if (instance->fw_crash_state != UNAVAILABLE)
 		megasas_free_host_crash_buffer(instance);
 	scsi_remove_host(instance->host);
+	instance->unload = 1;
 
 	if (megasas_wait_for_adapter_operational(instance))
 		goto skip_firing_dcmds;
@@ -7076,7 +7145,7 @@ megasas_mgmt_fw_ioctl(struct megasas_instance *instance,
 	int error = 0, i;
 	void *sense = NULL;
 	dma_addr_t sense_handle;
-	unsigned long *sense_ptr;
+	void *sense_ptr;
 	u32 opcode = 0;
 
 	memset(kbuff_arr, 0, sizeof(kbuff_arr));
@@ -7191,6 +7260,13 @@ megasas_mgmt_fw_ioctl(struct megasas_instance *instance,
 	}
 
 	if (ioc->sense_len) {
+		/* make sure the pointer is part of the frame */
+		if (ioc->sense_off >
+		    (sizeof(union megasas_frame) - sizeof(__le64))) {
+			error = -EINVAL;
+			goto out;
+		}
+
 		sense = dma_alloc_coherent(&instance->pdev->dev, ioc->sense_len,
 					     &sense_handle, GFP_KERNEL);
 		if (!sense) {
@@ -7198,12 +7274,9 @@ megasas_mgmt_fw_ioctl(struct megasas_instance *instance,
 			goto out;
 		}
 
-		sense_ptr =
-		(unsigned long *) ((unsigned long)cmd->frame + ioc->sense_off);
-		if (instance->consistent_mask_64bit)
-			*sense_ptr = cpu_to_le64(sense_handle);
-		else
-			*sense_ptr = cpu_to_le32(sense_handle);
+		/* always store 64 bits regardless of addressing */
+		sense_ptr = (void *)cmd->frame + ioc->sense_off;
+		put_unaligned_le64(sense_handle, sense_ptr);
 	}
 
 	/*
@@ -7493,6 +7566,9 @@ static int megasas_mgmt_compat_ioctl_fw(struct file *file, unsigned long arg)
 		get_user(local_sense_len, &ioc->sense_len) ||
 		get_user(user_sense_off, &cioc->sense_off))
 		return -EFAULT;
+
+	if (local_sense_off != user_sense_off)
+		return -EINVAL;
 
 	if (local_sense_len) {
 		void __user **sense_ioc_ptr =

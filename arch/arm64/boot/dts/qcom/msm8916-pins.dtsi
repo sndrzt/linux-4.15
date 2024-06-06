@@ -542,7 +542,7 @@
 				pins = "gpio63", "gpio64", "gpio65", "gpio66",
 				       "gpio67", "gpio68";
 				drive-strength = <8>;
-				bias-pull-none;
+				bias-disable;
 			};
 		};
 		cdc_pdm_lines_sus: pdm_lines_off {
@@ -555,7 +555,7 @@
 				pins = "gpio63", "gpio64", "gpio65", "gpio66",
 				       "gpio67", "gpio68";
 				drive-strength = <2>;
-				bias-disable;
+				bias-pull-down;
 			};
 		};
 	};
@@ -571,7 +571,7 @@
 				pins = "gpio113", "gpio114", "gpio115",
 				       "gpio116";
 				drive-strength = <8>;
-				bias-pull-none;
+				bias-disable;
 			};
 		};
 
@@ -599,7 +599,7 @@
 			pinconf {
 				pins = "gpio110";
 				drive-strength = <8>;
-				bias-pull-none;
+				bias-disable;
 			};
 		};
 
@@ -625,7 +625,7 @@
 			pinconf {
 				pins = "gpio116";
 				drive-strength = <8>;
-				bias-pull-none;
+				bias-disable;
 			};
 		};
 		ext_mclk_tlmm_lines_sus: mclk_lines_off {
@@ -653,7 +653,7 @@
 				pins = "gpio112", "gpio117", "gpio118",
 					"gpio119";
 				drive-strength = <8>;
-				bias-pull-none;
+				bias-disable;
 			};
 		};
 		ext_sec_tlmm_lines_sus: tlmm_lines_off {
@@ -731,6 +731,84 @@
 			pins = "gpio40", "gpio41", "gpio42", "gpio43", "gpio44";
 			drive-strength = <6>;
 			bias-pull-up;
+		};
+	};
+
+	cci_lines {
+		cci0_default: cci0_default {
+			pinmux {
+				function = "cci_i2c";
+				pins = "gpio29", "gpio30";
+			};
+			pinconf {
+				pins = "gpio29", "gpio30";
+				drive-strength = <16>;
+				bias-disable;
+			};
+		};
+	};
+
+	camera_front_default: camera_front_default {
+		pinmux_pwdn {
+			function = "gpio";
+			pins = "gpio33";
+		};
+		pinconf_pwdn {
+			pins = "gpio33";
+			drive-strength = <16>;
+			bias-disable;
+		};
+
+		pinmux_rst {
+			function = "gpio";
+			pins = "gpio28";
+		};
+		pinconf_rst {
+			pins = "gpio28";
+			drive-strength = <16>;
+			bias-disable;
+		};
+
+		pinmux_mclk1 {
+			function = "cam_mclk1";
+			pins = "gpio27";
+		};
+		pinconf_mclk1 {
+			pins = "gpio27";
+			drive-strength = <16>;
+			bias-disable;
+		};
+	};
+
+	camera_rear_default: camera_rear_default {
+		pinmux_pwdn {
+			function = "gpio";
+			pins = "gpio34";
+		};
+		pinconf_pwdn {
+			pins = "gpio34";
+			drive-strength = <16>;
+			bias-disable;
+		};
+
+		 pinmux_rst {
+			function = "gpio";
+			pins = "gpio35";
+		};
+		pinconf_rst {
+			pins = "gpio35";
+			drive-strength = <16>;
+			bias-disable;
+		};
+
+		pinmux_mclk0 {
+			function = "cam_mclk0";
+			pins = "gpio26";
+		};
+		pinconf_mclk0 {
+			pins = "gpio26";
+			drive-strength = <16>;
+			bias-disable;
 		};
 	};
 };

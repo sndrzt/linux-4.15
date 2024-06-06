@@ -448,6 +448,12 @@ xfs_dio_write_end_io(
 	if (size <= 0)
 		return size;
 
+	/*
+	 * Capture amount written on completion as we can't reliably account
+	 * for it on submission.
+	 */
+	XFS_STATS_ADD(ip->i_mount, xs_write_bytes, size);
+
 	if (flags & IOMAP_DIO_COW) {
 		error = xfs_reflink_end_cow(ip, offset, size);
 		if (error)
@@ -557,6 +563,9 @@ xfs_file_dio_aio_write(
 	}
 
 	if (iocb->ki_flags & IOCB_NOWAIT) {
+		/* unaligned dio always waits, bail */
+		if (unaligned_io)
+			return -EAGAIN;
 		if (!xfs_ilock_nowait(ip, iolock))
 			return -EAGAIN;
 	} else {
@@ -569,18 +578,14 @@ xfs_file_dio_aio_write(
 	count = iov_iter_count(from);
 
 	/*
-	 * If we are doing unaligned IO, wait for all other IO to drain,
-	 * otherwise demote the lock if we had to take the exclusive lock
-	 * for other reasons in xfs_file_aio_write_checks.
+	 * If we are doing unaligned IO, we can't allow any other overlapping IO
+	 * in-flight at the same time or we risk data corruption. Wait for all
+	 * other IO to drain before we submit. If the IO is aligned, demote the
+	 * iolock if we had to take the exclusive lock in
+	 * xfs_file_aio_write_checks() for other reasons.
 	 */
 	if (unaligned_io) {
-		/* If we are going to wait for other DIO to finish, bail */
-		if (iocb->ki_flags & IOCB_NOWAIT) {
-			if (atomic_read(&inode->i_dio_count))
-				return -EAGAIN;
-		} else {
-			inode_dio_wait(inode);
-		}
+		inode_dio_wait(inode);
 	} else if (iolock == XFS_IOLOCK_EXCL) {
 		xfs_ilock_demote(ip, XFS_IOLOCK_EXCL);
 		iolock = XFS_IOLOCK_SHARED;
@@ -588,6 +593,14 @@ xfs_file_dio_aio_write(
 
 	trace_xfs_file_direct_write(ip, count, iocb->ki_pos);
 	ret = iomap_dio_rw(iocb, from, &xfs_iomap_ops, xfs_dio_write_end_io);
+
+	/*
+	 * If unaligned, this is the only IO in-flight. If it has not yet
+	 * completed, wait on it before we release the iolock to prevent
+	 * subsequent overlapping IO.
+	 */
+	if (ret == -EIOCBQUEUED && unaligned_io)
+		inode_dio_wait(inode);
 out:
 	xfs_iunlock(ip, iolock);
 
@@ -633,7 +646,16 @@ xfs_file_dax_write(
 	}
 out:
 	xfs_iunlock(ip, iolock);
-	return error ? error : ret;
+	if (error)
+		return error;
+
+	if (ret > 0) {
+		XFS_STATS_ADD(ip->i_mount, xs_write_bytes, ret);
+
+		/* Handle various SYNC-type writes */
+		ret = generic_write_sync(iocb, ret);
+	}
+	return ret;
 }
 
 STATIC ssize_t
@@ -703,6 +725,12 @@ write_retry:
 out:
 	if (iolock)
 		xfs_iunlock(ip, iolock);
+
+	if (ret > 0) {
+		XFS_STATS_ADD(ip->i_mount, xs_write_bytes, ret);
+		/* Handle various SYNC-type writes */
+		ret = generic_write_sync(iocb, ret);
+	}
 	return ret;
 }
 
@@ -727,8 +755,9 @@ xfs_file_write_iter(
 		return -EIO;
 
 	if (IS_DAX(inode))
-		ret = xfs_file_dax_write(iocb, from);
-	else if (iocb->ki_flags & IOCB_DIRECT) {
+		return xfs_file_dax_write(iocb, from);
+
+	if (iocb->ki_flags & IOCB_DIRECT) {
 		/*
 		 * Allow a directio write to fall back to a buffered
 		 * write *only* in the case that we're doing a reflink
@@ -736,20 +765,11 @@ xfs_file_write_iter(
 		 * allow an operation to fall back to buffered mode.
 		 */
 		ret = xfs_file_dio_aio_write(iocb, from);
-		if (ret == -EREMCHG)
-			goto buffered;
-	} else {
-buffered:
-		ret = xfs_file_buffered_aio_write(iocb, from);
+		if (ret != -EREMCHG)
+			return ret;
 	}
 
-	if (ret > 0) {
-		XFS_STATS_ADD(ip->i_mount, xs_write_bytes, ret);
-
-		/* Handle various SYNC-type writes */
-		ret = generic_write_sync(iocb, ret);
-	}
-	return ret;
+	return xfs_file_buffered_aio_write(iocb, from);
 }
 
 #define	XFS_FALLOC_FL_SUPPORTED						\
@@ -812,22 +832,26 @@ xfs_file_fallocate(
 		if (error)
 			goto out_unlock;
 	} else if (mode & FALLOC_FL_INSERT_RANGE) {
-		unsigned int blksize_mask = i_blocksize(inode) - 1;
+		unsigned int	blksize_mask = i_blocksize(inode) - 1;
+		loff_t		isize = i_size_read(inode);
 
-		new_size = i_size_read(inode) + len;
 		if (offset & blksize_mask || len & blksize_mask) {
 			error = -EINVAL;
 			goto out_unlock;
 		}
 
-		/* check the new inode size does not wrap through zero */
-		if (new_size > inode->i_sb->s_maxbytes) {
+		/*
+		 * New inode size must not exceed ->s_maxbytes, accounting for
+		 * possible signed overflow.
+		 */
+		if (inode->i_sb->s_maxbytes - isize < len) {
 			error = -EFBIG;
 			goto out_unlock;
 		}
+		new_size = isize + len;
 
 		/* Offset should be less than i_size */
-		if (offset >= i_size_read(inode)) {
+		if (offset >= isize) {
 			error = -EINVAL;
 			goto out_unlock;
 		}
@@ -1064,6 +1088,14 @@ __xfs_filemap_fault(
 	return ret;
 }
 
+static inline bool
+xfs_is_write_fault(
+	struct vm_fault		*vmf)
+{
+	return (vmf->flags & FAULT_FLAG_WRITE) &&
+	       (vmf->vma->vm_flags & VM_SHARED);
+}
+
 static int
 xfs_filemap_fault(
 	struct vm_fault		*vmf)
@@ -1071,7 +1103,7 @@ xfs_filemap_fault(
 	/* DAX can shortcut the normal fault path on write faults! */
 	return __xfs_filemap_fault(vmf, PE_SIZE_PTE,
 			IS_DAX(file_inode(vmf->vma->vm_file)) &&
-			(vmf->flags & FAULT_FLAG_WRITE));
+			xfs_is_write_fault(vmf));
 }
 
 static int
@@ -1084,7 +1116,7 @@ xfs_filemap_huge_fault(
 
 	/* DAX can shortcut the normal fault path on write faults! */
 	return __xfs_filemap_fault(vmf, pe_size,
-			(vmf->flags & FAULT_FLAG_WRITE));
+			xfs_is_write_fault(vmf));
 }
 
 static int

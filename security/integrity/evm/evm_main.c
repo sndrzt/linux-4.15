@@ -31,7 +31,7 @@
 int evm_initialized;
 
 static char *integrity_status_msg[] = {
-	"pass", "fail", "no_label", "no_xattrs", "unknown"
+	"pass", "pass_immutable", "fail", "no_label", "no_xattrs", "unknown"
 };
 char *evm_hmac = "hmac(sha1)";
 char *evm_hash = "sha1";
@@ -59,7 +59,7 @@ char *evm_config_xattrnames[] = {
 	NULL
 };
 
-static int evm_fixmode;
+static int evm_fixmode __ro_after_init;
 static int __init evm_set_fixmode(char *str)
 {
 	if (strncmp(str, "fix", 3) == 0)
@@ -123,7 +123,8 @@ static enum integrity_status evm_verify_hmac(struct dentry *dentry,
 	enum integrity_status evm_status = INTEGRITY_PASS;
 	int rc, xattr_len;
 
-	if (iint && iint->evm_status == INTEGRITY_PASS)
+	if (iint && (iint->evm_status == INTEGRITY_PASS ||
+		     iint->evm_status == INTEGRITY_PASS_IMMUTABLE))
 		return iint->evm_status;
 
 	/* if status is not PASS, try to check again - against -ENOMEM */
@@ -164,22 +165,26 @@ static enum integrity_status evm_verify_hmac(struct dentry *dentry,
 			rc = -EINVAL;
 		break;
 	case EVM_IMA_XATTR_DIGSIG:
+	case EVM_XATTR_PORTABLE_DIGSIG:
 		rc = evm_calc_hash(dentry, xattr_name, xattr_value,
-				xattr_value_len, calc.digest);
+				   xattr_value_len, xattr_data->type,
+				   calc.digest);
 		if (rc)
 			break;
 		rc = integrity_digsig_verify(INTEGRITY_KEYRING_EVM,
 					(const char *)xattr_data, xattr_len,
 					calc.digest, sizeof(calc.digest));
 		if (!rc) {
-			/* Replace RSA with HMAC if not mounted readonly and
-			 * not immutable
-			 */
-			if (!IS_RDONLY(d_backing_inode(dentry)) &&
-			    !IS_IMMUTABLE(d_backing_inode(dentry)))
+			if (xattr_data->type == EVM_XATTR_PORTABLE_DIGSIG) {
+				if (iint)
+					iint->flags |= EVM_IMMUTABLE_DIGSIG;
+				evm_status = INTEGRITY_PASS_IMMUTABLE;
+			} else if (!IS_RDONLY(d_backing_inode(dentry)) &&
+				   !IS_IMMUTABLE(d_backing_inode(dentry))) {
 				evm_update_evmxattr(dentry, xattr_name,
 						    xattr_value,
 						    xattr_value_len);
+			}
 		}
 		break;
 	default:
@@ -280,7 +285,7 @@ static enum integrity_status evm_verify_current_integrity(struct dentry *dentry)
  * affect security.evm.  An interesting side affect of writing posix xattr
  * acls is their modifying of the i_mode, which is included in security.evm.
  * For posix xattr acls only, permit security.evm, even if it currently
- * doesn't exist, to be updated.
+ * doesn't exist, to be updated unless the EVM signature is immutable.
  */
 static int evm_protect_xattr(struct dentry *dentry, const char *xattr_name,
 			     const void *xattr_value, size_t xattr_value_len)
@@ -348,7 +353,8 @@ int evm_inode_setxattr(struct dentry *dentry, const char *xattr_name,
 	if (strcmp(xattr_name, XATTR_NAME_EVM) == 0) {
 		if (!xattr_value_len)
 			return -EINVAL;
-		if (xattr_data->type != EVM_IMA_XATTR_DIGSIG)
+		if (xattr_data->type != EVM_IMA_XATTR_DIGSIG &&
+		    xattr_data->type != EVM_XATTR_PORTABLE_DIGSIG)
 			return -EPERM;
 	}
 	return evm_protect_xattr(dentry, xattr_name, xattr_value,
@@ -425,6 +431,9 @@ void evm_inode_post_removexattr(struct dentry *dentry, const char *xattr_name)
 /**
  * evm_inode_setattr - prevent updating an invalid EVM extended attribute
  * @dentry: pointer to the affected dentry
+ *
+ * Permit update of file attributes when files have a valid EVM signature,
+ * except in the case of them having an immutable portable signature.
  */
 int evm_inode_setattr(struct dentry *dentry, struct iattr *attr)
 {
@@ -464,7 +473,7 @@ void evm_inode_post_setattr(struct dentry *dentry, int ia_valid)
 }
 
 /*
- * evm_inode_init_security - initializes security.evm
+ * evm_inode_init_security - initializes security.evm HMAC value
  */
 int evm_inode_init_security(struct inode *inode,
 				 const struct xattr *lsm_xattr,
@@ -473,7 +482,8 @@ int evm_inode_init_security(struct inode *inode,
 	struct evm_ima_xattr_data *xattr_data;
 	int rc;
 
-	if (!evm_initialized || !evm_protected_xattr(lsm_xattr->name))
+	if (!(evm_initialized & EVM_INIT_HMAC) ||
+	    !evm_protected_xattr(lsm_xattr->name))
 		return 0;
 
 	xattr_data = kzalloc(sizeof(*xattr_data), GFP_NOFS);

@@ -1000,7 +1000,7 @@ static int qcom_smd_create_device(struct qcom_smd_channel *channel)
 
 	/* Assign public information to the rpmsg_device */
 	rpdev = &qsdev->rpdev;
-	strncpy(rpdev->id.name, channel->name, RPMSG_NAME_SIZE);
+	strscpy_pad(rpdev->id.name, channel->name, RPMSG_NAME_SIZE);
 	rpdev->src = RPMSG_ADDR_ANY;
 	rpdev->dst = RPMSG_ADDR_ANY;
 
@@ -1043,14 +1043,16 @@ static struct qcom_smd_channel *qcom_smd_create_channel(struct qcom_smd_edge *ed
 	void *info;
 	int ret;
 
-	channel = devm_kzalloc(&edge->dev, sizeof(*channel), GFP_KERNEL);
+	channel = kzalloc(sizeof(*channel), GFP_KERNEL);
 	if (!channel)
 		return ERR_PTR(-ENOMEM);
 
 	channel->edge = edge;
-	channel->name = devm_kstrdup(&edge->dev, name, GFP_KERNEL);
-	if (!channel->name)
-		return ERR_PTR(-ENOMEM);
+	channel->name = kstrdup(name, GFP_KERNEL);
+	if (!channel->name) {
+		ret = -ENOMEM;
+		goto free_channel;
+	}
 
 	mutex_init(&channel->tx_lock);
 	spin_lock_init(&channel->recv_lock);
@@ -1098,8 +1100,9 @@ static struct qcom_smd_channel *qcom_smd_create_channel(struct qcom_smd_edge *ed
 	return channel;
 
 free_name_and_channel:
-	devm_kfree(&edge->dev, channel->name);
-	devm_kfree(&edge->dev, channel);
+	kfree(channel->name);
+free_channel:
+	kfree(channel);
 
 	return ERR_PTR(ret);
 }
@@ -1227,7 +1230,7 @@ static void qcom_channel_state_worker(struct work_struct *work)
 
 		spin_unlock_irqrestore(&edge->channels_lock, flags);
 
-		strncpy(chinfo.name, channel->name, sizeof(chinfo.name));
+		strscpy_pad(chinfo.name, channel->name, sizeof(chinfo.name));
 		chinfo.src = RPMSG_ADDR_ANY;
 		chinfo.dst = RPMSG_ADDR_ANY;
 		rpmsg_unregister_device(&edge->dev, &chinfo);
@@ -1261,7 +1264,7 @@ static int qcom_smd_parse_edge(struct device *dev,
 	ret = of_property_read_u32(node, key, &edge->edge_id);
 	if (ret) {
 		dev_err(dev, "edge missing %s property\n", key);
-		return -EINVAL;
+		goto put_node;
 	}
 
 	edge->remote_pid = QCOM_SMEM_HOST_ANY;
@@ -1271,24 +1274,28 @@ static int qcom_smd_parse_edge(struct device *dev,
 	syscon_np = of_parse_phandle(node, "qcom,ipc", 0);
 	if (!syscon_np) {
 		dev_err(dev, "no qcom,ipc node\n");
-		return -ENODEV;
+		ret = -ENODEV;
+		goto put_node;
 	}
 
 	edge->ipc_regmap = syscon_node_to_regmap(syscon_np);
-	if (IS_ERR(edge->ipc_regmap))
-		return PTR_ERR(edge->ipc_regmap);
+	of_node_put(syscon_np);
+	if (IS_ERR(edge->ipc_regmap)) {
+		ret = PTR_ERR(edge->ipc_regmap);
+		goto put_node;
+	}
 
 	key = "qcom,ipc";
 	ret = of_property_read_u32_index(node, key, 1, &edge->ipc_offset);
 	if (ret < 0) {
 		dev_err(dev, "no offset in %s\n", key);
-		return -EINVAL;
+		goto put_node;
 	}
 
 	ret = of_property_read_u32_index(node, key, 2, &edge->ipc_bit);
 	if (ret < 0) {
 		dev_err(dev, "no bit in %s\n", key);
-		return -EINVAL;
+		goto put_node;
 	}
 
 	ret = of_property_read_string(node, "label", &edge->name);
@@ -1296,9 +1303,10 @@ static int qcom_smd_parse_edge(struct device *dev,
 		edge->name = node->name;
 
 	irq = irq_of_parse_and_map(node, 0);
-	if (irq < 0) {
+	if (!irq) {
 		dev_err(dev, "required smd interrupt missing\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto put_node;
 	}
 
 	ret = devm_request_irq(dev, irq,
@@ -1306,12 +1314,18 @@ static int qcom_smd_parse_edge(struct device *dev,
 			       node->name, edge);
 	if (ret) {
 		dev_err(dev, "failed to request smd irq\n");
-		return ret;
+		goto put_node;
 	}
 
 	edge->irq = irq;
 
 	return 0;
+
+put_node:
+	of_node_put(node);
+	edge->of_node = NULL;
+
+	return ret;
 }
 
 /*
@@ -1320,13 +1334,13 @@ static int qcom_smd_parse_edge(struct device *dev,
  */
 static void qcom_smd_edge_release(struct device *dev)
 {
-	struct qcom_smd_channel *channel;
+	struct qcom_smd_channel *channel, *tmp;
 	struct qcom_smd_edge *edge = to_smd_edge(dev);
 
-	list_for_each_entry(channel, &edge->channels, list) {
-		SET_RX_CHANNEL_INFO(channel, state, SMD_CHANNEL_CLOSED);
-		SET_RX_CHANNEL_INFO(channel, head, 0);
-		SET_RX_CHANNEL_INFO(channel, tail, 0);
+	list_for_each_entry_safe(channel, tmp, &edge->channels, list) {
+		list_del(&channel->list);
+		kfree(channel->name);
+		kfree(channel);
 	}
 
 	kfree(edge);

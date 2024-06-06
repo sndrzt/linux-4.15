@@ -31,6 +31,7 @@
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/nospec.h>
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
 #include <linux/spinlock.h>
@@ -167,7 +168,7 @@ static void dvb_ca_private_free(struct dvb_ca_private *ca)
 {
 	unsigned int i;
 
-	dvb_free_device(ca->dvbdev);
+	dvb_device_put(ca->dvbdev);
 	for (i = 0; i < ca->slot_count; i++)
 		vfree(ca->slot_info[i].rx_buffer.data);
 
@@ -1473,6 +1474,10 @@ static ssize_t dvb_ca_en50221_io_write(struct file *file,
 		return -EFAULT;
 	buf += 2;
 	count -= 2;
+
+	if (slot >= ca->slot_count)
+		return -EINVAL;
+	slot = array_index_nospec(slot, ca->slot_count);
 	sl = &ca->slot_info[slot];
 
 	/* check if the slot is actually running */

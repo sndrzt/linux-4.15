@@ -23,6 +23,7 @@
  *
  */
 
+#include <linux/delay.h>
 #include "dm_services.h"
 #include "core_types.h"
 #include "resource.h"
@@ -376,10 +377,34 @@ static void enable_power_gating_plane(
 static void disable_vga(
 	struct dce_hwseq *hws)
 {
+	unsigned int in_vga1_mode = 0;
+	unsigned int in_vga2_mode = 0;
+	unsigned int in_vga3_mode = 0;
+	unsigned int in_vga4_mode = 0;
+
+	REG_GET(D1VGA_CONTROL, D1VGA_MODE_ENABLE, &in_vga1_mode);
+	REG_GET(D2VGA_CONTROL, D2VGA_MODE_ENABLE, &in_vga2_mode);
+	REG_GET(D3VGA_CONTROL, D3VGA_MODE_ENABLE, &in_vga3_mode);
+	REG_GET(D4VGA_CONTROL, D4VGA_MODE_ENABLE, &in_vga4_mode);
+
+	if (in_vga1_mode == 0 && in_vga2_mode == 0 &&
+			in_vga3_mode == 0 && in_vga4_mode == 0)
+		return;
+
 	REG_WRITE(D1VGA_CONTROL, 0);
 	REG_WRITE(D2VGA_CONTROL, 0);
 	REG_WRITE(D3VGA_CONTROL, 0);
 	REG_WRITE(D4VGA_CONTROL, 0);
+
+	/* HW Engineer's Notes:
+	 *  During switch from vga->extended, if we set the VGA_TEST_ENABLE and
+	 *  then hit the VGA_TEST_RENDER_START, then the DCHUBP timing gets updated correctly.
+	 *
+	 *  Then vBIOS will have it poll for the VGA_TEST_RENDER_DONE and unset
+	 *  VGA_TEST_ENABLE, to leave it in the same state as before.
+	 */
+	REG_UPDATE(VGA_TEST_CONTROL, VGA_TEST_ENABLE, 1);
+	REG_UPDATE(VGA_TEST_CONTROL, VGA_TEST_RENDER_START, 1);
 }
 
 static void dpp_pg_control(
@@ -894,6 +919,9 @@ static void dcn10_init_hw(struct dc *dc)
 		 * default signal on connector).
 		 */
 		struct dc_link *link = dc->links[i];
+
+		if (link->link_enc->connector.id == CONNECTOR_ID_EDP)
+			dc->hwss.edp_power_control(link, true);
 
 		link->link_enc->funcs->hw_init(link->link_enc);
 	}
@@ -2932,6 +2960,7 @@ static const struct hw_sequencer_funcs dcn10_funcs = {
 	.enable_stream = dce110_enable_stream,
 	.disable_stream = dce110_disable_stream,
 	.unblank_stream = dce110_unblank_stream,
+	.blank_stream = dce110_blank_stream,
 	.enable_display_power_gating = dcn10_dummy_display_power_gating,
 	.power_down_front_end = dcn10_power_down_fe,
 	.power_on_front_end = dcn10_power_on_fe,
@@ -2949,7 +2978,8 @@ static const struct hw_sequencer_funcs dcn10_funcs = {
 	.ready_shared_resources = ready_shared_resources,
 	.optimize_shared_resources = optimize_shared_resources,
 	.edp_backlight_control = hwss_edp_backlight_control,
-	.edp_power_control = hwss_edp_power_control
+	.edp_power_control = hwss_edp_power_control,
+	.edp_wait_for_hpd_ready = hwss_edp_wait_for_hpd_ready,
 };
 
 

@@ -75,7 +75,7 @@ config NF_CONNTRACK_MARK
 config NF_CONNTRACK_SECMARK
 	bool  'Connection tracking security mark support'
 	depends on NETWORK_SECMARK
-	default m if NETFILTER_ADVANCED=n
+	default y if NETFILTER_ADVANCED=n
 	help
 	  This option enables security markings to be applied to
 	  connections.  Typically they are copied to connections from
@@ -100,7 +100,6 @@ config NF_CONNTRACK_ZONES
 
 config NF_CONNTRACK_PROCFS
 	bool "Supply CT list in procfs (OBSOLETE)"
-	default y
 	depends on PROC_FS
 	---help---
 	This option enables for the list of known conntrack entries
@@ -718,13 +717,13 @@ config NETFILTER_XT_TARGET_CHECKSUM
 	depends on NETFILTER_ADVANCED
 	---help---
 	  This option adds a `CHECKSUM' target, which can be used in the iptables mangle
-	  table.
+	  table to work around buggy DHCP clients in virtualized environments.
 
-	  You can use this target to compute and fill in the checksum in
-	  a packet that lacks a checksum.  This is particularly useful,
-	  if you need to work around old applications such as dhcp clients,
-	  that do not work well with checksum offloads, but don't want to disable
-	  checksum offload in your device.
+	  Some old DHCP clients drop packets because they are not aware
+	  that the checksum would normally be offloaded to hardware and
+	  thus should be considered valid.
+	  This target can be used to fill in the checksum using iptables
+	  when such packets are sent via a virtual network device.
 
 	  To compile it as a module, choose M here.  If unsure, say N.
 

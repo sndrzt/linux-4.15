@@ -49,7 +49,7 @@ static struct dsa_switch_tree *dsa_tree_alloc(int index)
 	dst->index = index;
 
 	INIT_LIST_HEAD(&dst->list);
-	list_add_tail(&dsa_tree_list, &dst->list);
+	list_add_tail(&dst->list, &dsa_tree_list);
 
 	kref_init(&dst->refcount);
 
@@ -258,11 +258,14 @@ static void dsa_tree_teardown_default_cpu(struct dsa_switch_tree *dst)
 static int dsa_port_setup(struct dsa_port *dp)
 {
 	struct dsa_switch *ds = dp->ds;
-	int err;
+	int err = 0;
 
 	memset(&dp->devlink_port, 0, sizeof(dp->devlink_port));
+	dp->mac = of_get_mac_address(dp->dn);
 
-	err = devlink_port_register(ds->devlink, &dp->devlink_port, dp->index);
+	if (dp->type != DSA_PORT_TYPE_UNUSED)
+		err = devlink_port_register(ds->devlink, &dp->devlink_port,
+					    dp->index);
 	if (err)
 		return err;
 
@@ -294,7 +297,8 @@ static int dsa_port_setup(struct dsa_port *dp)
 
 static void dsa_port_teardown(struct dsa_port *dp)
 {
-	devlink_port_unregister(&dp->devlink_port);
+	if (dp->type != DSA_PORT_TYPE_UNUSED)
+		devlink_port_unregister(&dp->devlink_port);
 
 	switch (dp->type) {
 	case DSA_PORT_TYPE_UNUSED:
@@ -386,7 +390,7 @@ static int dsa_tree_setup_switches(struct dsa_switch_tree *dst)
 
 		err = dsa_switch_setup(ds);
 		if (err)
-			return err;
+			continue;
 
 		for (port = 0; port < ds->num_ports; port++) {
 			dp = &ds->ports[port];
@@ -569,6 +573,7 @@ static int dsa_port_parse_of(struct dsa_port *dp, struct device_node *dn)
 		struct net_device *master;
 
 		master = of_find_net_device_by_node(ethernet);
+		of_node_put(ethernet);
 		if (!master)
 			return -EPROBE_DEFER;
 

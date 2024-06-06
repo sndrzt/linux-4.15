@@ -151,6 +151,8 @@ void drm_atomic_state_default_clear(struct drm_atomic_state *state)
 						       state->connectors[i].state);
 		state->connectors[i].ptr = NULL;
 		state->connectors[i].state = NULL;
+		state->connectors[i].old_state = NULL;
+		state->connectors[i].new_state = NULL;
 		drm_connector_put(connector);
 	}
 
@@ -165,6 +167,13 @@ void drm_atomic_state_default_clear(struct drm_atomic_state *state)
 
 		state->crtcs[i].ptr = NULL;
 		state->crtcs[i].state = NULL;
+		state->crtcs[i].old_state = NULL;
+		state->crtcs[i].new_state = NULL;
+
+		if (state->crtcs[i].commit) {
+			drm_crtc_commit_put(state->crtcs[i].commit);
+			state->crtcs[i].commit = NULL;
+		}
 	}
 
 	for (i = 0; i < config->num_total_plane; i++) {
@@ -177,6 +186,8 @@ void drm_atomic_state_default_clear(struct drm_atomic_state *state)
 						   state->planes[i].state);
 		state->planes[i].ptr = NULL;
 		state->planes[i].state = NULL;
+		state->planes[i].old_state = NULL;
+		state->planes[i].new_state = NULL;
 	}
 
 	for (i = 0; i < state->num_private_objs; i++) {
@@ -186,6 +197,8 @@ void drm_atomic_state_default_clear(struct drm_atomic_state *state)
 						 state->private_objs[i].state);
 		state->private_objs[i].ptr = NULL;
 		state->private_objs[i].state = NULL;
+		state->private_objs[i].old_state = NULL;
+		state->private_objs[i].new_state = NULL;
 	}
 	state->num_private_objs = 0;
 
@@ -1341,7 +1354,9 @@ drm_atomic_set_crtc_for_plane(struct drm_plane_state *plane_state,
 {
 	struct drm_plane *plane = plane_state->plane;
 	struct drm_crtc_state *crtc_state;
-
+	/* Nothing to do for same crtc*/
+	if (plane_state->crtc == crtc)
+		return 0;
 	if (plane_state->crtc) {
 		crtc_state = drm_atomic_get_crtc_state(plane_state->state,
 						       plane_state->crtc);

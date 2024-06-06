@@ -257,7 +257,7 @@ void ovl_inode_init(struct inode *inode, struct dentry *upperdentry,
 	if (upperdentry)
 		OVL_I(inode)->__upperdentry = upperdentry;
 	if (lowerdentry)
-		OVL_I(inode)->lower = d_inode(lowerdentry);
+		OVL_I(inode)->lower = igrab(d_inode(lowerdentry));
 
 	ovl_copyattr(d_inode(upperdentry ?: lowerdentry), inode);
 }
@@ -273,7 +273,7 @@ void ovl_inode_update(struct inode *inode, struct dentry *upperdentry)
 	 */
 	smp_wmb();
 	OVL_I(inode)->__upperdentry = upperdentry;
-	if (!S_ISDIR(upperinode->i_mode) && inode_unhashed(inode)) {
+	if (inode_unhashed(inode)) {
 		inode->i_private = upperinode;
 		__insert_inode_hash(inode, (unsigned long) upperinode);
 	}
@@ -311,7 +311,32 @@ bool ovl_is_whiteout(struct dentry *dentry)
 
 struct file *ovl_path_open(struct path *path, int flags)
 {
-	return dentry_open(path, flags | O_NOATIME, current_cred());
+	struct inode *inode = d_inode(path->dentry);
+	int err, acc_mode;
+
+	if (flags & ~(O_ACCMODE | O_LARGEFILE))
+		BUG();
+
+	switch (flags & O_ACCMODE) {
+	case O_RDONLY:
+		acc_mode = MAY_READ;
+		break;
+	case O_WRONLY:
+		acc_mode = MAY_WRITE;
+		break;
+	default:
+		BUG();
+	}
+
+	err = inode_permission(inode, acc_mode | MAY_OPEN);
+	if (err)
+		return ERR_PTR(err);
+
+	/* O_NOATIME is an optimization, don't fail if not permitted */
+	if (inode_owner_or_capable(inode))
+		flags |= O_NOATIME;
+
+	return dentry_open(path, flags, current_cred());
 }
 
 int ovl_copy_up_start(struct dentry *dentry)
@@ -455,7 +480,7 @@ static void ovl_cleanup_index(struct dentry *dentry)
 	struct dentry *upperdentry = ovl_dentry_upper(dentry);
 	struct dentry *index = NULL;
 	struct inode *inode;
-	struct qstr name;
+	struct qstr name = { };
 	int err;
 
 	err = ovl_get_index_name(lowerdentry, &name);
@@ -494,6 +519,7 @@ static void ovl_cleanup_index(struct dentry *dentry)
 		goto fail;
 
 out:
+	kfree(name.name);
 	dput(index);
 	return;
 

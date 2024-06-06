@@ -421,6 +421,8 @@ int arch_setup_msi_irqs(struct pci_dev *pdev, int nvec, int type)
 	hwirq = 0;
 	for_each_pci_msi_entry(msi, pdev) {
 		rc = -EIO;
+		if (hwirq >= msi_vecs)
+			break;
 		irq = irq_alloc_desc(0);	/* Alloc irq on node 0 */
 		if (irq < 0)
 			return -ENOMEM;
@@ -1000,5 +1002,5 @@ subsys_initcall_sync(pci_base_init);
 void zpci_rescan(void)
 {
 	if (zpci_is_enabled())
-		clp_rescan_pci_devices_simple();
+		clp_rescan_pci_devices_simple(NULL);
 }

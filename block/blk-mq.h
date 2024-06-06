@@ -28,7 +28,7 @@ struct blk_mq_ctx {
 } ____cacheline_aligned_in_smp;
 
 void blk_mq_freeze_queue(struct request_queue *q);
-void blk_mq_free_queue(struct request_queue *q);
+void blk_mq_exit_queue(struct request_queue *q);
 int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
 void blk_mq_wake_waiters(struct request_queue *q);
 bool blk_mq_dispatch_rq_list(struct request_queue *, struct list_head *, bool);
@@ -59,6 +59,11 @@ void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 void blk_mq_request_bypass_insert(struct request *rq, bool run_queue);
 void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
 				struct list_head *list);
+
+/* Used by blk_insert_cloned_request() to issue request directly */
+blk_status_t blk_mq_request_issue_directly(struct request *rq);
+void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
+				    struct list_head *list);
 
 /*
  * CPU -> queue mappings
@@ -137,7 +142,9 @@ static inline bool blk_mq_hw_queue_mapped(struct blk_mq_hw_ctx *hctx)
 }
 
 void blk_mq_in_flight(struct request_queue *q, struct hd_struct *part,
-			unsigned int inflight[2]);
+		      unsigned int inflight[2]);
+void blk_mq_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+			 unsigned int inflight[2]);
 
 static inline void blk_mq_put_dispatch_budget(struct blk_mq_hw_ctx *hctx)
 {

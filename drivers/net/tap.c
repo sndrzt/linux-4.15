@@ -330,9 +330,6 @@ rx_handler_result_t tap_handle_frame(struct sk_buff **pskb)
 	if (!q)
 		return RX_HANDLER_PASS;
 
-	if (__skb_array_full(&q->skb_array))
-		goto drop;
-
 	skb_push(skb, ETH_HLEN);
 
 	/* Apply the forward feature mask so that we perform segmentation
@@ -777,13 +774,16 @@ static ssize_t tap_put_user(struct tap_queue *q,
 	int total;
 
 	if (q->flags & IFF_VNET_HDR) {
+		int vlan_hlen = skb_vlan_tag_present(skb) ? VLAN_HLEN : 0;
 		struct virtio_net_hdr vnet_hdr;
+
 		vnet_hdr_len = READ_ONCE(q->vnet_hdr_sz);
 		if (iov_iter_count(iter) < vnet_hdr_len)
 			return -EINVAL;
 
 		if (virtio_net_hdr_from_skb(skb, &vnet_hdr,
-					    tap_is_little_endian(q), true))
+					    tap_is_little_endian(q), true,
+					    vlan_hlen))
 			BUG();
 
 		if (copy_to_iter(&vnet_hdr, sizeof(vnet_hdr), iter) !=

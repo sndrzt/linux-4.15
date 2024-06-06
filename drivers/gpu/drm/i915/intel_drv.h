@@ -207,6 +207,16 @@ struct intel_fbdev {
 	struct i915_vma *vma;
 	async_cookie_t cookie;
 	int preferred_bpp;
+
+	/* Whether or not fbdev hpd processing is temporarily suspended */
+	bool hpd_suspended : 1;
+	/* Set when a hotplug was received while HPD processing was
+	 * suspended
+	 */
+	bool hpd_waiting : 1;
+
+	/* Protects hpd_suspended */
+	struct mutex hpd_lock;
 };
 
 struct intel_encoder {
@@ -265,7 +275,6 @@ struct intel_encoder {
 
 struct intel_panel {
 	struct drm_display_mode *fixed_mode;
-	struct drm_display_mode *alt_fixed_mode;
 	struct drm_display_mode *downclock_mode;
 
 	/* backlight */
@@ -369,6 +378,11 @@ struct intel_atomic_state {
 		 * state only when all crtc's are DPMS off.
 		 */
 		struct intel_cdclk_state actual;
+
+		int force_min_cdclk;
+		bool force_min_cdclk_changed;
+		/* pipe to which cd2x update is synchronized */
+		enum pipe pipe;
 	} cdclk;
 
 	bool dpll_set, modeset;
@@ -1275,8 +1289,7 @@ void intel_ddi_init(struct drm_i915_private *dev_priv, enum port port);
 enum port intel_ddi_get_encoder_port(struct intel_encoder *intel_encoder);
 bool intel_ddi_get_hw_state(struct intel_encoder *encoder, enum pipe *pipe);
 void intel_ddi_enable_transcoder_func(const struct intel_crtc_state *crtc_state);
-void intel_ddi_disable_transcoder_func(struct drm_i915_private *dev_priv,
-				       enum transcoder cpu_transcoder);
+void intel_ddi_disable_transcoder_func(const struct intel_crtc_state *crtc_state);
 void intel_ddi_enable_pipe_clock(const struct intel_crtc_state *crtc_state);
 void intel_ddi_disable_pipe_clock(const  struct intel_crtc_state *crtc_state);
 struct intel_encoder *
@@ -1325,9 +1338,20 @@ void intel_update_cdclk(struct drm_i915_private *dev_priv);
 void intel_update_rawclk(struct drm_i915_private *dev_priv);
 bool intel_cdclk_state_compare(const struct intel_cdclk_state *a,
 			       const struct intel_cdclk_state *b);
-void intel_set_cdclk(struct drm_i915_private *dev_priv,
-		     const struct intel_cdclk_state *cdclk_state);
-
+bool intel_cdclk_needs_cd2x_update(struct drm_i915_private *dev_priv,
+				   const struct intel_cdclk_state *a,
+				   const struct intel_cdclk_state *b);
+void intel_cdclk_swap_state(struct intel_atomic_state *state);
+void
+intel_set_cdclk_pre_plane_update(struct drm_i915_private *dev_priv,
+				 const struct intel_cdclk_state *old_state,
+				 const struct intel_cdclk_state *new_state,
+				 enum pipe pipe);
+void
+intel_set_cdclk_post_plane_update(struct drm_i915_private *dev_priv,
+				  const struct intel_cdclk_state *old_state,
+				  const struct intel_cdclk_state *new_state,
+				  enum pipe pipe);
 /* intel_display.c */
 void i830_enable_pipe(struct drm_i915_private *dev_priv, enum pipe pipe);
 void i830_disable_pipe(struct drm_i915_private *dev_priv, enum pipe pipe);
@@ -1708,7 +1732,6 @@ void intel_overlay_reset(struct drm_i915_private *dev_priv);
 /* intel_panel.c */
 int intel_panel_init(struct intel_panel *panel,
 		     struct drm_display_mode *fixed_mode,
-		     struct drm_display_mode *alt_fixed_mode,
 		     struct drm_display_mode *downclock_mode);
 void intel_panel_fini(struct intel_panel *panel);
 void intel_fixed_panel_mode(const struct drm_display_mode *fixed_mode,
@@ -1872,6 +1895,9 @@ void intel_enable_gt_powersave(struct drm_i915_private *dev_priv);
 void intel_autoenable_gt_powersave(struct drm_i915_private *dev_priv);
 void intel_disable_gt_powersave(struct drm_i915_private *dev_priv);
 void intel_suspend_gt_powersave(struct drm_i915_private *dev_priv);
+bool i915_rc6_ctx_wa_check(struct drm_i915_private *i915);
+void i915_rc6_ctx_wa_suspend(struct drm_i915_private *i915);
+void i915_rc6_ctx_wa_resume(struct drm_i915_private *i915);
 void gen6_rps_busy(struct drm_i915_private *dev_priv);
 void gen6_rps_reset_ei(struct drm_i915_private *dev_priv);
 void gen6_rps_idle(struct drm_i915_private *dev_priv);

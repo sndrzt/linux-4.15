@@ -582,6 +582,7 @@ struct clock_source *dce80_clock_source_create(
 		return &clk_src->base;
 	}
 
+	kfree(clk_src);
 	BREAK_TO_DEBUGGER();
 	return NULL;
 }
@@ -900,6 +901,7 @@ static bool dce80_construct(
 	}
 
 	dc->caps.max_planes =  pool->base.pipe_count;
+	dc->caps.disable_dp_clk_share = true;
 
 	if (!resource_construct(num_virtual_links, dc, &pool->base,
 			&res_create_funcs))
@@ -1064,6 +1066,7 @@ static bool dce81_construct(
 	}
 
 	dc->caps.max_planes =  pool->base.pipe_count;
+	dc->caps.disable_dp_clk_share = true;
 
 	if (!resource_construct(num_virtual_links, dc, &pool->base,
 			&res_create_funcs))
@@ -1224,6 +1227,7 @@ static bool dce83_construct(
 	}
 
 	dc->caps.max_planes =  pool->base.pipe_count;
+	dc->caps.disable_dp_clk_share = true;
 
 	if (!resource_construct(num_virtual_links, dc, &pool->base,
 			&res_create_funcs))

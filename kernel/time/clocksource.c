@@ -119,6 +119,16 @@ static DEFINE_SPINLOCK(watchdog_lock);
 static int watchdog_running;
 static atomic_t watchdog_reset_pending;
 
+static void inline clocksource_watchdog_lock(unsigned long *flags)
+{
+	spin_lock_irqsave(&watchdog_lock, *flags);
+}
+
+static void inline clocksource_watchdog_unlock(unsigned long *flags)
+{
+	spin_unlock_irqrestore(&watchdog_lock, *flags);
+}
+
 static int clocksource_watchdog_kthread(void *data);
 static void __clocksource_change_rating(struct clocksource *cs, int rating);
 
@@ -142,9 +152,19 @@ static void __clocksource_unstable(struct clocksource *cs)
 	cs->flags &= ~(CLOCK_SOURCE_VALID_FOR_HRES | CLOCK_SOURCE_WATCHDOG);
 	cs->flags |= CLOCK_SOURCE_UNSTABLE;
 
+	/*
+	 * If the clocksource is registered clocksource_watchdog_kthread() will
+	 * re-rate and re-select.
+	 */
+	if (list_empty(&cs->list)) {
+		cs->rating = 0;
+		return;
+	}
+
 	if (cs->mark_unstable)
 		cs->mark_unstable(cs);
 
+	/* kick clocksource_watchdog_kthread() */
 	if (finished_booting)
 		schedule_work(&watchdog_work);
 }
@@ -164,7 +184,7 @@ void clocksource_mark_unstable(struct clocksource *cs)
 
 	spin_lock_irqsave(&watchdog_lock, flags);
 	if (!(cs->flags & CLOCK_SOURCE_UNSTABLE)) {
-		if (list_empty(&cs->wd_list))
+		if (!list_empty(&cs->list) && list_empty(&cs->wd_list))
 			list_add(&cs->wd_list, &watchdog_list);
 		__clocksource_unstable(cs);
 	}
@@ -280,8 +300,15 @@ static void clocksource_watchdog(struct timer_list *unused)
 	next_cpu = cpumask_next(raw_smp_processor_id(), cpu_online_mask);
 	if (next_cpu >= nr_cpu_ids)
 		next_cpu = cpumask_first(cpu_online_mask);
-	watchdog_timer.expires += WATCHDOG_INTERVAL;
-	add_timer_on(&watchdog_timer, next_cpu);
+
+	/*
+	 * Arm timer if not already pending: could race with concurrent
+	 * pair clocksource_stop_watchdog() clocksource_start_watchdog().
+	 */
+	if (!timer_pending(&watchdog_timer)) {
+		watchdog_timer.expires += WATCHDOG_INTERVAL;
+		add_timer_on(&watchdog_timer, next_cpu);
+	}
 out:
 	spin_unlock(&watchdog_lock);
 }
@@ -319,9 +346,8 @@ static void clocksource_resume_watchdog(void)
 
 static void clocksource_enqueue_watchdog(struct clocksource *cs)
 {
-	unsigned long flags;
+	INIT_LIST_HEAD(&cs->wd_list);
 
-	spin_lock_irqsave(&watchdog_lock, flags);
 	if (cs->flags & CLOCK_SOURCE_MUST_VERIFY) {
 		/* cs is a clocksource to be watched. */
 		list_add(&cs->wd_list, &watchdog_list);
@@ -331,7 +357,6 @@ static void clocksource_enqueue_watchdog(struct clocksource *cs)
 		if (cs->flags & CLOCK_SOURCE_IS_CONTINUOUS)
 			cs->flags |= CLOCK_SOURCE_VALID_FOR_HRES;
 	}
-	spin_unlock_irqrestore(&watchdog_lock, flags);
 }
 
 static void clocksource_select_watchdog(bool fallback)
@@ -373,9 +398,6 @@ static void clocksource_select_watchdog(bool fallback)
 
 static void clocksource_dequeue_watchdog(struct clocksource *cs)
 {
-	unsigned long flags;
-
-	spin_lock_irqsave(&watchdog_lock, flags);
 	if (cs != watchdog) {
 		if (cs->flags & CLOCK_SOURCE_MUST_VERIFY) {
 			/* cs is a watched clocksource. */
@@ -384,21 +406,19 @@ static void clocksource_dequeue_watchdog(struct clocksource *cs)
 			clocksource_stop_watchdog();
 		}
 	}
-	spin_unlock_irqrestore(&watchdog_lock, flags);
 }
 
 static int __clocksource_watchdog_kthread(void)
 {
 	struct clocksource *cs, *tmp;
 	unsigned long flags;
-	LIST_HEAD(unstable);
 	int select = 0;
 
 	spin_lock_irqsave(&watchdog_lock, flags);
 	list_for_each_entry_safe(cs, tmp, &watchdog_list, wd_list) {
 		if (cs->flags & CLOCK_SOURCE_UNSTABLE) {
 			list_del_init(&cs->wd_list);
-			list_add(&cs->wd_list, &unstable);
+			__clocksource_change_rating(cs, 0);
 			select = 1;
 		}
 		if (cs->flags & CLOCK_SOURCE_RESELECT) {
@@ -410,11 +430,6 @@ static int __clocksource_watchdog_kthread(void)
 	clocksource_stop_watchdog();
 	spin_unlock_irqrestore(&watchdog_lock, flags);
 
-	/* Needs to be done outside of watchdog lock */
-	list_for_each_entry_safe(cs, tmp, &unstable, wd_list) {
-		list_del_init(&cs->wd_list);
-		__clocksource_change_rating(cs, 0);
-	}
 	return select;
 }
 
@@ -446,6 +461,9 @@ static inline void clocksource_resume_watchdog(void) { }
 static inline int __clocksource_watchdog_kthread(void) { return 0; }
 static bool clocksource_is_watchdog(struct clocksource *cs) { return false; }
 void clocksource_mark_unstable(struct clocksource *cs) { }
+
+static inline void clocksource_watchdog_lock(unsigned long *flags) { }
+static inline void clocksource_watchdog_unlock(unsigned long *flags) { }
 
 #endif /* CONFIG_CLOCKSOURCE_WATCHDOG */
 
@@ -775,14 +793,19 @@ EXPORT_SYMBOL_GPL(__clocksource_update_freq_scale);
  */
 int __clocksource_register_scale(struct clocksource *cs, u32 scale, u32 freq)
 {
+	unsigned long flags;
 
 	/* Initialize mult/shift and max_idle_ns */
 	__clocksource_update_freq_scale(cs, scale, freq);
 
 	/* Add clocksource to the clocksource list */
 	mutex_lock(&clocksource_mutex);
+
+	clocksource_watchdog_lock(&flags);
 	clocksource_enqueue(cs);
 	clocksource_enqueue_watchdog(cs);
+	clocksource_watchdog_unlock(&flags);
+
 	clocksource_select();
 	clocksource_select_watchdog(false);
 	mutex_unlock(&clocksource_mutex);
@@ -804,8 +827,13 @@ static void __clocksource_change_rating(struct clocksource *cs, int rating)
  */
 void clocksource_change_rating(struct clocksource *cs, int rating)
 {
+	unsigned long flags;
+
 	mutex_lock(&clocksource_mutex);
+	clocksource_watchdog_lock(&flags);
 	__clocksource_change_rating(cs, rating);
+	clocksource_watchdog_unlock(&flags);
+
 	clocksource_select();
 	clocksource_select_watchdog(false);
 	mutex_unlock(&clocksource_mutex);
@@ -817,6 +845,8 @@ EXPORT_SYMBOL(clocksource_change_rating);
  */
 static int clocksource_unbind(struct clocksource *cs)
 {
+	unsigned long flags;
+
 	if (clocksource_is_watchdog(cs)) {
 		/* Select and try to install a replacement watchdog. */
 		clocksource_select_watchdog(true);
@@ -830,8 +860,12 @@ static int clocksource_unbind(struct clocksource *cs)
 		if (curr_clocksource == cs)
 			return -EBUSY;
 	}
+
+	clocksource_watchdog_lock(&flags);
 	clocksource_dequeue_watchdog(cs);
 	list_del_init(&cs->list);
+	clocksource_watchdog_unlock(&flags);
+
 	return 0;
 }
 

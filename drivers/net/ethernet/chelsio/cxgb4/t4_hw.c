@@ -2632,7 +2632,6 @@ void t4_get_regs(struct adapter *adap, void *buf, size_t buf_size)
 }
 
 #define EEPROM_STAT_ADDR   0x7bfc
-#define VPD_SIZE           0x800
 #define VPD_BASE           0x400
 #define VPD_BASE_OLD       0
 #define VPD_LEN            1024
@@ -2698,15 +2697,6 @@ int t4_get_raw_vpd_params(struct adapter *adapter, struct vpd_params *p)
 	vpd = vmalloc(VPD_LEN);
 	if (!vpd)
 		return -ENOMEM;
-
-	/* We have two VPD data structures stored in the adapter VPD area.
-	 * By default, Linux calculates the size of the VPD area by traversing
-	 * the first VPD area at offset 0x0, so we need to tell the OS what
-	 * our real VPD size is.
-	 */
-	ret = pci_set_vpd_size(adapter->pdev, VPD_SIZE);
-	if (ret < 0)
-		goto out;
 
 	/* Card information normally starts at VPD_BASE but early cards had
 	 * it at 0.
@@ -3398,7 +3388,7 @@ int t4_prep_fw(struct adapter *adap, struct fw_info *fw_info,
 	drv_fw = &fw_info->fw_hdr;
 
 	/* Read the header of the firmware on the card */
-	ret = -t4_read_flash(adap, FLASH_FW_START,
+	ret = t4_read_flash(adap, FLASH_FW_START,
 			    sizeof(*card_fw) / sizeof(uint32_t),
 			    (uint32_t *)card_fw, 1);
 	if (ret == 0) {
@@ -3427,8 +3417,8 @@ int t4_prep_fw(struct adapter *adap, struct fw_info *fw_info,
 		   should_install_fs_fw(adap, card_fw_usable,
 					be32_to_cpu(fs_fw->fw_ver),
 					be32_to_cpu(card_fw->fw_ver))) {
-		ret = -t4_fw_upgrade(adap, adap->mbox, fw_data,
-				     fw_size, 0);
+		ret = t4_fw_upgrade(adap, adap->mbox, fw_data,
+				    fw_size, 0);
 		if (ret != 0) {
 			dev_err(adap->pdev_dev,
 				"failed to install firmware: %d\n", ret);
@@ -3459,7 +3449,7 @@ int t4_prep_fw(struct adapter *adap, struct fw_info *fw_info,
 			FW_HDR_FW_VER_MICRO_G(c), FW_HDR_FW_VER_BUILD_G(c),
 			FW_HDR_FW_VER_MAJOR_G(k), FW_HDR_FW_VER_MINOR_G(k),
 			FW_HDR_FW_VER_MICRO_G(k), FW_HDR_FW_VER_BUILD_G(k));
-		ret = EINVAL;
+		ret = -EINVAL;
 		goto bye;
 	}
 
@@ -3647,7 +3637,7 @@ int t4_phy_fw_ver(struct adapter *adap, int *phy_fw_ver)
 		 FW_PARAMS_PARAM_Z_V(FW_PARAMS_PARAM_DEV_PHYFW_VERSION));
 	ret = t4_query_params(adap, adap->mbox, adap->pf, 0, 1,
 			      &param, &val);
-	if (ret < 0)
+	if (ret)
 		return ret;
 	*phy_fw_ver = val;
 	return 0;
@@ -3788,7 +3778,7 @@ int t4_fwcache(struct adapter *adap, enum fw_params_param_dev_fwcache op)
 	c.param[0].mnem =
 		cpu_to_be32(FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_DEV) |
 			    FW_PARAMS_PARAM_X_V(FW_PARAMS_PARAM_DEV_FWCACHE));
-	c.param[0].val = (__force __be32)op;
+	c.param[0].val = cpu_to_be32(op);
 
 	return t4_wr_mbox(adap, adap->mbox, &c, sizeof(c), NULL);
 }
@@ -8358,7 +8348,7 @@ static int t4_get_flash_params(struct adapter *adap)
 	};
 
 	unsigned int part, manufacturer;
-	unsigned int density, size;
+	unsigned int density, size = 0;
 	u32 flashid = 0;
 	int ret;
 
@@ -8428,11 +8418,6 @@ static int t4_get_flash_params(struct adapter *adap)
 		case 0x22: /* 256MB */
 			size = 1 << 28;
 			break;
-
-		default:
-			dev_err(adap->pdev_dev, "Micron Flash Part has bad size, ID = %#x, Density code = %#x\n",
-				flashid, density);
-			return -EINVAL;
 		}
 		break;
 	}
@@ -8448,10 +8433,6 @@ static int t4_get_flash_params(struct adapter *adap)
 		case 0x18: /* 16MB */
 			size = 1 << 24;
 			break;
-		default:
-			dev_err(adap->pdev_dev, "Macronix Flash Part has bad size, ID = %#x, Density code = %#x\n",
-				flashid, density);
-			return -EINVAL;
 		}
 		break;
 	}
@@ -8467,17 +8448,21 @@ static int t4_get_flash_params(struct adapter *adap)
 		case 0x18: /* 16MB */
 			size = 1 << 24;
 			break;
-		default:
-			dev_err(adap->pdev_dev, "Winbond Flash Part has bad size, ID = %#x, Density code = %#x\n",
-				flashid, density);
-			return -EINVAL;
 		}
 		break;
 	}
-	default:
-		dev_err(adap->pdev_dev, "Unsupported Flash Part, ID = %#x\n",
-			flashid);
-		return -EINVAL;
+	}
+
+	/* If we didn't recognize the FLASH part, that's no real issue: the
+	 * Hardware/Software contract says that Hardware will _*ALWAYS*_
+	 * use a FLASH part which is at least 4MB in size and has 64KB
+	 * sectors.  The unrecognized FLASH part is likely to be much larger
+	 * than 4MB, but that's all we really need.
+	 */
+	if (size == 0) {
+		dev_warn(adap->pdev_dev, "Unknown Flash Part, ID = %#x, assuming 4MB\n",
+			 flashid);
+		size = 1 << 22;
 	}
 
 	/* Store decoded Flash size and fall through into vetting code. */

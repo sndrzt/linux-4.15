@@ -31,6 +31,7 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/kernel.h>
+#include <linux/dmi.h>
 #include "tpm.h"
 #include "tpm_tis_core.h"
 
@@ -53,8 +54,8 @@ static inline struct tpm_tis_tcg_phy *to_tpm_tis_tcg_phy(struct tpm_tis_data *da
 	return container_of(data, struct tpm_tis_tcg_phy, priv);
 }
 
-static bool interrupts = true;
-module_param(interrupts, bool, 0444);
+static int interrupts = -1;
+module_param(interrupts, int, 0444);
 MODULE_PARM_DESC(interrupts, "Enable interrupts");
 
 static bool itpm;
@@ -66,6 +67,28 @@ static bool force;
 module_param(force, bool, 0444);
 MODULE_PARM_DESC(force, "Force device probe rather than using ACPI entry");
 #endif
+
+static int tpm_tis_disable_irq(const struct dmi_system_id *d)
+{
+	if (interrupts == -1) {
+		pr_notice("tpm_tis: %s detected: disabling interrupts.\n", d->ident);
+		interrupts = 0;
+	}
+
+	return 0;
+}
+
+static const struct dmi_system_id tpm_tis_dmi_table[] = {
+	{
+		.callback = tpm_tis_disable_irq,
+		.ident = "ThinkPad T490s",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad T490s"),
+		},
+	},
+	{}
+};
 
 #if defined(CONFIG_PNP) && defined(CONFIG_ACPI)
 static int has_hid(struct acpi_device *dev, const char *hid)
@@ -106,6 +129,7 @@ static int check_acpi_tpm2(struct device *dev)
 	const struct acpi_device_id *aid = acpi_match_device(tpm_acpi_tbl, dev);
 	struct acpi_table_tpm2 *tbl;
 	acpi_status st;
+	int ret = 0;
 
 	if (!aid || aid->driver_data != DEVICE_IS_TPM2)
 		return 0;
@@ -113,8 +137,7 @@ static int check_acpi_tpm2(struct device *dev)
 	/* If the ACPI TPM2 signature is matched then a global ACPI_SIG_TPM2
 	 * table is mandatory
 	 */
-	st =
-	    acpi_get_table(ACPI_SIG_TPM2, 1, (struct acpi_table_header **)&tbl);
+	st = acpi_get_table(ACPI_SIG_TPM2, 1, (struct acpi_table_header **)&tbl);
 	if (ACPI_FAILURE(st) || tbl->header.length < sizeof(*tbl)) {
 		dev_err(dev, FW_BUG "failed to get TPM2 ACPI table\n");
 		return -EINVAL;
@@ -122,9 +145,10 @@ static int check_acpi_tpm2(struct device *dev)
 
 	/* The tpm2_crb driver handles this device */
 	if (tbl->start_method != ACPI_TPM2_MEMORY_MAPPED)
-		return -ENODEV;
+		ret = -ENODEV;
 
-	return 0;
+	acpi_put_table((struct acpi_table_header *)tbl);
+	return ret;
 }
 #else
 static int check_acpi_tpm2(struct device *dev)
@@ -133,92 +157,13 @@ static int check_acpi_tpm2(struct device *dev)
 }
 #endif
 
-#ifdef CONFIG_X86
-#define INTEL_LEGACY_BLK_BASE_ADDR      0xFED08000
-#define ILB_REMAP_SIZE			0x100
-#define LPC_CNTRL_REG_OFFSET            0x84
-#define LPC_CLKRUN_EN                   (1 << 2)
-
-static void __iomem *ilb_base_addr;
-
-static inline bool is_bsw(void)
-{
-	return ((boot_cpu_data.x86_model == INTEL_FAM6_ATOM_AIRMONT) ? 1 : 0);
-}
-
-/**
- * tpm_platform_begin_xfer() - clear LPC CLKRUN_EN i.e. clocks will be running
- */
-static void tpm_platform_begin_xfer(void)
-{
-	u32 clkrun_val;
-
-	if (!is_bsw())
-		return;
-
-	clkrun_val = ioread32(ilb_base_addr + LPC_CNTRL_REG_OFFSET);
-
-	/* Disable LPC CLKRUN# */
-	clkrun_val &= ~LPC_CLKRUN_EN;
-	iowrite32(clkrun_val, ilb_base_addr + LPC_CNTRL_REG_OFFSET);
-
-	/*
-	 * Write any random value on port 0x80 which is on LPC, to make
-	 * sure LPC clock is running before sending any TPM command.
-	 */
-	outb(0xCC, 0x80);
-
-}
-
-/**
- * tpm_platform_end_xfer() - set LPC CLKRUN_EN i.e. clocks can be turned off
- */
-static void tpm_platform_end_xfer(void)
-{
-	u32 clkrun_val;
-
-	if (!is_bsw())
-		return;
-
-	clkrun_val = ioread32(ilb_base_addr + LPC_CNTRL_REG_OFFSET);
-
-	/* Enable LPC CLKRUN# */
-	clkrun_val |= LPC_CLKRUN_EN;
-	iowrite32(clkrun_val, ilb_base_addr + LPC_CNTRL_REG_OFFSET);
-
-	/*
-	 * Write any random value on port 0x80 which is on LPC, to make
-	 * sure LPC clock is running before sending any TPM command.
-	 */
-	outb(0xCC, 0x80);
-
-}
-#else
-static inline bool is_bsw(void)
-{
-	return false;
-}
-
-static void tpm_platform_begin_xfer(void)
-{
-}
-
-static void tpm_platform_end_xfer(void)
-{
-}
-#endif
-
 static int tpm_tcg_read_bytes(struct tpm_tis_data *data, u32 addr, u16 len,
 			      u8 *result)
 {
 	struct tpm_tis_tcg_phy *phy = to_tpm_tis_tcg_phy(data);
 
-	tpm_platform_begin_xfer();
-
 	while (len--)
 		*result++ = ioread8(phy->iobase + addr);
-
-	tpm_platform_end_xfer();
 
 	return 0;
 }
@@ -228,12 +173,8 @@ static int tpm_tcg_write_bytes(struct tpm_tis_data *data, u32 addr, u16 len,
 {
 	struct tpm_tis_tcg_phy *phy = to_tpm_tis_tcg_phy(data);
 
-	tpm_platform_begin_xfer();
-
 	while (len--)
 		iowrite8(*value++, phy->iobase + addr);
-
-	tpm_platform_end_xfer();
 
 	return 0;
 }
@@ -242,11 +183,7 @@ static int tpm_tcg_read16(struct tpm_tis_data *data, u32 addr, u16 *result)
 {
 	struct tpm_tis_tcg_phy *phy = to_tpm_tis_tcg_phy(data);
 
-	tpm_platform_begin_xfer();
-
 	*result = ioread16(phy->iobase + addr);
-
-	tpm_platform_end_xfer();
 
 	return 0;
 }
@@ -255,11 +192,7 @@ static int tpm_tcg_read32(struct tpm_tis_data *data, u32 addr, u32 *result)
 {
 	struct tpm_tis_tcg_phy *phy = to_tpm_tis_tcg_phy(data);
 
-	tpm_platform_begin_xfer();
-
 	*result = ioread32(phy->iobase + addr);
-
-	tpm_platform_end_xfer();
 
 	return 0;
 }
@@ -268,11 +201,7 @@ static int tpm_tcg_write32(struct tpm_tis_data *data, u32 addr, u32 value)
 {
 	struct tpm_tis_tcg_phy *phy = to_tpm_tis_tcg_phy(data);
 
-	tpm_platform_begin_xfer();
-
 	iowrite32(value, phy->iobase + addr);
-
-	tpm_platform_end_xfer();
 
 	return 0;
 }
@@ -290,6 +219,8 @@ static int tpm_tis_init(struct device *dev, struct tpm_info *tpm_info)
 	struct tpm_tis_tcg_phy *phy;
 	int irq = -1;
 	int rc;
+
+	dmi_check_system(tpm_tis_dmi_table);
 
 	rc = check_acpi_tpm2(dev);
 	if (rc)
@@ -461,11 +392,6 @@ static int __init init_tis(void)
 	if (rc)
 		goto err_force;
 
-#ifdef CONFIG_X86
-	if (is_bsw())
-		ilb_base_addr = ioremap(INTEL_LEGACY_BLK_BASE_ADDR,
-					ILB_REMAP_SIZE);
-#endif
 	rc = platform_driver_register(&tis_drv);
 	if (rc)
 		goto err_platform;
@@ -484,10 +410,6 @@ err_pnp:
 err_platform:
 	if (force_pdev)
 		platform_device_unregister(force_pdev);
-#ifdef CONFIG_X86
-	if (is_bsw())
-		iounmap(ilb_base_addr);
-#endif
 err_force:
 	return rc;
 }
@@ -497,10 +419,6 @@ static void __exit cleanup_tis(void)
 	pnp_unregister_driver(&tis_pnp_driver);
 	platform_driver_unregister(&tis_drv);
 
-#ifdef CONFIG_X86
-	if (is_bsw())
-		iounmap(ilb_base_addr);
-#endif
 	if (force_pdev)
 		platform_device_unregister(force_pdev);
 }

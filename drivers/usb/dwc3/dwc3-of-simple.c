@@ -143,12 +143,14 @@ static int dwc3_of_simple_remove(struct platform_device *pdev)
 		clk_disable_unprepare(simple->clks[i]);
 		clk_put(simple->clks[i]);
 	}
+	simple->num_clocks = 0;
 
 	reset_control_assert(simple->resets);
 	reset_control_put(simple->resets);
 
-	pm_runtime_put_sync(dev);
 	pm_runtime_disable(dev);
+	pm_runtime_put_noidle(dev);
+	pm_runtime_set_suspended(dev);
 
 	return 0;
 }
@@ -195,6 +197,7 @@ static const struct of_device_id of_dwc3_simple_match[] = {
 	{ .compatible = "xlnx,zynqmp-dwc3" },
 	{ .compatible = "cavium,octeon-7130-usb-uctl" },
 	{ .compatible = "sprd,sc9860-dwc3" },
+	{ .compatible = "hisilicon,hi3670-dwc3" },
 	{ /* Sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, of_dwc3_simple_match);

@@ -15,6 +15,7 @@
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/hw_random.h>
+#include <linux/random.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/sched/signal.h>
@@ -67,7 +68,7 @@ static void add_early_randomness(struct hwrng *rng)
 	size_t size = min_t(size_t, 16, rng_buffer_size());
 
 	mutex_lock(&reading_mutex);
-	bytes_read = rng_get_data(rng, rng_buffer, size, 1);
+	bytes_read = rng_get_data(rng, rng_buffer, size, 0);
 	mutex_unlock(&reading_mutex);
 	if (bytes_read > 0)
 		add_device_randomness(rng_buffer, bytes_read);
@@ -306,6 +307,10 @@ static int enable_best_rng(void)
 		ret = ((new_rng == current_rng) ? 0 : set_current_rng(new_rng));
 		if (!ret)
 			cur_rng_set_by_user = 0;
+	} else {
+		drop_current_rng();
+		cur_rng_set_by_user = 0;
+		ret = 0;
 	}
 
 	return ret;
@@ -512,11 +517,18 @@ EXPORT_SYMBOL_GPL(hwrng_register);
 
 void hwrng_unregister(struct hwrng *rng)
 {
+	int err;
+
 	mutex_lock(&rng_mutex);
 
 	list_del(&rng->list);
-	if (current_rng == rng)
-		enable_best_rng();
+	if (current_rng == rng) {
+		err = enable_best_rng();
+		if (err) {
+			drop_current_rng();
+			cur_rng_set_by_user = 0;
+		}
+	}
 
 	if (list_empty(&rng_list)) {
 		mutex_unlock(&rng_mutex);

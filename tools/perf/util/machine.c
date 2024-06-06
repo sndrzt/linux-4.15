@@ -634,24 +634,6 @@ int machine__process_switch_event(struct machine *machine __maybe_unused,
 	return 0;
 }
 
-static void dso__adjust_kmod_long_name(struct dso *dso, const char *filename)
-{
-	const char *dup_filename;
-
-	if (!filename || !dso || !dso->long_name)
-		return;
-	if (dso->long_name[0] != '[')
-		return;
-	if (!strchr(filename, '/'))
-		return;
-
-	dup_filename = strdup(filename);
-	if (!dup_filename)
-		return;
-
-	dso__set_long_name(dso, dup_filename, true);
-}
-
 struct map *machine__findnew_module_map(struct machine *machine, u64 start,
 					const char *filename)
 {
@@ -664,15 +646,8 @@ struct map *machine__findnew_module_map(struct machine *machine, u64 start,
 
 	map = map_groups__find_by_name(&machine->kmaps, MAP__FUNCTION,
 				       m.name);
-	if (map) {
-		/*
-		 * If the map's dso is an offline module, give dso__load()
-		 * a chance to find the file path of that module by fixing
-		 * long_name.
-		 */
-		dso__adjust_kmod_long_name(map->dso, filename);
+	if (map)
 		goto out;
-	}
 
 	dso = machine__findnew_module_dso(machine, &m, filename);
 	if (dso == NULL)
@@ -846,6 +821,102 @@ static int machine__get_running_kernel_start(struct machine *machine,
 		*symbol_name = name;
 
 	*start = addr;
+	return 0;
+}
+
+/* Kernel-space maps for symbols that are outside the main kernel map and module maps */
+struct extra_kernel_map {
+	u64 start;
+	u64 end;
+	u64 pgoff;
+};
+
+static int machine__create_extra_kernel_map(struct machine *machine,
+					    struct dso *kernel,
+					    struct extra_kernel_map *xm)
+{
+	struct kmap *kmap;
+	struct map *map;
+
+	map = map__new2(xm->start, kernel, MAP__FUNCTION);
+	if (!map)
+		return -1;
+
+	map->end   = xm->end;
+	map->pgoff = xm->pgoff;
+
+	kmap = map__kmap(map);
+
+	kmap->kmaps = &machine->kmaps;
+
+	map_groups__insert(&machine->kmaps, map);
+
+	pr_debug2("Added extra kernel map %" PRIx64 "-%" PRIx64 "\n",
+		  map->start, map->end);
+
+	map__put(map);
+
+	return 0;
+}
+
+static u64 find_entry_trampoline(struct dso *dso)
+{
+	/* Duplicates are removed so lookup all aliases */
+	const char *syms[] = {
+		"_entry_trampoline",
+		"__entry_trampoline_start",
+		"entry_SYSCALL_64_trampoline",
+	};
+	struct symbol *sym = dso__first_symbol(dso, MAP__FUNCTION);
+	unsigned int i;
+
+	for (; sym; sym = dso__next_symbol(sym)) {
+		if (sym->binding != STB_GLOBAL)
+			continue;
+		for (i = 0; i < ARRAY_SIZE(syms); i++) {
+			if (!strcmp(sym->name, syms[i]))
+				return sym->start;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * These values can be used for kernels that do not have symbols for the entry
+ * trampolines in kallsyms.
+ */
+#define X86_64_CPU_ENTRY_AREA_PER_CPU	0xfffffe0000000000ULL
+#define X86_64_CPU_ENTRY_AREA_SIZE	0x2c000
+#define X86_64_ENTRY_TRAMPOLINE		0x6000
+
+/* Map x86_64 PTI entry trampolines */
+int machine__map_x86_64_entry_trampolines(struct machine *machine,
+					  struct dso *kernel)
+{
+	u64 pgoff = find_entry_trampoline(kernel);
+	int nr_cpus_avail, cpu;
+
+	if (!pgoff)
+		return 0;
+
+	nr_cpus_avail = machine__nr_cpus_avail(machine);
+
+	/* Add a 1 page map for each CPU's entry trampoline */
+	for (cpu = 0; cpu < nr_cpus_avail; cpu++) {
+		u64 va = X86_64_CPU_ENTRY_AREA_PER_CPU +
+			 cpu * X86_64_CPU_ENTRY_AREA_SIZE +
+			 X86_64_ENTRY_TRAMPOLINE;
+		struct extra_kernel_map xm = {
+			.start = va,
+			.end   = va + page_size,
+			.pgoff = pgoff,
+		};
+
+		if (machine__create_extra_kernel_map(machine, kernel, &xm) < 0)
+			return -1;
+	}
+
 	return 0;
 }
 
@@ -1165,6 +1236,7 @@ static int machine__set_modules_path(struct machine *machine)
 	return map_groups__set_modules_path_dir(&machine->kmaps, modules_path, 0);
 }
 int __weak arch__fix_module_text_start(u64 *start __maybe_unused,
+				u64 *size __maybe_unused,
 				const char *name __maybe_unused)
 {
 	return 0;
@@ -1176,7 +1248,7 @@ static int machine__create_module(void *arg, const char *name, u64 start,
 	struct machine *machine = arg;
 	struct map *map;
 
-	if (arch__fix_module_text_start(&start, name) < 0)
+	if (arch__fix_module_text_start(&start, &size, name) < 0)
 		return -1;
 
 	map = machine__findnew_module_map(machine, start, name);
@@ -1756,6 +1828,7 @@ static int add_callchain_ip(struct thread *thread,
 
 	al.filtered = 0;
 	al.sym = NULL;
+	al.srcline = NULL;
 	if (!cpumode) {
 		thread__find_cpumode_addr_location(thread, MAP__FUNCTION,
 						   ip, &al);
@@ -1837,7 +1910,7 @@ static void save_iterations(struct iterations *iter,
 {
 	int i;
 
-	iter->nr_loop_iter = nr;
+	iter->nr_loop_iter++;
 	iter->cycles = 0;
 
 	for (i = 0; i < nr; i++)
@@ -2135,7 +2208,8 @@ static int append_inlines(struct callchain_cursor *cursor,
 	if (!symbol_conf.inline_name || !map || !sym)
 		return ret;
 
-	addr = map__rip_2objdump(map, ip);
+	addr = map__map_ip(map, ip);
+	addr = map__rip_2objdump(map, addr);
 
 	inline_node = inlines__tree_find(&map->dso->inlined_nodes, addr);
 	if (!inline_node) {
@@ -2161,6 +2235,7 @@ static int unwind_entry(struct unwind_entry *entry, void *arg)
 {
 	struct callchain_cursor *cursor = arg;
 	const char *srcline = NULL;
+	u64 addr = entry->ip;
 
 	if (symbol_conf.hide_unresolved && entry->sym == NULL)
 		return 0;
@@ -2168,7 +2243,14 @@ static int unwind_entry(struct unwind_entry *entry, void *arg)
 	if (append_inlines(cursor, entry->map, entry->sym, entry->ip) == 0)
 		return 0;
 
-	srcline = callchain_srcline(entry->map, entry->sym, entry->ip);
+	/*
+	 * Convert entry->ip from a virtual address to an offset in
+	 * its corresponding binary.
+	 */
+	if (entry->map)
+		addr = map__map_ip(entry->map, entry->ip);
+
+	srcline = callchain_srcline(entry->map, entry->sym, addr);
 	return callchain_cursor_append(cursor, entry->ip,
 				       entry->map, entry->sym,
 				       false, NULL, 0, 0, 0, srcline);
@@ -2341,6 +2423,20 @@ int machine__set_current_tid(struct machine *machine, int cpu, pid_t pid,
 	return 0;
 }
 
+/*
+ * Compares the raw arch string. N.B. see instead perf_env__arch() if a
+ * normalized arch is needed.
+ */
+bool machine__is(struct machine *machine, const char *arch)
+{
+	return machine && !strcmp(perf_env__raw_arch(machine->env), arch);
+}
+
+int machine__nr_cpus_avail(struct machine *machine)
+{
+	return machine ? perf_env__nr_cpus_avail(machine->env) : 0;
+}
+
 int machine__get_kernel_start(struct machine *machine)
 {
 	struct map *map = machine__kernel_map(machine);
@@ -2357,7 +2453,12 @@ int machine__get_kernel_start(struct machine *machine)
 	machine->kernel_start = 1ULL << 63;
 	if (map) {
 		err = map__load(map);
-		if (!err)
+		/*
+		 * On x86_64, PTI entry trampolines are less than the
+		 * start of kernel text, but still above 2^63. So leave
+		 * kernel_start = 1ULL << 63 for x86_64.
+		 */
+		if (!err && !machine__is(machine, "x86_64"))
 			machine->kernel_start = map->start;
 	}
 	return err;

@@ -108,7 +108,7 @@ int cmd_select(const struct cmd *cmds, int argc, char **argv,
 int get_fd_type(int fd);
 const char *get_fd_type_name(enum bpf_obj_type type);
 char *get_fdinfo(int fd, const char *key);
-int open_obj_pinned(char *path);
+int open_obj_pinned(char *path, bool quiet);
 int open_obj_pinned_any(char *path, enum bpf_obj_type exp_type);
 int do_pin_any(int argc, char **argv, int (*get_fd_by_id)(__u32));
 
@@ -117,7 +117,20 @@ int do_map(int argc, char **arg);
 
 int prog_parse_fd(int *argc, char ***argv);
 
+#ifdef HAVE_LIBBFD_SUPPORT
 void disasm_print_insn(unsigned char *image, ssize_t len, int opcodes);
+int disasm_init(void);
+#else
+static inline
+void disasm_print_insn(unsigned char *image, ssize_t len, int opcodes)
+{
+}
+static inline int disasm_init(void)
+{
+	p_err("No libbfd support");
+	return -1;
+}
+#endif
 void print_hex_data_json(uint8_t *data, size_t len);
 
 #endif

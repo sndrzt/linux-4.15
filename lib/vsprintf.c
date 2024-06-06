@@ -48,6 +48,31 @@
 #include <linux/string_helpers.h>
 #include "kstrtox.h"
 
+static unsigned long long simple_strntoull(const char *startp, size_t max_chars,
+					   char **endp, unsigned int base)
+{
+	const char *cp;
+	unsigned long long result = 0ULL;
+	size_t prefix_chars;
+	unsigned int rv;
+
+	cp = _parse_integer_fixup_radix(startp, &base);
+	prefix_chars = cp - startp;
+	if (prefix_chars < max_chars) {
+		rv = _parse_integer_limit(cp, base, &result, max_chars - prefix_chars);
+		/* FIXME */
+		cp += (rv & ~KSTRTOX_OVERFLOW);
+	} else {
+		/* Field too short for prefix + digit, skip over without converting */
+		cp = startp + max_chars;
+	}
+
+	if (endp)
+		*endp = (char *)cp;
+
+	return result;
+}
+
 /**
  * simple_strtoull - convert a string to an unsigned long long
  * @cp: The start of the string
@@ -58,18 +83,7 @@
  */
 unsigned long long simple_strtoull(const char *cp, char **endp, unsigned int base)
 {
-	unsigned long long result;
-	unsigned int rv;
-
-	cp = _parse_integer_fixup_radix(cp, &base);
-	rv = _parse_integer(cp, base, &result);
-	/* FIXME */
-	cp += (rv & ~KSTRTOX_OVERFLOW);
-
-	if (endp)
-		*endp = (char *)cp;
-
-	return result;
+	return simple_strntoull(cp, INT_MAX, endp, base);
 }
 EXPORT_SYMBOL(simple_strtoull);
 
@@ -104,6 +118,21 @@ long simple_strtol(const char *cp, char **endp, unsigned int base)
 }
 EXPORT_SYMBOL(simple_strtol);
 
+static long long simple_strntoll(const char *cp, size_t max_chars, char **endp,
+				 unsigned int base)
+{
+	/*
+	 * simple_strntoull() safely handles receiving max_chars==0 in the
+	 * case cp[0] == '-' && max_chars == 1.
+	 * If max_chars == 0 we can drop through and pass it to simple_strntoull()
+	 * and the content of *cp is irrelevant.
+	 */
+	if (*cp == '-' && max_chars > 0)
+		return -simple_strntoull(cp + 1, max_chars - 1, endp, base);
+
+	return simple_strntoull(cp, max_chars, endp, base);
+}
+
 /**
  * simple_strtoll - convert a string to a signed long long
  * @cp: The start of the string
@@ -114,10 +143,7 @@ EXPORT_SYMBOL(simple_strtol);
  */
 long long simple_strtoll(const char *cp, char **endp, unsigned int base)
 {
-	if (*cp == '-')
-		return -simple_strtoull(cp + 1, endp, base);
-
-	return simple_strtoull(cp, endp, base);
+	return simple_strntoll(cp, INT_MAX, endp, base);
 }
 EXPORT_SYMBOL(simple_strtoll);
 
@@ -1447,9 +1473,6 @@ char *clock(char *buf, char *end, struct clk *clk, struct printf_spec spec,
 		return string(buf, end, NULL, spec);
 
 	switch (fmt[1]) {
-	case 'r':
-		return number(buf, end, clk_get_rate(clk), spec);
-
 	case 'n':
 	default:
 #ifdef CONFIG_COMMON_CLK
@@ -1660,33 +1683,39 @@ char *pointer_string(char *buf, char *end, const void *ptr,
 	return number(buf, end, (unsigned long int)ptr, spec);
 }
 
-static bool have_filled_random_ptr_key __read_mostly;
+static DEFINE_STATIC_KEY_TRUE(not_filled_random_ptr_key);
 static siphash_key_t ptr_key __read_mostly;
 
-static void fill_random_ptr_key(struct random_ready_callback *unused)
+static void enable_ptr_key_workfn(struct work_struct *work)
 {
 	get_random_bytes(&ptr_key, sizeof(ptr_key));
-	/*
-	 * have_filled_random_ptr_key==true is dependent on get_random_bytes().
-	 * ptr_to_id() needs to see have_filled_random_ptr_key==true
-	 * after get_random_bytes() returns.
-	 */
-	smp_mb();
-	WRITE_ONCE(have_filled_random_ptr_key, true);
+	/* Needs to run from preemptible context */
+	static_branch_disable(&not_filled_random_ptr_key);
 }
 
-static struct random_ready_callback random_ready = {
-	.func = fill_random_ptr_key
+static DECLARE_WORK(enable_ptr_key_work, enable_ptr_key_workfn);
+
+static int fill_random_ptr_key(struct notifier_block *nb,
+			       unsigned long action, void *data)
+{
+	/* This may be in an interrupt handler. */
+	queue_work(system_unbound_wq, &enable_ptr_key_work);
+	return 0;
+}
+
+static struct notifier_block random_ready = {
+	.notifier_call = fill_random_ptr_key
 };
 
 static int __init initialize_ptr_random(void)
 {
-	int ret = add_random_ready_callback(&random_ready);
+	int ret = register_random_ready_notifier(&random_ready);
 
 	if (!ret) {
 		return 0;
 	} else if (ret == -EALREADY) {
-		fill_random_ptr_key(&random_ready);
+		/* This is in preemptible context */
+		enable_ptr_key_workfn(&enable_ptr_key_work);
 		return 0;
 	}
 
@@ -1700,7 +1729,7 @@ static char *ptr_to_id(char *buf, char *end, void *ptr, struct printf_spec spec)
 	unsigned long hashval;
 	const int default_width = 2 * sizeof(ptr);
 
-	if (unlikely(!have_filled_random_ptr_key)) {
+	if (static_branch_unlikely(&not_filled_random_ptr_key)) {
 		spec.field_width = default_width;
 		/* string length must be less than default_width */
 		return string(buf, end, "(ptrval)", spec);
@@ -1726,6 +1755,29 @@ static char *ptr_to_id(char *buf, char *end, void *ptr, struct printf_spec spec)
 
 	return number(buf, end, hashval, spec);
 }
+
+#ifdef CONFIG_KMSG_IDS
+
+unsigned long long __jhash_string(const char *str);
+
+static noinline_for_stack
+char *jhash_string(char *buf, char *end, const char *str, const char *fmt)
+{
+	struct printf_spec spec;
+	unsigned long long num;
+
+	num = __jhash_string(str);
+
+	spec.type = FORMAT_TYPE_PTR;
+	spec.field_width = 6;
+	spec.flags = SMALL | ZEROPAD;
+	spec.base = 16;
+	spec.precision = -1;
+
+	return number(buf, end, num, spec);
+}
+
+#endif
 
 /*
  * Show a '%p' thing.  A kernel extension is that the '%p' is followed
@@ -1821,6 +1873,7 @@ static char *ptr_to_id(char *buf, char *end, void *ptr, struct printf_spec spec)
  *       p page flags (see struct page) given as pointer to unsigned long
  *       g gfp flags (GFP_* and __GFP_*) given as pointer to gfp_t
  *       v vma flags (VM_*) given as pointer to unsigned long
+ * - 'j' Kernel message catalog jhash for System z
  * - 'O' For a kobject based struct. Must be one of the following:
  *       - 'OF[fnpPcCF]'  For a device tree object
  *                        Without any optional arguments prints the full_name
@@ -1849,7 +1902,7 @@ char *pointer(const char *fmt, char *buf, char *end, void *ptr,
 {
 	const int default_width = 2 * sizeof(void *);
 
-	if (!ptr && *fmt != 'K') {
+	if (!ptr && *fmt != 'K' && *fmt != 'x') {
 		/*
 		 * Print (null) with the same width as a pointer so it makes
 		 * tabular output look nice.
@@ -1958,8 +2011,13 @@ char *pointer(const char *fmt, char *buf, char *end, void *ptr,
 		case 'F':
 			return device_node_string(buf, end, ptr, spec, fmt + 1);
 		}
+		break;
 	case 'x':
 		return pointer_string(buf, end, ptr, spec);
+#ifdef CONFIG_KMSG_IDS
+	case 'j':
+		return jhash_string(buf, end, ptr, fmt);
+#endif
 	}
 
 	/* default is to _not_ leak addresses, hash before printing */
@@ -3044,25 +3102,13 @@ int vsscanf(const char *buf, const char *fmt, va_list args)
 			break;
 
 		if (is_sign)
-			val.s = qualifier != 'L' ?
-				simple_strtol(str, &next, base) :
-				simple_strtoll(str, &next, base);
+			val.s = simple_strntoll(str,
+						field_width >= 0 ? field_width : INT_MAX,
+						&next, base);
 		else
-			val.u = qualifier != 'L' ?
-				simple_strtoul(str, &next, base) :
-				simple_strtoull(str, &next, base);
-
-		if (field_width > 0 && next - str > field_width) {
-			if (base == 0)
-				_parse_integer_fixup_radix(str, &base);
-			while (next - str > field_width) {
-				if (is_sign)
-					val.s = div_s64(val.s, base);
-				else
-					val.u = div_u64(val.u, base);
-				--next;
-			}
-		}
+			val.u = simple_strntoull(str,
+						 field_width >= 0 ? field_width : INT_MAX,
+						 &next, base);
 
 		switch (qualifier) {
 		case 'H':	/* that's 'hh' in format */

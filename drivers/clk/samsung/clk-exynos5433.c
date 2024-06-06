@@ -16,6 +16,7 @@
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/slab.h>
 
 #include <dt-bindings/clock/exynos5433.h>
 
@@ -729,7 +730,7 @@ static const struct samsung_pll_rate_table exynos5433_pll_rates[] __initconst = 
 	PLL_35XX_RATE(800000000U,  400, 6,  1),
 	PLL_35XX_RATE(733000000U,  733, 12, 1),
 	PLL_35XX_RATE(700000000U,  175, 3,  1),
-	PLL_35XX_RATE(667000000U,  222, 4,  1),
+	PLL_35XX_RATE(666000000U,  222, 4,  1),
 	PLL_35XX_RATE(633000000U,  211, 4,  1),
 	PLL_35XX_RATE(600000000U,  500, 5,  2),
 	PLL_35XX_RATE(552000000U,  460, 5,  2),
@@ -757,12 +758,12 @@ static const struct samsung_pll_rate_table exynos5433_pll_rates[] __initconst = 
 /* AUD_PLL */
 static const struct samsung_pll_rate_table exynos5433_aud_pll_rates[] __initconst = {
 	PLL_36XX_RATE(400000000U, 200, 3, 2,      0),
-	PLL_36XX_RATE(393216000U, 197, 3, 2, -25690),
+	PLL_36XX_RATE(393216003U, 197, 3, 2, -25690),
 	PLL_36XX_RATE(384000000U, 128, 2, 2,      0),
-	PLL_36XX_RATE(368640000U, 246, 4, 2, -15729),
-	PLL_36XX_RATE(361507200U, 181, 3, 2, -16148),
-	PLL_36XX_RATE(338688000U, 113, 2, 2,  -6816),
-	PLL_36XX_RATE(294912000U,  98, 1, 3,  19923),
+	PLL_36XX_RATE(368639991U, 246, 4, 2, -15729),
+	PLL_36XX_RATE(361507202U, 181, 3, 2, -16148),
+	PLL_36XX_RATE(338687988U, 113, 2, 2,  -6816),
+	PLL_36XX_RATE(294912002U,  98, 1, 3,  19923),
 	PLL_36XX_RATE(288000000U,  96, 1, 3,      0),
 	PLL_36XX_RATE(252000000U,  84, 1, 3,      0),
 	{ /* sentinel */ }
@@ -1678,7 +1679,8 @@ static const struct samsung_gate_clock peric_gate_clks[] __initconst = {
 	GATE(CLK_SCLK_PCM1, "sclk_pcm1", "sclk_pcm1_peric",
 			ENABLE_SCLK_PERIC, 7, CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_SCLK_I2S1, "sclk_i2s1", "sclk_i2s1_peric",
-			ENABLE_SCLK_PERIC, 6, CLK_SET_RATE_PARENT, 0),
+			ENABLE_SCLK_PERIC, 6,
+			CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0),
 	GATE(CLK_SCLK_SPI2, "sclk_spi2", "sclk_spi2_peric", ENABLE_SCLK_PERIC,
 			5, CLK_SET_RATE_PARENT, 0),
 	GATE(CLK_SCLK_SPI1, "sclk_spi1", "sclk_spi1_peric", ENABLE_SCLK_PERIC,
@@ -5528,6 +5530,8 @@ static int __init exynos5433_cmu_probe(struct platform_device *pdev)
 
 	data->clk_save = samsung_clk_alloc_reg_dump(info->clk_regs,
 						    info->nr_clk_regs);
+	if (!data->clk_save)
+		return -ENOMEM;
 	data->nr_clk_save = info->nr_clk_regs;
 	data->clk_suspend = info->suspend_regs;
 	data->nr_clk_suspend = info->nr_suspend_regs;
@@ -5536,12 +5540,19 @@ static int __init exynos5433_cmu_probe(struct platform_device *pdev)
 	if (data->nr_pclks > 0) {
 		data->pclks = devm_kcalloc(dev, sizeof(struct clk *),
 					   data->nr_pclks, GFP_KERNEL);
-
+		if (!data->pclks) {
+			kfree(data->clk_save);
+			return -ENOMEM;
+		}
 		for (i = 0; i < data->nr_pclks; i++) {
 			struct clk *clk = of_clk_get(dev->of_node, i);
 
-			if (IS_ERR(clk))
+			if (IS_ERR(clk)) {
+				kfree(data->clk_save);
+				while (--i >= 0)
+					clk_put(data->pclks[i]);
 				return PTR_ERR(clk);
+			}
 			data->pclks[i] = clk;
 		}
 	}
@@ -5631,7 +5642,7 @@ static const struct of_device_id exynos5433_cmu_of_match[] = {
 static const struct dev_pm_ops exynos5433_cmu_pm_ops = {
 	SET_RUNTIME_PM_OPS(exynos5433_cmu_suspend, exynos5433_cmu_resume,
 			   NULL)
-	SET_LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
+	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
 				     pm_runtime_force_resume)
 };
 
