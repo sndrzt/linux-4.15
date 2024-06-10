@@ -1233,7 +1233,7 @@ static void i915_driver_register(struct drm_i915_private *dev_priv)
 		I915_WRITE(vgtif_reg(display_ready), VGT_DRV_DISPLAY_READY);
 
 	/* Reveal our presence to userspace */
-	if (drm_dev_register(dev, 0) == 0) {
+	if (drm_dev_register(dev, 0) == 0) { /*  */
 		i915_debugfs_register(dev_priv);
 		i915_guc_log_register(dev_priv);
 		i915_setup_sysfs(dev_priv);
@@ -1311,7 +1311,7 @@ int i915_driver_load(struct pci_dev *pdev, const struct pci_device_id *ent)
 	ret = -ENOMEM;
 	dev_priv = kzalloc(sizeof(*dev_priv), GFP_KERNEL);
 	if (dev_priv)
-		ret = drm_dev_init(&dev_priv->drm, &driver, &pdev->dev);
+		ret = drm_dev_init(&dev_priv->drm, &driver, &pdev->dev); /*  */
 	if (ret) {
 		DRM_DEV_ERROR(&pdev->dev, "allocation failed\n");
 		goto out_free;
@@ -2700,12 +2700,12 @@ static const struct vm_operations_struct i915_gem_vm_ops = {
 
 static const struct file_operations i915_driver_fops = {
 	.owner = THIS_MODULE,
-	.open = drm_open,
-	.release = drm_release,
-	.unlocked_ioctl = drm_ioctl,
+	.open = drm_open, /* open */
+	.release = drm_release, /* release */
+	.unlocked_ioctl = drm_ioctl, /* ioctl  */
 	.mmap = drm_gem_mmap,
-	.poll = drm_poll,
-	.read = drm_read,
+	.poll = drm_poll, /* poll */
+	.read = drm_read, /* read */
 	.compat_ioctl = i915_compat_ioctl,
 	.llseek = noop_llseek,
 };
@@ -2780,8 +2780,8 @@ static struct drm_driver driver = {
 	 * deal with them for Intel hardware.
 	 */
 	.driver_features =
-	    DRIVER_HAVE_IRQ | DRIVER_IRQ_SHARED | DRIVER_GEM | DRIVER_PRIME |
-	    DRIVER_RENDER | DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_SYNCOBJ,
+	    DRIVER_HAVE_IRQ | DRIVER_IRQ_SHARED | DRIVER_GEM | DRIVER_PRIME | /* support GEM operation */
+	    DRIVER_RENDER | DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_SYNCOBJ, /* support MODESET feature */
 	.release = i915_driver_release,
 	.open = i915_driver_open,
 	.lastclose = i915_driver_lastclose,
@@ -2796,16 +2796,16 @@ static struct drm_driver driver = {
 	.gem_prime_export = i915_gem_prime_export,
 	.gem_prime_import = i915_gem_prime_import,
 
-	.dumb_create = i915_gem_dumb_create,
+	.dumb_create = i915_gem_dumb_create, /* for gem object creation and physical buffer allocation  */
 	.dumb_map_offset = i915_gem_mmap_gtt,
 	.ioctls = i915_ioctls,
 	.num_ioctls = ARRAY_SIZE(i915_ioctls),
-	.fops = &i915_driver_fops,
-	.name = DRIVER_NAME,
+	.fops = &i915_driver_fops, /* fops */
+	.name = DRIVER_NAME, /* name */
 	.desc = DRIVER_DESC,
-	.date = DRIVER_DATE,
-	.major = DRIVER_MAJOR,
-	.minor = DRIVER_MINOR,
+	.date = DRIVER_DATE,  /* date */
+	.major = DRIVER_MAJOR, /* major */
+	.minor = DRIVER_MINOR, /* minor */
 	.patchlevel = DRIVER_PATCHLEVEL,
 };
 

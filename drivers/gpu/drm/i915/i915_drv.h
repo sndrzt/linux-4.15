@@ -80,7 +80,16 @@
 /* General customization:
  */
 
-#define DRIVER_NAME		"i915"
+/*
+  work@work-pc:~/linux-4.15$ sudo dmesg | grep "Initialized i915"
+  [sudo] password for work: 
+  [    3.976680] [drm] Initialized i915 1.6.0 20171023 for 0000:00:02.0 on minor 0
+  work@work-pc:~/linux-4.15$ 
+  root@work-pc:~/linux-4.15/drivers/gpu/drm/i915# cat /sys/kernel/debug/dri/0/name 
+  i915 dev=0000:00:02.0 master=pci:0000:00:02.0 unique=0000:00:02.0
+  root@work-pc:~/linux-4.15/drivers/gpu/drm/i915# 
+ */
+#define DRIVER_NAME		"i915" /* driver name */
 #define DRIVER_DESC		"Intel Graphics"
 #define DRIVER_DATE		"20171023"
 #define DRIVER_TIMESTAMP	1508748913

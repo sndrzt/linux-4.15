@@ -13305,7 +13305,7 @@ intel_primary_plane_create(struct drm_i915_private *dev_priv, enum pipe pipe)
 	}
 
 	if (INTEL_GEN(dev_priv) >= 9)
-		ret = drm_universal_plane_init(&dev_priv->drm, &primary->base,
+		ret = drm_universal_plane_init(&dev_priv->drm, &primary->base, /* init primary plane */
 					       0, &intel_plane_funcs,
 					       intel_primary_formats, num_formats,
 					       modifiers,
@@ -13406,7 +13406,7 @@ intel_cursor_plane_create(struct drm_i915_private *dev_priv,
 	if (IS_I845G(dev_priv) || IS_I865G(dev_priv) || HAS_CUR_FBC(dev_priv))
 		cursor->cursor.size = ~0;
 
-	ret = drm_universal_plane_init(&dev_priv->drm, &cursor->base,
+	ret = drm_universal_plane_init(&dev_priv->drm, &cursor->base, /* init cursor plane */
 				       0, &intel_cursor_plane_funcs,
 				       intel_cursor_formats,
 				       ARRAY_SIZE(intel_cursor_formats),
@@ -13504,7 +13504,7 @@ static int intel_crtc_init(struct drm_i915_private *dev_priv, enum pipe pipe)
 	}
 	intel_crtc->plane_ids_mask |= BIT(cursor->id);
 
-	ret = drm_crtc_init_with_planes(&dev_priv->drm, &intel_crtc->base,
+	ret = drm_crtc_init_with_planes(&dev_priv->drm, &intel_crtc->base, /* init crtc */
 					&primary->base, &cursor->base,
 					&intel_crtc_funcs,
 					"pipe %c", pipe_name(pipe));
@@ -14564,7 +14564,7 @@ int intel_modeset_init(struct drm_device *dev)
 
 	dev_priv->modeset_wq = alloc_ordered_workqueue("i915_modeset", 0);
 
-	drm_mode_config_init(dev);
+	drm_mode_config_init(dev); /*  */
 
 	dev->mode_config.min_width = 0;
 	dev->mode_config.min_height = 0;
