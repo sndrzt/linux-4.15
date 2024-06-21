@@ -63,10 +63,7 @@ MODULE_PARM_DESC(ignoreled, "Autosuspend with active leds");
 /* Quirks specified at module load time */
 static char *quirks_param[MAX_USBHID_BOOT_QUIRKS];
 module_param_array_named(quirks, quirks_param, charp, NULL, 0444);
-MODULE_PARM_DESC(quirks, "Add/modify USB HID quirks by specifying "
-		" quirks=vendorID:productID:quirks"
-		" where vendorID, productID, and quirks are all in"
-		" 0x-prefixed hex");
+MODULE_PARM_DESC(quirks, "Add/modify USB HID quirks by specifying " " quirks=vendorID:productID:quirks" " where vendorID, productID, and quirks are all in" " 0x-prefixed hex");
 /*
  * Input submission and I/O error handler.
  */
@@ -83,10 +80,7 @@ static int hid_start_in(struct hid_device *hid)
 	struct usbhid_device *usbhid = hid->driver_data;
 
 	spin_lock_irqsave(&usbhid->lock, flags);
-	if (test_bit(HID_IN_POLLING, &usbhid->iofl) &&
-	    !test_bit(HID_DISCONNECTED, &usbhid->iofl) &&
-	    !test_bit(HID_SUSPENDED, &usbhid->iofl) &&
-	    !test_and_set_bit(HID_IN_RUNNING, &usbhid->iofl)) {
+	if (test_bit(HID_IN_POLLING, &usbhid->iofl) && !test_bit(HID_DISCONNECTED, &usbhid->iofl) && !test_bit(HID_SUSPENDED, &usbhid->iofl) && !test_and_set_bit(HID_IN_RUNNING, &usbhid->iofl)) {
 		rc = usb_submit_urb(usbhid->urbin, GFP_ATOMIC);
 		if (rc != 0) {
 			clear_bit(HID_IN_RUNNING, &usbhid->iofl);
@@ -126,8 +120,7 @@ static void hid_reset(struct work_struct *work)
 		if (rc == 0) {
 			hid_start_in(hid);
 		} else {
-			dev_dbg(&usbhid->intf->dev,
-					"clear-halt failed: %d\n", rc);
+			dev_dbg(&usbhid->intf->dev, "clear-halt failed: %d\n", rc);
 			set_bit(HID_RESET_PENDING, &usbhid->iofl);
 		}
 	}
@@ -165,8 +158,7 @@ static void hid_io_error(struct hid_device *hid)
 	if (time_after(jiffies, usbhid->stop_retry)) {
 
 		/* Retries failed, so do a port reset unless we lack bandwidth*/
-		if (!test_bit(HID_NO_BANDWIDTH, &usbhid->iofl)
-		     && !test_and_set_bit(HID_RESET_PENDING, &usbhid->iofl)) {
+		if (!test_bit(HID_NO_BANDWIDTH, &usbhid->iofl) && !test_and_set_bit(HID_RESET_PENDING, &usbhid->iofl)) {
 
 			schedule_work(&usbhid->reset_work);
 			goto done;
@@ -192,8 +184,7 @@ static int usbhid_restart_out_queue(struct usbhid_device *usbhid)
 	int kicked;
 	int r;
 
-	if (!hid || test_bit(HID_RESET_PENDING, &usbhid->iofl) ||
-			test_bit(HID_SUSPENDED, &usbhid->iofl))
+	if (!hid || test_bit(HID_RESET_PENDING, &usbhid->iofl) || test_bit(HID_SUSPENDED, &usbhid->iofl))
 		return 0;
 
 	if ((kicked = (usbhid->outhead != usbhid->outtail))) {
@@ -231,8 +222,7 @@ static int usbhid_restart_ctrl_queue(struct usbhid_device *usbhid)
 	int r;
 
 	WARN_ON(hid == NULL);
-	if (!hid || test_bit(HID_RESET_PENDING, &usbhid->iofl) ||
-			test_bit(HID_SUSPENDED, &usbhid->iofl))
+	if (!hid || test_bit(HID_RESET_PENDING, &usbhid->iofl) || test_bit(HID_SUSPENDED, &usbhid->iofl))
 		return 0;
 
 	if ((kicked = (usbhid->ctrlhead != usbhid->ctrltail))) {
@@ -280,9 +270,7 @@ static void hid_irq_in(struct urb *urb)
 			break;
 		usbhid_mark_busy(usbhid);
 		if (!test_bit(HID_RESUME_RUNNING, &usbhid->iofl)) {
-			hid_input_report(urb->context, HID_INPUT_REPORT,
-					 urb->transfer_buffer,
-					 urb->actual_length, 1);
+			hid_input_report(urb->context, HID_INPUT_REPORT, urb->transfer_buffer, urb->actual_length, 1);
 			/*
 			 * autosuspend refused while keys are pressed
 			 * because most keyboards don't wake up when
@@ -322,10 +310,7 @@ static void hid_irq_in(struct urb *urb)
 	if (status) {
 		clear_bit(HID_IN_RUNNING, &usbhid->iofl);
 		if (status != -EPERM) {
-			hid_err(hid, "can't resubmit intr, %s-%s/input%d, status %d\n",
-				hid_to_usb_dev(hid)->bus->bus_name,
-				hid_to_usb_dev(hid)->devpath,
-				usbhid->ifnum, status);
+			hid_err(hid, "can't resubmit intr, %s-%s/input%d, status %d\n", hid_to_usb_dev(hid)->bus->bus_name, hid_to_usb_dev(hid)->devpath, usbhid->ifnum, status);
 			hid_io_error(hid);
 		}
 	}
@@ -344,8 +329,7 @@ static int hid_submit_out(struct hid_device *hid)
 	usbhid->urbout->transfer_buffer_length = hid_report_len(report);
 	usbhid->urbout->dev = hid_to_usb_dev(hid);
 	if (raw_report) {
-		memcpy(usbhid->outbuf, raw_report,
-				usbhid->urbout->transfer_buffer_length);
+		memcpy(usbhid->outbuf, raw_report, usbhid->urbout->transfer_buffer_length);
 		kfree(raw_report);
 		usbhid->out[usbhid->outtail].raw_report = NULL;
 	}
@@ -386,8 +370,7 @@ static int hid_submit_ctrl(struct hid_device *hid)
 		int maxpacket, padlen;
 
 		usbhid->urbctrl->pipe = usb_rcvctrlpipe(hid_to_usb_dev(hid), 0);
-		maxpacket = usb_maxpacket(hid_to_usb_dev(hid),
-					  usbhid->urbctrl->pipe, 0);
+		maxpacket = usb_maxpacket(hid_to_usb_dev(hid), usbhid->urbctrl->pipe, 0);
 		if (maxpacket > 0) {
 			padlen = DIV_ROUND_UP(len, maxpacket);
 			padlen *= maxpacket;
@@ -400,17 +383,13 @@ static int hid_submit_ctrl(struct hid_device *hid)
 	usbhid->urbctrl->dev = hid_to_usb_dev(hid);
 
 	usbhid->cr->bRequestType = USB_TYPE_CLASS | USB_RECIP_INTERFACE | dir;
-	usbhid->cr->bRequest = (dir == USB_DIR_OUT) ? HID_REQ_SET_REPORT :
-						      HID_REQ_GET_REPORT;
-	usbhid->cr->wValue = cpu_to_le16(((report->type + 1) << 8) |
-					 report->id);
+	usbhid->cr->bRequest = (dir == USB_DIR_OUT) ? HID_REQ_SET_REPORT : HID_REQ_GET_REPORT;
+	usbhid->cr->wValue = cpu_to_le16(((report->type + 1) << 8) | report->id);
 	usbhid->cr->wIndex = cpu_to_le16(usbhid->ifnum);
 	usbhid->cr->wLength = cpu_to_le16(len);
 
 	dbg_hid("submitting ctrl urb: %s wValue=0x%04x wIndex=0x%04x wLength=%u\n",
-		usbhid->cr->bRequest == HID_REQ_SET_REPORT ? "Set_Report" :
-							     "Get_Report",
-		usbhid->cr->wValue, usbhid->cr->wIndex, usbhid->cr->wLength);
+		usbhid->cr->bRequest == HID_REQ_SET_REPORT ? "Set_Report" : "Get_Report", usbhid->cr->wValue, usbhid->cr->wIndex, usbhid->cr->wLength);
 
 	r = usb_submit_urb(usbhid->urbctrl, GFP_ATOMIC);
 	if (r < 0) {
@@ -443,8 +422,7 @@ static void hid_irq_out(struct urb *urb)
 	case -ENOENT:
 		break;
 	default:		/* error */
-		hid_warn(urb->dev, "output irq status %d received\n",
-			 urb->status);
+		hid_warn(urb->dev, "output irq status %d received\n", urb->status);
 	}
 
 	spin_lock_irqsave(&usbhid->lock, flags);
@@ -454,8 +432,7 @@ static void hid_irq_out(struct urb *urb)
 	} else {
 		usbhid->outtail = (usbhid->outtail + 1) & (HID_OUTPUT_FIFO_SIZE - 1);
 
-		if (usbhid->outhead != usbhid->outtail &&
-				hid_submit_out(hid) == 0) {
+		if (usbhid->outhead != usbhid->outtail && hid_submit_out(hid) == 0) {
 			/* Successfully submitted next urb in queue */
 			spin_unlock_irqrestore(&usbhid->lock, flags);
 			return;
@@ -481,9 +458,7 @@ static void hid_ctrl(struct urb *urb)
 	switch (status) {
 	case 0:			/* success */
 		if (usbhid->ctrl[usbhid->ctrltail].dir == USB_DIR_IN)
-			hid_input_report(urb->context,
-				usbhid->ctrl[usbhid->ctrltail].report->type,
-				urb->transfer_buffer, urb->actual_length, 0);
+			hid_input_report(urb->context, usbhid->ctrl[usbhid->ctrltail].report->type, urb->transfer_buffer, urb->actual_length, 0);
 		break;
 	case -ESHUTDOWN:	/* unplug */
 		unplug = 1;
@@ -504,8 +479,7 @@ static void hid_ctrl(struct urb *urb)
 	} else if (usbhid->ctrlhead != usbhid->ctrltail) {
 		usbhid->ctrltail = (usbhid->ctrltail + 1) & (HID_CONTROL_FIFO_SIZE - 1);
 
-		if (usbhid->ctrlhead != usbhid->ctrltail &&
-				hid_submit_ctrl(hid) == 0) {
+		if (usbhid->ctrlhead != usbhid->ctrltail && hid_submit_ctrl(hid) == 0) {
 			/* Successfully submitted next urb in queue */
 			spin_unlock(&usbhid->lock);
 			return;
@@ -518,14 +492,12 @@ static void hid_ctrl(struct urb *urb)
 	wake_up(&usbhid->wait);
 }
 
-static void __usbhid_submit_report(struct hid_device *hid, struct hid_report *report,
-				   unsigned char dir)
+static void __usbhid_submit_report(struct hid_device *hid, struct hid_report *report, unsigned char dir)
 {
 	int head;
 	struct usbhid_device *usbhid = hid->driver_data;
 
-	if (((hid->quirks & HID_QUIRK_NOGET) && dir == USB_DIR_IN) ||
-		test_bit(HID_DISCONNECTED, &usbhid->iofl))
+	if (((hid->quirks & HID_QUIRK_NOGET) && dir == USB_DIR_IN) || test_bit(HID_DISCONNECTED, &usbhid->iofl))
 		return;
 
 	if (usbhid->urbout && dir == USB_DIR_OUT && report->type == HID_OUTPUT_REPORT) {
@@ -641,10 +613,7 @@ static int usbhid_wait_io(struct hid_device *hid)
 {
 	struct usbhid_device *usbhid = hid->driver_data;
 
-	if (!wait_event_timeout(usbhid->wait,
-				(!test_bit(HID_CTRL_RUNNING, &usbhid->iofl) &&
-				!test_bit(HID_OUT_RUNNING, &usbhid->iofl)),
-					10*HZ)) {
+	if (!wait_event_timeout(usbhid->wait, (!test_bit(HID_CTRL_RUNNING, &usbhid->iofl) && !test_bit(HID_OUT_RUNNING, &usbhid->iofl)), 10*HZ)) {
 		dbg_hid("timeout waiting for ctrl or out queue to clear\n");
 		return -1;
 	}
@@ -654,22 +623,17 @@ static int usbhid_wait_io(struct hid_device *hid)
 
 static int hid_set_idle(struct usb_device *dev, int ifnum, int report, int idle)
 {
-	return usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
-		HID_REQ_SET_IDLE, USB_TYPE_CLASS | USB_RECIP_INTERFACE, (idle << 8) | report,
-		ifnum, NULL, 0, USB_CTRL_SET_TIMEOUT);
+	return usb_control_msg(dev, usb_sndctrlpipe(dev, 0), HID_REQ_SET_IDLE, USB_TYPE_CLASS | USB_RECIP_INTERFACE, (idle << 8) | report, ifnum, NULL, 0, USB_CTRL_SET_TIMEOUT);
 }
 
-static int hid_get_class_descriptor(struct usb_device *dev, int ifnum,
-		unsigned char type, void *buf, int size)
+static int hid_get_class_descriptor(struct usb_device *dev, int ifnum, unsigned char type, void *buf, int size)
 {
 	int result, retries = 4;
 
 	memset(buf, 0, size);
 
 	do {
-		result = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
-				USB_REQ_GET_DESCRIPTOR, USB_RECIP_INTERFACE | USB_DIR_IN,
-				(type << 8), ifnum, buf, size, USB_CTRL_GET_TIMEOUT);
+		result = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0), USB_REQ_GET_DESCRIPTOR, USB_RECIP_INTERFACE | USB_DIR_IN, (type << 8), ifnum, buf, size, USB_CTRL_GET_TIMEOUT);
 		retries--;
 	} while (result < size && retries);
 	return result;
@@ -797,8 +761,7 @@ void usbhid_init_reports(struct hid_device *hid)
 /*
  * Reset LEDs which BIOS might have left on. For now, just NumLock (0x01).
  */
-static int hid_find_field_early(struct hid_device *hid, unsigned int page,
-    unsigned int hid_code, struct hid_field **pfield)
+static int hid_find_field_early(struct hid_device *hid, unsigned int page, unsigned int hid_code, struct hid_field **pfield)
 {
 	struct hid_report *report;
 	struct hid_field *field;
@@ -810,8 +773,7 @@ static int hid_find_field_early(struct hid_device *hid, unsigned int page,
 			field = report->field[i];
 			for (j = 0; j < field->maxusage; j++) {
 				usage = &field->usage[j];
-				if ((usage->hid & HID_USAGE_PAGE) == page &&
-				    (usage->hid & 0xFFFF) == hid_code) {
+				if ((usage->hid & HID_USAGE_PAGE) == page && (usage->hid & 0xFFFF) == hid_code) {
 					*pfield = field;
 					return j;
 				}
@@ -835,8 +797,7 @@ static void usbhid_set_leds(struct hid_device *hid)
 /*
  * Traverse the supplied list of reports and find the longest
  */
-static void hid_find_max_report(struct hid_device *hid, unsigned int type,
-		unsigned int *max)
+static void hid_find_max_report(struct hid_device *hid, unsigned int type, unsigned int *max)
 {
 	struct hid_report *report;
 	unsigned int size;
@@ -852,23 +813,17 @@ static int hid_alloc_buffers(struct usb_device *dev, struct hid_device *hid)
 {
 	struct usbhid_device *usbhid = hid->driver_data;
 
-	usbhid->inbuf = usb_alloc_coherent(dev, usbhid->bufsize, GFP_KERNEL,
-			&usbhid->inbuf_dma);
-	usbhid->outbuf = usb_alloc_coherent(dev, usbhid->bufsize, GFP_KERNEL,
-			&usbhid->outbuf_dma);
+	usbhid->inbuf = usb_alloc_coherent(dev, usbhid->bufsize, GFP_KERNEL, &usbhid->inbuf_dma);
+	usbhid->outbuf = usb_alloc_coherent(dev, usbhid->bufsize, GFP_KERNEL, &usbhid->outbuf_dma);
 	usbhid->cr = kmalloc(sizeof(*usbhid->cr), GFP_KERNEL);
-	usbhid->ctrlbuf = usb_alloc_coherent(dev, usbhid->bufsize, GFP_KERNEL,
-			&usbhid->ctrlbuf_dma);
-	if (!usbhid->inbuf || !usbhid->outbuf || !usbhid->cr ||
-			!usbhid->ctrlbuf)
+	usbhid->ctrlbuf = usb_alloc_coherent(dev, usbhid->bufsize, GFP_KERNEL, &usbhid->ctrlbuf_dma);
+	if (!usbhid->inbuf || !usbhid->outbuf || !usbhid->cr || !usbhid->ctrlbuf)
 		return -1;
 
 	return 0;
 }
 
-static int usbhid_get_raw_report(struct hid_device *hid,
-		unsigned char report_number, __u8 *buf, size_t count,
-		unsigned char report_type)
+static int usbhid_get_raw_report(struct hid_device *hid, unsigned char report_number, __u8 *buf, size_t count, unsigned char report_type)
 {
 	struct usbhid_device *usbhid = hid->driver_data;
 	struct usb_device *dev = hid_to_usb_dev(hid);
@@ -887,11 +842,7 @@ static int usbhid_get_raw_report(struct hid_device *hid,
 		skipped_report_id = 1;
 	}
 	ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
-		HID_REQ_GET_REPORT,
-		USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-		((report_type + 1) << 8) | report_number,
-		interface->desc.bInterfaceNumber, buf, count,
-		USB_CTRL_SET_TIMEOUT);
+		HID_REQ_GET_REPORT, USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE, ((report_type + 1) << 8) | report_number, interface->desc.bInterfaceNumber, buf, count, USB_CTRL_SET_TIMEOUT);
 
 	/* count also the report id */
 	if (ret > 0 && skipped_report_id)
@@ -900,8 +851,7 @@ static int usbhid_get_raw_report(struct hid_device *hid,
 	return ret;
 }
 
-static int usbhid_set_raw_report(struct hid_device *hid, unsigned int reportnum,
-				 __u8 *buf, size_t count, unsigned char rtype)
+static int usbhid_set_raw_report(struct hid_device *hid, unsigned int reportnum, __u8 *buf, size_t count, unsigned char rtype)
 {
 	struct usbhid_device *usbhid = hid->driver_data;
 	struct usb_device *dev = hid_to_usb_dev(hid);
@@ -923,12 +873,8 @@ static int usbhid_set_raw_report(struct hid_device *hid, unsigned int reportnum,
 		skipped_report_id = 1;
 	}
 
-	ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
-			HID_REQ_SET_REPORT,
-			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-			((rtype + 1) << 8) | reportnum,
-			interface->desc.bInterfaceNumber, buf, count,
-			USB_CTRL_SET_TIMEOUT);
+	ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0), HID_REQ_SET_REPORT, USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE, ((rtype + 1) << 8) | reportnum,
+			interface->desc.bInterfaceNumber, buf, count, USB_CTRL_SET_TIMEOUT);
 	/* count also the report id, if this was a numbered report. */
 	if (ret > 0 && skipped_report_id)
 		ret++;
@@ -952,9 +898,7 @@ static int usbhid_output_report(struct hid_device *hid, __u8 *buf, size_t count)
 		skipped_report_id = 1;
 	}
 
-	ret = usb_interrupt_msg(dev, usbhid->urbout->pipe,
-				buf, count, &actual_length,
-				USB_CTRL_SET_TIMEOUT);
+	ret = usb_interrupt_msg(dev, usbhid->urbout->pipe, buf, count, &actual_length, USB_CTRL_SET_TIMEOUT);
 	/* return the number of bytes transferred */
 	if (ret == 0) {
 		ret = actual_length;
@@ -997,14 +941,11 @@ static int usbhid_parse(struct hid_device *hid)
 	/* Many keyboards and mice don't like to be polled for reports,
 	 * so we will always set the HID_QUIRK_NOGET flag for them. */
 	if (interface->desc.bInterfaceSubClass == USB_INTERFACE_SUBCLASS_BOOT) {
-		if (interface->desc.bInterfaceProtocol == USB_INTERFACE_PROTOCOL_KEYBOARD ||
-			interface->desc.bInterfaceProtocol == USB_INTERFACE_PROTOCOL_MOUSE)
+		if (interface->desc.bInterfaceProtocol == USB_INTERFACE_PROTOCOL_KEYBOARD || interface->desc.bInterfaceProtocol == USB_INTERFACE_PROTOCOL_MOUSE)
 				quirks |= HID_QUIRK_NOGET;
 	}
 
-	if (usb_get_extra_descriptor(interface, HID_DT_HID, &hdesc) &&
-	    (!interface->desc.bNumEndpoints ||
-	     usb_get_extra_descriptor(&interface->endpoint[0], HID_DT_HID, &hdesc))) {
+	if (usb_get_extra_descriptor(interface, HID_DT_HID, &hdesc) && (!interface->desc.bNumEndpoints || usb_get_extra_descriptor(&interface->endpoint[0], HID_DT_HID, &hdesc))) {
 		dbg_hid("class descriptor not present\n");
 		return -ENODEV;
 	}
@@ -1017,8 +958,7 @@ static int usbhid_parse(struct hid_device *hid)
 	hid->version = le16_to_cpu(hdesc->bcdHID);
 	hid->country = hdesc->bCountryCode;
 
-	num_descriptors = min_t(int, hdesc->bNumDescriptors,
-	       (hdesc->bLength - offset) / sizeof(struct hid_class_descriptor));
+	num_descriptors = min_t(int, hdesc->bNumDescriptors, (hdesc->bLength - offset) / sizeof(struct hid_class_descriptor));
 
 	for (n = 0; n < num_descriptors; n++)
 		if (hdesc->desc[n].bDescriptorType == HID_DT_REPORT)
@@ -1035,8 +975,7 @@ static int usbhid_parse(struct hid_device *hid)
 
 	hid_set_idle(dev, interface->desc.bInterfaceNumber, 0, 0);
 
-	ret = hid_get_class_descriptor(dev, interface->desc.bInterfaceNumber,
-			HID_DT_REPORT, rdesc, rsize);
+	ret = hid_get_class_descriptor(dev, interface->desc.bInterfaceNumber, HID_DT_REPORT, rdesc, rsize);
 	if (ret < 0) {
 		dbg_hid("reading report descriptor failed\n");
 		kfree(rdesc);
@@ -1100,11 +1039,9 @@ static int usbhid_start(struct hid_device *hid)
 		interval = endpoint->bInterval;
 
 		/* Some vendors give fullspeed interval on highspeed devides */
-		if (hid->quirks & HID_QUIRK_FULLSPEED_INTERVAL &&
-		    dev->speed == USB_SPEED_HIGH) {
+		if (hid->quirks & HID_QUIRK_FULLSPEED_INTERVAL && dev->speed == USB_SPEED_HIGH) {
 			interval = fls(endpoint->bInterval*8);
-			pr_info("%s: Fixing fullspeed to highspeed interval: %d -> %d\n",
-				hid->name, endpoint->bInterval, interval);
+			pr_info("%s: Fixing fullspeed to highspeed interval: %d -> %d\n", hid->name, endpoint->bInterval, interval);
 		}
 
 		/* Change the polling interval of mice and joysticks. */
@@ -1126,8 +1063,7 @@ static int usbhid_start(struct hid_device *hid)
 			if (!(usbhid->urbin = usb_alloc_urb(0, GFP_KERNEL)))
 				goto fail;
 			pipe = usb_rcvintpipe(dev, endpoint->bEndpointAddress);
-			usb_fill_int_urb(usbhid->urbin, dev, pipe, usbhid->inbuf, insize,
-					 hid_irq_in, hid, interval);
+			usb_fill_int_urb(usbhid->urbin, dev, pipe, usbhid->inbuf, insize, hid_irq_in, hid, interval);
 			usbhid->urbin->transfer_dma = usbhid->inbuf_dma;
 			usbhid->urbin->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 		} else {
@@ -1149,8 +1085,7 @@ static int usbhid_start(struct hid_device *hid)
 		goto fail;
 	}
 
-	usb_fill_control_urb(usbhid->urbctrl, dev, 0, (void *) usbhid->cr,
-			     usbhid->ctrlbuf, 1, hid_ctrl, hid);
+	usb_fill_control_urb(usbhid->urbctrl, dev, 0, (void *) usbhid->cr, usbhid->ctrlbuf, 1, hid_ctrl, hid);
 	usbhid->urbctrl->transfer_dma = usbhid->ctrlbuf_dma;
 	usbhid->urbctrl->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
@@ -1164,8 +1099,7 @@ static int usbhid_start(struct hid_device *hid)
 		usbhid->intf->needs_remote_wakeup = 1;
 		ret = hid_start_in(hid);
 		if (ret) {
-			dev_err(&hid->dev,
-				"failed to start in urb: %d\n", ret);
+			dev_err(&hid->dev, "failed to start in urb: %d\n", ret);
 		}
 		usb_autopm_put_interface(usbhid->intf);
 	}
@@ -1176,9 +1110,7 @@ static int usbhid_start(struct hid_device *hid)
 	 * In addition, enable remote wakeup by default for all keyboard
 	 * devices supporting the boot protocol.
 	 */
-	if (interface->desc.bInterfaceSubClass == USB_INTERFACE_SUBCLASS_BOOT &&
-			interface->desc.bInterfaceProtocol ==
-				USB_INTERFACE_PROTOCOL_KEYBOARD) {
+	if (interface->desc.bInterfaceSubClass == USB_INTERFACE_SUBCLASS_BOOT && interface->desc.bInterfaceProtocol == USB_INTERFACE_PROTOCOL_KEYBOARD) {
 		usbhid_set_leds(hid);
 		device_set_wakeup_enable(&dev->dev, 1);
 	}
@@ -1222,8 +1154,7 @@ static void usbhid_stop(struct hid_device *hid)
 			usbhid->ctrl[usbhid->ctrltail].raw_report = NULL;
 		}
 
-		usbhid->ctrltail = (usbhid->ctrltail + 1) &
-			(HID_CONTROL_FIFO_SIZE - 1);
+		usbhid->ctrltail = (usbhid->ctrltail + 1) & (HID_CONTROL_FIFO_SIZE - 1);
 	}
 	spin_unlock_irq(&usbhid->lock);
 
@@ -1277,8 +1208,7 @@ static void usbhid_request(struct hid_device *hid, struct hid_report *rep, int r
 	}
 }
 
-static int usbhid_raw_request(struct hid_device *hid, unsigned char reportnum,
-			      __u8 *buf, size_t len, unsigned char rtype,
+static int usbhid_raw_request(struct hid_device *hid, unsigned char reportnum, __u8 *buf, size_t len, unsigned char rtype,
 			      int reqtype)
 {
 	switch (reqtype) {
@@ -1330,8 +1260,7 @@ static int usbhid_probe(struct usb_interface *intf, const struct usb_device_id *
 	size_t len;
 	int ret;
 
-	dbg_hid("HID probe called for ifnum %d\n",
-			intf->altsetting->desc.bInterfaceNumber);
+	dbg_hid("HID probe called for ifnum %d\n", intf->altsetting->desc.bInterfaceNumber);
 
 	for (n = 0; n < interface->desc.bNumEndpoints; n++)
 		if (usb_endpoint_is_int_in(&interface->endpoint[n].desc))
@@ -1359,8 +1288,7 @@ static int usbhid_probe(struct usb_interface *intf, const struct usb_device_id *
 	hid->vendor = le16_to_cpu(dev->descriptor.idVendor);
 	hid->product = le16_to_cpu(dev->descriptor.idProduct);
 	hid->name[0] = 0;
-	if (intf->cur_altsetting->desc.bInterfaceProtocol ==
-			USB_INTERFACE_PROTOCOL_MOUSE)
+	if (intf->cur_altsetting->desc.bInterfaceProtocol == USB_INTERFACE_PROTOCOL_MOUSE)
 		hid->type = HID_TYPE_USBMOUSE;
 	else if (intf->cur_altsetting->desc.bInterfaceProtocol == 0)
 		hid->type = HID_TYPE_USBNONE;
@@ -1375,16 +1303,13 @@ static int usbhid_probe(struct usb_interface *intf, const struct usb_device_id *
 	}
 
 	if (!strlen(hid->name))
-		snprintf(hid->name, sizeof(hid->name), "HID %04x:%04x",
-			 le16_to_cpu(dev->descriptor.idVendor),
-			 le16_to_cpu(dev->descriptor.idProduct));
+		snprintf(hid->name, sizeof(hid->name), "HID %04x:%04x", le16_to_cpu(dev->descriptor.idVendor), le16_to_cpu(dev->descriptor.idProduct));
 
 	usb_make_path(dev, hid->phys, sizeof(hid->phys));
 	strlcat(hid->phys, "/input", sizeof(hid->phys));
 	len = strlen(hid->phys);
 	if (len < sizeof(hid->phys) - 1)
-		snprintf(hid->phys + len, sizeof(hid->phys) - len,
-			 "%d", intf->altsetting[0].desc.bInterfaceNumber);
+		snprintf(hid->phys + len, sizeof(hid->phys) - len, "%d", intf->altsetting[0].desc.bInterfaceNumber);
 
 	if (usb_string(dev, dev->descriptor.iSerialNumber, hid->uniq, 64) <= 0)
 		hid->uniq[0] = 0;
@@ -1515,9 +1440,7 @@ static int hid_post_reset(struct usb_interface *intf)
 	if (!rdesc)
 		return -ENOMEM;
 
-	status = hid_get_class_descriptor(dev,
-				interface->desc.bInterfaceNumber,
-				HID_DT_REPORT, rdesc, hid->dev_rsize);
+	status = hid_get_class_descriptor(dev, interface->desc.bInterfaceNumber, HID_DT_REPORT, rdesc, hid->dev_rsize);
 	if (status < 0) {
 		dbg_hid("reading report descriptor failed (post_reset)\n");
 		kfree(rdesc);
@@ -1640,8 +1563,7 @@ static int hid_reset_resume(struct usb_interface *intf)
 #endif /* CONFIG_PM */
 
 static const struct usb_device_id hid_usb_ids[] = {
-	{ .match_flags = USB_DEVICE_ID_MATCH_INT_CLASS,
-		.bInterfaceClass = USB_INTERFACE_CLASS_HID },
+	{ .match_flags = USB_DEVICE_ID_MATCH_INT_CLASS, .bInterfaceClass = USB_INTERFACE_CLASS_HID },
 	{ }						/* Terminating entry */
 };
 

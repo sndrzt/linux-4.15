@@ -213,26 +213,12 @@ static const struct {
 	int val;
 	int val2;
 	u8 bw_bits;
-} bmc150_accel_samp_freq_table[] = { {15, 620000, 0x08},
-				     {31, 260000, 0x09},
-				     {62, 500000, 0x0A},
-				     {125, 0, 0x0B},
-				     {250, 0, 0x0C},
-				     {500, 0, 0x0D},
-				     {1000, 0, 0x0E},
-				     {2000, 0, 0x0F} };
+} bmc150_accel_samp_freq_table[] = { {15, 620000, 0x08}, {31, 260000, 0x09}, {62, 500000, 0x0A}, {125, 0, 0x0B}, {250, 0, 0x0C}, {500, 0, 0x0D}, {1000, 0, 0x0E}, {2000, 0, 0x0F} };
 
 static const struct {
 	int bw_bits;
 	int msec;
-} bmc150_accel_sample_upd_time[] = { {0x08, 64},
-				     {0x09, 32},
-				     {0x0A, 16},
-				     {0x0B, 8},
-				     {0x0C, 4},
-				     {0x0D, 2},
-				     {0x0E, 1},
-				     {0x0F, 1} };
+} bmc150_accel_sample_upd_time[] = { {0x08, 64}, {0x09, 32}, {0x0A, 16}, {0x0B, 8}, {0x0C, 4}, {0x0D, 2}, {0x0E, 1}, {0x0F, 1} };
 
 static const struct {
 	int sleep_dur;
@@ -257,9 +243,7 @@ const struct regmap_config bmc150_regmap_conf = {
 };
 EXPORT_SYMBOL_GPL(bmc150_regmap_conf);
 
-static int bmc150_accel_set_mode(struct bmc150_accel_data *data,
-				 enum bmc150_power_modes mode,
-				 int dur_us)
+static int bmc150_accel_set_mode(struct bmc150_accel_data *data, enum bmc150_power_modes mode, int dur_us)
 {
 	struct device *dev = regmap_get_device(data->regmap);
 	int i;
@@ -301,14 +285,11 @@ static int bmc150_accel_set_bw(struct bmc150_accel_data *data, int val, int val2
 	for (i = 0; i < ARRAY_SIZE(bmc150_accel_samp_freq_table); ++i) {
 		if (bmc150_accel_samp_freq_table[i].val == val &&
 		    bmc150_accel_samp_freq_table[i].val2 == val2) {
-			ret = regmap_write(data->regmap,
-				BMC150_ACCEL_REG_PMU_BW,
-				bmc150_accel_samp_freq_table[i].bw_bits);
+			ret = regmap_write(data->regmap, BMC150_ACCEL_REG_PMU_BW, bmc150_accel_samp_freq_table[i].bw_bits);
 			if (ret < 0)
 				return ret;
 
-			data->bw_bits =
-				bmc150_accel_samp_freq_table[i].bw_bits;
+			data->bw_bits = bmc150_accel_samp_freq_table[i].bw_bits;
 			return 0;
 		}
 	}
@@ -433,8 +414,7 @@ static const struct bmc150_accel_interrupt_info {
 	},
 };
 
-static void bmc150_accel_interrupts_setup(struct iio_dev *indio_dev,
-					  struct bmc150_accel_data *data)
+static void bmc150_accel_interrupts_setup(struct iio_dev *indio_dev, struct bmc150_accel_data *data)
 {
 	int i;
 
@@ -442,8 +422,7 @@ static void bmc150_accel_interrupts_setup(struct iio_dev *indio_dev,
 		data->interrupts[i].info = &bmc150_accel_interrupts[i];
 }
 
-static int bmc150_accel_set_interrupt(struct bmc150_accel_data *data, int i,
-				      bool state)
+static int bmc150_accel_set_interrupt(struct bmc150_accel_data *data, int i, bool state)
 {
 	struct device *dev = regmap_get_device(data->regmap);
 	struct bmc150_accel_interrupt *intr = &data->interrupts[i];
@@ -937,8 +916,7 @@ static const struct iio_event_spec bmc150_accel_event = {
 	.modified = 1,							\
 	.channel2 = IIO_MOD_##_axis,					\
 	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),			\
-	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) |		\
-				BIT(IIO_CHAN_INFO_SAMP_FREQ),		\
+	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) | BIT(IIO_CHAN_INFO_SAMP_FREQ),		\
 	.scan_index = AXIS_##_axis,					\
 	.scan_type = {							\
 		.sign = 's',						\
@@ -954,9 +932,7 @@ static const struct iio_event_spec bmc150_accel_event = {
 #define BMC150_ACCEL_CHANNELS(bits) {					\
 	{								\
 		.type = IIO_TEMP,					\
-		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |		\
-				      BIT(IIO_CHAN_INFO_SCALE) |	\
-				      BIT(IIO_CHAN_INFO_OFFSET),	\
+		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_SCALE) | BIT(IIO_CHAN_INFO_OFFSET),	\
 		.scan_index = -1,					\
 	},								\
 	BMC150_ACCEL_CHANNEL(X, bits),					\
@@ -965,14 +941,10 @@ static const struct iio_event_spec bmc150_accel_event = {
 	IIO_CHAN_SOFT_TIMESTAMP(3),					\
 }
 
-static const struct iio_chan_spec bma222e_accel_channels[] =
-	BMC150_ACCEL_CHANNELS(8);
-static const struct iio_chan_spec bma250e_accel_channels[] =
-	BMC150_ACCEL_CHANNELS(10);
-static const struct iio_chan_spec bmc150_accel_channels[] =
-	BMC150_ACCEL_CHANNELS(12);
-static const struct iio_chan_spec bma280_accel_channels[] =
-	BMC150_ACCEL_CHANNELS(14);
+static const struct iio_chan_spec bma222e_accel_channels[] = BMC150_ACCEL_CHANNELS(8);
+static const struct iio_chan_spec bma250e_accel_channels[] = BMC150_ACCEL_CHANNELS(10);
+static const struct iio_chan_spec bmc150_accel_channels[] = BMC150_ACCEL_CHANNELS(12);
+static const struct iio_chan_spec bma280_accel_channels[] = BMC150_ACCEL_CHANNELS(14);
 
 static const struct bmc150_accel_chip_info bmc150_accel_chip_info_tbl[] = {
 	[bmc150] = {
@@ -980,10 +952,7 @@ static const struct bmc150_accel_chip_info bmc150_accel_chip_info_tbl[] = {
 		.chip_id = 0xFA,
 		.channels = bmc150_accel_channels,
 		.num_channels = ARRAY_SIZE(bmc150_accel_channels),
-		.scale_table = { {9610, BMC150_ACCEL_DEF_RANGE_2G},
-				 {19122, BMC150_ACCEL_DEF_RANGE_4G},
-				 {38344, BMC150_ACCEL_DEF_RANGE_8G},
-				 {76590, BMC150_ACCEL_DEF_RANGE_16G} },
+		.scale_table = { {9610, BMC150_ACCEL_DEF_RANGE_2G}, {19122, BMC150_ACCEL_DEF_RANGE_4G}, {38344, BMC150_ACCEL_DEF_RANGE_8G}, {76590, BMC150_ACCEL_DEF_RANGE_16G} },
 	},
 };
 
@@ -1010,9 +979,7 @@ static const struct iio_info bmc150_accel_info_fifo = {
 	.hwfifo_flush_to_buffer	= bmc150_accel_fifo_flush,
 };
 
-static const unsigned long bmc150_accel_scan_masks[] = {
-					BIT(AXIS_X) | BIT(AXIS_Y) | BIT(AXIS_Z),
-					0};
+static const unsigned long bmc150_accel_scan_masks[] = { BIT(AXIS_X) | BIT(AXIS_Y) | BIT(AXIS_Z), 0};
 
 static irqreturn_t bmc150_accel_trigger_handler(int irq, void *p)
 {
@@ -1497,7 +1464,7 @@ int bmc150_accel_core_probe(struct device *dev, struct regmap *regmap, int irq, 
 	pm_runtime_set_autosuspend_delay(dev, BMC150_AUTO_SUSPEND_DELAY_MS);
 	pm_runtime_use_autosuspend(dev);
 
-	ret = iio_device_register(indio_dev);
+	ret = iio_device_register(indio_dev); /* sndrz: register iio_device */
 	if (ret < 0) {
 		dev_err(dev, "Unable to register iio device\n");
 		goto err_trigger_unregister;
@@ -1519,7 +1486,7 @@ int bmc150_accel_core_remove(struct device *dev)
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct bmc150_accel_data *data = iio_priv(indio_dev);
 
-	iio_device_unregister(indio_dev);
+	iio_device_unregister(indio_dev); /* unregister iio_device */
 
 	pm_runtime_disable(dev);
 	pm_runtime_set_suspended(dev);
@@ -1612,6 +1579,369 @@ const struct dev_pm_ops bmc150_accel_pm_ops = {
 };
 EXPORT_SYMBOL_GPL(bmc150_accel_pm_ops);
 
+/*
+ * Copyright (c) 2012 Analog Devices, Inc.
+ *  Author: Lars-Peter Clausen <lars@metafoo.de>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 as published by
+ * the Free Software Foundation.
+ */
+
+#include <linux/kernel.h>
+#include <linux/export.h>
+#include <linux/module.h>
+#include <linux/iio/iio.h>
+#include <linux/iio/buffer.h>
+#include <linux/iio/kfifo_buf.h>
+#include <linux/iio/triggered_buffer.h>
+#include <linux/iio/trigger_consumer.h>
+
+static const struct iio_buffer_setup_ops iio_triggered_buffer_setup_ops = {
+	.postenable = &iio_triggered_buffer_postenable,
+	.predisable = &iio_triggered_buffer_predisable,
+};
+
+/**
+ * iio_triggered_buffer_setup() - Setup triggered buffer and pollfunc
+ * @indio_dev:		IIO device structure
+ * @h:			Function which will be used as pollfunc top half
+ * @thread:		Function which will be used as pollfunc bottom half
+ * @setup_ops:		Buffer setup functions to use for this device.
+ *			If NULL the default setup functions for triggered
+ *			buffers will be used.
+ *
+ * This function combines some common tasks which will normally be performed
+ * when setting up a triggered buffer. It will allocate the buffer and the
+ * pollfunc.
+ *
+ * Before calling this function the indio_dev structure should already be
+ * completely initialized, but not yet registered. In practice this means that
+ * this function should be called right before iio_device_register().
+ *
+ * To free the resources allocated by this function call
+ * iio_triggered_buffer_cleanup().
+ */
+int iio_triggered_buffer_setup(struct iio_dev *indio_dev,
+	irqreturn_t (*h)(int irq, void *p),
+	irqreturn_t (*thread)(int irq, void *p),
+	const struct iio_buffer_setup_ops *setup_ops)
+{
+	struct iio_buffer *buffer;
+	int ret;
+
+	buffer = iio_kfifo_allocate();
+	if (!buffer) {
+		ret = -ENOMEM;
+		goto error_ret;
+	}
+
+	iio_device_attach_buffer(indio_dev, buffer);
+
+	indio_dev->pollfunc = iio_alloc_pollfunc(h,
+						 thread,
+						 IRQF_ONESHOT,
+						 indio_dev,
+						 "%s_consumer%d",
+						 indio_dev->name,
+						 indio_dev->id);
+	if (indio_dev->pollfunc == NULL) {
+		ret = -ENOMEM;
+		goto error_kfifo_free;
+	}
+
+	/* Ring buffer functions - here trigger setup related */
+	if (setup_ops)
+		indio_dev->setup_ops = setup_ops;
+	else
+		indio_dev->setup_ops = &iio_triggered_buffer_setup_ops;
+
+	/* Flag that polled ring buffering is possible */
+	indio_dev->modes |= INDIO_BUFFER_TRIGGERED;
+
+	return 0;
+
+error_kfifo_free:
+	iio_kfifo_free(indio_dev->buffer);
+error_ret:
+	return ret;
+}
+EXPORT_SYMBOL(iio_triggered_buffer_setup);
+
+/**
+ * iio_triggered_buffer_cleanup() - Free resources allocated by iio_triggered_buffer_setup()
+ * @indio_dev: IIO device structure
+ */
+void iio_triggered_buffer_cleanup(struct iio_dev *indio_dev)
+{
+	iio_dealloc_pollfunc(indio_dev->pollfunc);
+	iio_kfifo_free(indio_dev->buffer);
+}
+EXPORT_SYMBOL(iio_triggered_buffer_cleanup);
+
+static void devm_iio_triggered_buffer_clean(struct device *dev, void *res)
+{
+	iio_triggered_buffer_cleanup(*(struct iio_dev **)res);
+}
+
+//MODULE_AUTHOR("Lars-Peter Clausen <lars@metafoo.de>");
+//MODULE_DESCRIPTION("IIO helper functions for setting up triggered buffers");
+//MODULE_LICENSE("GPL");
+
+#include <linux/slab.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/device.h>
+#include <linux/workqueue.h>
+#include <linux/kfifo.h>
+#include <linux/mutex.h>
+#include <linux/iio/iio.h>
+#include <linux/iio/buffer.h>
+#include <linux/iio/kfifo_buf.h>
+#include <linux/iio/buffer_impl.h>
+#include <linux/sched.h>
+#include <linux/poll.h>
+
+struct iio_kfifo {
+	struct iio_buffer buffer;
+	struct kfifo kf;
+	struct mutex user_lock;
+	int update_needed;
+};
+
+#define iio_to_kfifo(r) container_of(r, struct iio_kfifo, buffer)
+
+static inline int __iio_allocate_kfifo(struct iio_kfifo *buf,
+			size_t bytes_per_datum, unsigned int length)
+{
+	if ((length == 0) || (bytes_per_datum == 0))
+		return -EINVAL;
+
+	/*
+	 * Make sure we don't overflow an unsigned int after kfifo rounds up to
+	 * the next power of 2.
+	 */
+	if (roundup_pow_of_two(length) > UINT_MAX / bytes_per_datum)
+		return -EINVAL;
+
+	return __kfifo_alloc((struct __kfifo *)&buf->kf, length,
+			     bytes_per_datum, GFP_KERNEL);
+}
+
+static int iio_request_update_kfifo(struct iio_buffer *r)
+{
+	int ret = 0;
+	struct iio_kfifo *buf = iio_to_kfifo(r);
+
+	mutex_lock(&buf->user_lock);
+	if (buf->update_needed) {
+		kfifo_free(&buf->kf);
+		ret = __iio_allocate_kfifo(buf, buf->buffer.bytes_per_datum,
+				   buf->buffer.length);
+		if (ret >= 0)
+			buf->update_needed = false;
+	} else {
+		kfifo_reset_out(&buf->kf);
+	}
+	mutex_unlock(&buf->user_lock);
+
+	return ret;
+}
+
+static int iio_mark_update_needed_kfifo(struct iio_buffer *r)
+{
+	struct iio_kfifo *kf = iio_to_kfifo(r);
+	kf->update_needed = true;
+	return 0;
+}
+
+static int iio_set_bytes_per_datum_kfifo(struct iio_buffer *r, size_t bpd)
+{
+	if (r->bytes_per_datum != bpd) {
+		r->bytes_per_datum = bpd;
+		iio_mark_update_needed_kfifo(r);
+	}
+	return 0;
+}
+
+static int iio_set_length_kfifo(struct iio_buffer *r, unsigned int length)
+{
+	/* Avoid an invalid state */
+	if (length < 2)
+		length = 2;
+	if (r->length != length) {
+		r->length = length;
+		iio_mark_update_needed_kfifo(r);
+	}
+	return 0;
+}
+
+static int iio_store_to_kfifo(struct iio_buffer *r,
+			      const void *data)
+{
+	int ret;
+	struct iio_kfifo *kf = iio_to_kfifo(r);
+	ret = kfifo_in(&kf->kf, data, 1);
+	if (ret != 1)
+		return -EBUSY;
+	return 0;
+}
+
+static int iio_read_first_n_kfifo(struct iio_buffer *r,
+			   size_t n, char __user *buf)
+{
+	int ret, copied;
+	struct iio_kfifo *kf = iio_to_kfifo(r);
+
+	if (mutex_lock_interruptible(&kf->user_lock))
+		return -ERESTARTSYS;
+
+	if (!kfifo_initialized(&kf->kf) || n < kfifo_esize(&kf->kf))
+		ret = -EINVAL;
+	else
+		ret = kfifo_to_user(&kf->kf, buf, n, &copied);
+	mutex_unlock(&kf->user_lock);
+	if (ret < 0)
+		return ret;
+
+	return copied;
+}
+
+static size_t iio_kfifo_buf_data_available(struct iio_buffer *r)
+{
+	struct iio_kfifo *kf = iio_to_kfifo(r);
+	size_t samples;
+
+	mutex_lock(&kf->user_lock);
+	samples = kfifo_len(&kf->kf);
+	mutex_unlock(&kf->user_lock);
+
+	return samples;
+}
+
+static void iio_kfifo_buffer_release(struct iio_buffer *buffer)
+{
+	struct iio_kfifo *kf = iio_to_kfifo(buffer);
+
+	mutex_destroy(&kf->user_lock);
+	kfifo_free(&kf->kf);
+	kfree(kf);
+}
+
+static const struct iio_buffer_access_funcs kfifo_access_funcs = {
+	.store_to = &iio_store_to_kfifo,
+	.read_first_n = &iio_read_first_n_kfifo,
+	.data_available = iio_kfifo_buf_data_available,
+	.request_update = &iio_request_update_kfifo,
+	.set_bytes_per_datum = &iio_set_bytes_per_datum_kfifo,
+	.set_length = &iio_set_length_kfifo,
+	.release = &iio_kfifo_buffer_release,
+
+	.modes = INDIO_BUFFER_SOFTWARE | INDIO_BUFFER_TRIGGERED,
+};
+
+struct iio_buffer *iio_kfifo_allocate(void)
+{
+	struct iio_kfifo *kf;
+
+	kf = kzalloc(sizeof(*kf), GFP_KERNEL);
+	if (!kf)
+		return NULL;
+
+	kf->update_needed = true;
+	iio_buffer_init(&kf->buffer);
+	kf->buffer.access = &kfifo_access_funcs;
+	kf->buffer.length = 2;
+	mutex_init(&kf->user_lock);
+
+	return &kf->buffer;
+}
+EXPORT_SYMBOL(iio_kfifo_allocate);
+
+void iio_kfifo_free(struct iio_buffer *r)
+{
+	iio_buffer_put(r);
+}
+EXPORT_SYMBOL(iio_kfifo_free);
+
+static void devm_iio_kfifo_release(struct device *dev, void *res)
+{
+	iio_kfifo_free(*(struct iio_buffer **)res);
+}
+
+static int devm_iio_kfifo_match(struct device *dev, void *res, void *data)
+{
+	struct iio_buffer **r = res;
+
+	if (WARN_ON(!r || !*r))
+		return 0;
+
+	return *r == data;
+}
+
+//MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>");
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("BMC150 accelerometer driver");
+
+/****SDI**PS****CSB*****
+************************
+SDO******************SCL
+************************
+INT1*****************VIO
+******* TOP VIEW *******
+INT2*****************GND
+************************
+DRDY*****************VDD
+************************
+*****INT3**GND**GND*****/
+ 
+#include <linux/device.h>
+#include <linux/mod_devicetable.h>
+#include <linux/i2c.h>
+#include <linux/module.h>
+#include <linux/acpi.h>
+#include <linux/regmap.h>
+
+#include "bmc150-accel.h"
+
+static int bmc150_accel_probe(struct i2c_client *client, const struct i2c_device_id *id)
+{
+	struct regmap *regmap;
+	const char *name = NULL;
+	bool block_supported = i2c_check_functionality(client->adapter, I2C_FUNC_I2C) || i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_READ_I2C_BLOCK);
+
+	regmap = devm_regmap_init_i2c(client, &bmc150_regmap_conf);
+	if (IS_ERR(regmap)) {
+		dev_err(&client->dev, "Failed to initialize i2c regmap\n");
+		return PTR_ERR(regmap);
+	}
+
+	if (id)
+		name = id->name;
+
+	return bmc150_accel_core_probe(&client->dev, regmap, client->irq, name, block_supported);
+}
+
+static int bmc150_accel_remove(struct i2c_client *client)
+{
+	return bmc150_accel_core_remove(&client->dev);
+}
+
+static const struct acpi_device_id bmc150_accel_acpi_match[] = {
+	{"BOSC0200"}, /* sudo cp /sys/firmware/acpi/tables/DSDT DSDT.aml; sudo chown $(id -gn).$(id -un) DSDT.aml; sudo apt-get install iasl; iasl -d DSDT.aml */
+	{ },
+};
+MODULE_DEVICE_TABLE(acpi, bmc150_accel_acpi_match);
+
+static struct i2c_driver bmc150_accel_driver = {
+	.driver = {
+		.name	= "bmc150_accel_i2c",
+		.acpi_match_table = ACPI_PTR(bmc150_accel_acpi_match),
+		.pm	= &bmc150_accel_pm_ops,
+	},
+	.probe		= bmc150_accel_probe,
+	.remove		= bmc150_accel_remove,
+};
+module_i2c_driver(bmc150_accel_driver);
+

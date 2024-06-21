@@ -13,7 +13,6 @@
 
 #include "i2c-hid.h"
 
-
 struct i2c_hid_desc_override {
 	union {
 		struct i2c_hid_desc *i2c_hid_desc;
@@ -23,7 +22,6 @@ struct i2c_hid_desc_override {
 	unsigned int          hid_report_desc_size;
 	uint8_t              *i2c_name;
 };
-
 
 /*
  * descriptors for the SIPODEV SP1064 touchpad
@@ -288,7 +286,6 @@ static const struct i2c_hid_desc_override sipodev_desc = {
 	.i2c_name = "SYNA3602:00"
 };
 
-
 static const struct dmi_system_id i2c_hid_dmi_desc_override_table[] = {
 	{
 		.ident = "Teclast F6 Pro",
@@ -418,6 +415,8 @@ struct i2c_hid_desc *i2c_hid_get_dmi_i2c_hid_desc_override(uint8_t *i2c_name)
 	if (!system_id)
 		return NULL;
 
+    printk("system_id.ident: %s", system_id->ident);
+
 	override = system_id->driver_data;
 	if (strcmp(override->i2c_name, i2c_name))
 		return NULL;
@@ -425,8 +424,7 @@ struct i2c_hid_desc *i2c_hid_get_dmi_i2c_hid_desc_override(uint8_t *i2c_name)
 	return override->i2c_hid_desc;
 }
 
-char *i2c_hid_get_dmi_hid_report_desc_override(uint8_t *i2c_name,
-					       unsigned int *size)
+char *i2c_hid_get_dmi_hid_report_desc_override(uint8_t *i2c_name, unsigned int *size)
 {
 	struct i2c_hid_desc_override *override;
 	const struct dmi_system_id *system_id;

@@ -18,10 +18,6 @@ config IIO_BUFFER
 	  Provide core support for various buffer based data
 	  acquisition methods.
 
-if IIO_BUFFER
-	source "drivers/iio/buffer/Kconfig"
-endif # IIO_BUFFER
-
 config IIO_CONFIGFS
 	tristate "Enable IIO configuration via configfs"
 	select CONFIGFS_FS
@@ -69,29 +65,5 @@ config IIO_TRIGGERED_EVENT
 	  Provides helper functions for setting up triggered events.
 
 source "drivers/iio/accel/Kconfig"
-source "drivers/iio/adc/Kconfig"
-source "drivers/iio/amplifiers/Kconfig"
-source "drivers/iio/chemical/Kconfig"
-source "drivers/iio/common/Kconfig"
-source "drivers/iio/counter/Kconfig"
-source "drivers/iio/dac/Kconfig"
-source "drivers/iio/dummy/Kconfig"
-source "drivers/iio/frequency/Kconfig"
-source "drivers/iio/gyro/Kconfig"
-source "drivers/iio/health/Kconfig"
-source "drivers/iio/humidity/Kconfig"
-source "drivers/iio/imu/Kconfig"
-source "drivers/iio/light/Kconfig"
-source "drivers/iio/magnetometer/Kconfig"
-source "drivers/iio/multiplexer/Kconfig"
-source "drivers/iio/orientation/Kconfig"
-if IIO_TRIGGER
-   source "drivers/iio/trigger/Kconfig"
-endif #IIO_TRIGGER
-source "drivers/iio/potentiometer/Kconfig"
-source "drivers/iio/potentiostat/Kconfig"
-source "drivers/iio/pressure/Kconfig"
-source "drivers/iio/proximity/Kconfig"
-source "drivers/iio/temperature/Kconfig"
 
 endif # IIO
