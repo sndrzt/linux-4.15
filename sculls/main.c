@@ -62,8 +62,11 @@ int scull_trim(struct scull_dev *pdev)
 	return 0;
 }
 
+atomic_t scull_s_available = ATOMIC_INIT(1);
 int scull_release(struct inode *inode, struct file *filp)
 {
+	atomic_inc(&scull_s_available); /* release the device */
+
 	return 0;
 }
 
@@ -73,6 +76,11 @@ int scull_open(struct inode *inode, struct file *filp)
 
 	pdev = container_of(inode->i_cdev, struct scull_dev, devt);
 	filp->private_data = pdev;
+
+	if (! atomic_dec_and_test (&scull_s_available)) {
+		atomic_inc(&scull_s_available);
+		return -EBUSY; /* already open */
+	}
 
 	/* now trim to 0 the length of the device if open was write-only */
 	if ( (filp->f_flags & O_ACCMODE) == O_WRONLY) {
