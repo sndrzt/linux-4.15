@@ -26,6 +26,7 @@ load:
 
 unload:
 	sudo rmmod scull
+	sudo rm -rf /dev/scull[0-3]
 
 scull-objs := main.o
 
