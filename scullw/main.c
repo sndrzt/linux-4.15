@@ -62,8 +62,31 @@ int scull_trim(struct scull_dev *pdev)
 	return 0;
 }
 
+static int scull_w_count;	/* initialized to 0 by default */
+static uid_t scull_w_owner;	/* initialized to 0 by default */
+static DECLARE_WAIT_QUEUE_HEAD(scull_w_wait);
+static spinlock_t scull_w_lock = SPIN_LOCK_UNLOCKED;
+
+static inline int scull_w_available(void)
+{
+	return scull_w_count == 0 ||
+		scull_w_owner == current->uid ||
+		scull_w_owner == current->euid ||
+		capable(CAP_DAC_OVERRIDE);
+}
+
 int scull_release(struct inode *inode, struct file *filp)
 {
+	int temp;
+
+	spin_lock(&scull_w_lock);
+	scull_w_count--;
+	temp = scull_w_count;
+	spin_unlock(&scull_w_lock);
+
+	if (temp == 0)
+		wake_up_interruptible_sync(&scull_w_wait); /* awake other uid's */
+
 	return 0;
 }
 
@@ -73,6 +96,19 @@ int scull_open(struct inode *inode, struct file *filp)
 
 	pdev = container_of(inode->i_cdev, struct scull_dev, devt);
 	filp->private_data = pdev;
+
+	spin_lock(&scull_w_lock);
+	while (! scull_w_available()) {
+		spin_unlock(&scull_w_lock);
+		if (filp->f_flags & O_NONBLOCK) return -EAGAIN;
+		if (wait_event_interruptible (scull_w_wait, scull_w_available()))
+			return -ERESTARTSYS; /* tell the fs layer to handle it */
+		spin_lock(&scull_w_lock);
+	}
+	if (scull_w_count == 0)
+		scull_w_owner = current->uid; /* grab it */
+	scull_w_count++;
+	spin_unlock(&scull_w_lock);
 
 	/* now trim to 0 the length of the device if open was write-only */
 	if ( (filp->f_flags & O_ACCMODE) == O_WRONLY) {

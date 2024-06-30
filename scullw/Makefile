@@ -12,17 +12,13 @@ load:
 
 	echo "major=${major}"
 
-	sudo rm -f /dev/scull[0-3]
-	sudo mknod /dev/scull0 c 254 0
-	sudo mknod /dev/scull1 c 254 1
-	sudo mknod /dev/scull2 c 254 2
-	sudo mknod /dev/scull3 c 254 3
-	sudo ln -sf scull0 /dev/scull
-	sudo chgrp work /dev/scull[0-3]
-	sudo chmod 664  /dev/scull[0-3]
+	sudo rm -f /dev/scullw
+	sudo mknod /dev/scullw c 254 1
+	sudo chgrp work /dev/scullw
+	sudo chmod 664  /dev/scullw
 
-	echo abcdefg > /dev/scull0
-	cat /dev/scull0
+	echo abcdefg > /dev/scullw
+	cat /dev/scullw
 
 unload:
 	sudo rmmod scull
