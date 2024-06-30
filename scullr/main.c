@@ -10,6 +10,7 @@
 #include <linux/types.h>	/* nr_bfsize_t */
 #include <linux/cdev.h>
 #include <asm/uaccess.h>	/* copy_*_user */
+#include <linux/tty.h>
 
 struct scull_seg {
         void **buff;
@@ -62,6 +63,41 @@ int scull_trim(struct scull_dev *pdev)
 	return 0;
 }
 
+struct scull_listitem {
+	struct scull_dev device;
+	dev_t key;
+	struct list_head list;
+};
+
+static LIST_HEAD(scull_list); /* The list of devices, and a lock to protect it */
+static spinlock_t scull_lock = SPIN_LOCK_UNLOCKED;
+
+static struct scull_dev *scull_lookfor_device(dev_t key) /* Look for a device or create one if missing */
+{
+	struct scull_listitem *lptr;
+
+	list_for_each_entry(lptr, &scull_list, list) {
+		if (lptr->key == key)
+			return &(lptr->device);
+	}
+
+	/* not found */
+	lptr = kmalloc(sizeof(struct scull_listitem), GFP_KERNEL);
+	if (!lptr)
+		return NULL;
+
+	/* initialize the device */
+	memset(lptr, 0, sizeof(struct scull_listitem));
+	lptr->key = key;
+	scull_trim(&(lptr->device)); /* initialize it */
+	init_MUTEX(&(lptr->device.sem));
+
+	/* place it in the list */
+	list_add(&lptr->list, &scull_list);
+
+	return &(lptr->device);
+}
+
 int scull_release(struct inode *inode, struct file *filp)
 {
 	return 0;
@@ -70,8 +106,22 @@ int scull_release(struct inode *inode, struct file *filp)
 int scull_open(struct inode *inode, struct file *filp)
 {
 	struct scull_dev *pdev;
+	dev_t key;
+ 
+	if (!current->signal->tty) { 
+		printk("Process \"%s\" has no ctl tty\n", current->comm);
+		return -EINVAL;
+	}
+	key = tty_devnum(current->signal->tty);
 
-	pdev = container_of(inode->i_cdev, struct scull_dev, devt);
+	/* look for a scullc device in the list */
+	spin_lock(&scull_lock);
+	pdev = scull_lookfor_device(key);
+	spin_unlock(&scull_lock);
+
+	if (!pdev)
+		return -ENOMEM;
+
 	filp->private_data = pdev;
 
 	/* now trim to 0 the length of the device if open was write-only */

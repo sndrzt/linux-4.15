@@ -12,20 +12,17 @@ load:
 
 	echo "major=${major}"
 
-	sudo rm -f /dev/scull[0-3]
-	sudo mknod /dev/scull0 c 254 0
-	sudo mknod /dev/scull1 c 254 1
-	sudo mknod /dev/scull2 c 254 2
-	sudo mknod /dev/scull3 c 254 3
-	sudo ln -sf scull0 /dev/scull
-	sudo chgrp work /dev/scull[0-3]
-	sudo chmod 664  /dev/scull[0-3]
+	sudo rm -f /dev/scullr
+	sudo mknod /dev/scullr c 254 1
+	sudo chgrp work /dev/scullr
+	sudo chmod 664  /dev/scullr
 
-	echo abcdefg > /dev/scull0
-	cat /dev/scull0
+	echo abcdefg > /dev/scullr
+	cat /dev/scullr
 
 unload:
 	sudo rmmod scull
+	sudo rm -rf /dev/scullr
 
 scull-objs := main.o
 
