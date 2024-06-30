@@ -62,8 +62,15 @@ int scull_trim(struct scull_dev *pdev)
 	return 0;
 }
 
+int scull_u_count;	/* initialized to 0 by default */
+uid_t scull_u_owner;	/* initialized to 0 by default */
+spinlock_t scull_u_lock = SPIN_LOCK_UNLOCKED;
 int scull_release(struct inode *inode, struct file *filp)
 {
+	spin_lock(&scull_u_lock);
+	scull_u_count--; /* nothing else */
+	spin_unlock(&scull_u_lock);
+
 	return 0;
 }
 
@@ -73,6 +80,21 @@ int scull_open(struct inode *inode, struct file *filp)
 
 	pdev = container_of(inode->i_cdev, struct scull_dev, devt);
 	filp->private_data = pdev;
+
+	spin_lock(&scull_u_lock);
+	if (scull_u_count && 
+			(scull_u_owner != current->uid) &&  /* allow user */
+			(scull_u_owner != current->euid) && /* allow whoever did su */
+			!capable(CAP_DAC_OVERRIDE)) { /* still allow root */
+		spin_unlock(&scull_u_lock);
+		return -EBUSY;   /* -EPERM would confuse the user */
+	}
+
+	if (scull_u_count == 0)
+		scull_u_owner = current->uid; /* grab it */
+
+	scull_u_count++;
+	spin_unlock(&scull_u_lock);
 
 	/* now trim to 0 the length of the device if open was write-only */
 	if ( (filp->f_flags & O_ACCMODE) == O_WRONLY) {
