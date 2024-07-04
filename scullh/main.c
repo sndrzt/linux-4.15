@@ -1,4 +1,3 @@
-#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/init.h>
@@ -10,6 +9,25 @@
 #include <linux/types.h>	/* nr_bfsize_t */
 #include <linux/cdev.h>
 #include <asm/uaccess.h>	/* copy_*_user */
+#include <linux/device.h>
+
+struct ldd_driver {
+	char *version;
+	struct module *module;
+	struct device_driver driver;
+	struct driver_attribute version_attr;
+};
+
+struct ldd_device {
+	char *name;
+	struct ldd_driver *driver;
+	struct device dev;
+};
+
+extern int register_ldd_device(struct ldd_device *);
+extern void unregister_ldd_device(struct ldd_device *);
+extern int register_ldd_driver(struct ldd_driver *);
+extern void unregister_ldd_driver(struct ldd_driver *);
 
 struct scull_seg {
         void **buff;
@@ -23,6 +41,8 @@ struct scull_dev {
         unsigned long fpos;                /* amount of lst stored here */
         struct semaphore sem;              /* mutual exclusion semaphore */
         struct cdev devt;                  /* Char device structure */
+        char devname[20];
+        struct ldd_device ldev;
 };
 
 int major = 0;
@@ -228,6 +248,34 @@ struct file_operations scull_fops = {
 };
 
 dev_t devno;
+
+static ssize_t scull_show_dev(struct device *ddev, char *buf)
+{
+	struct scull_dev *dev = dev_get_drvdata(ddev);
+
+	return print_dev_t(buf, dev->devt.dev);
+}
+
+static DEVICE_ATTR(dev, S_IRUGO, scull_show_dev, NULL);
+
+static struct ldd_driver scull_driver = { /* Device model stuff */
+	.version = "$Revision: 1.21 $",
+	.module = THIS_MODULE,
+	.driver = {
+		.name = "scull",
+	},
+};
+
+static void scull_register_dev(struct scull_dev *dev, int index)
+{
+	sprintf(dev->devname, "scull%d", index);
+	dev->ldev.name = dev->devname;
+	dev->ldev.driver = &scull_driver;
+	dev_set_drvdata(&dev->ldev.dev, dev);
+	register_ldd_device(&dev->ldev);
+	device_create_file(&dev->ldev.dev, &dev_attr_dev);
+}
+
 void scull_cleanup(void)
 {
 	int i;
@@ -238,10 +286,11 @@ void scull_cleanup(void)
 
 	for (i = 0; i < nr_devs; i++) {
 		scull_trim(devlist + i);
+		unregister_ldd_device(&devlist[i].ldev);
 		cdev_del(&devlist[i].devt);
 	}
 	kfree(devlist);
-
+	unregister_ldd_driver(&scull_driver);
 	unregister_chrdev_region(devno, nr_devs);
 }
 
@@ -264,6 +313,7 @@ int scull_init(void)
 		return result;
 	}
 
+	register_ldd_driver(&scull_driver);
 	devlist = kmalloc(nr_devs * sizeof(struct scull_dev), GFP_KERNEL);
 	if (!devlist) {
 		result = -ENOMEM;
@@ -285,6 +335,7 @@ int scull_init(void)
 		if (err)
 			printk(KERN_NOTICE "Error %d adding scull%d", err, i);
 
+		scull_register_dev(devlist + i, i);
 	}
 
 	return 0;
@@ -298,3 +349,4 @@ module_exit(scull_cleanup);
 
 MODULE_AUTHOR("Alessandro Rubini, Jonathan Corbet");
 MODULE_LICENSE("Dual BSD/GPL");
+
